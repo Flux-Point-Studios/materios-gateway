@@ -8,9 +8,10 @@ dist/
 # Test coverage
 coverage/
 
-# Runtime data (mounted as docker volumes in prod)
-data/
-blobs/
+# Runtime data (mounted as docker volumes in prod).
+# Anchored to repo root so the rule does NOT match `src/data/` (source JSONs).
+/data/
+/blobs/
 *.db
 *.db-journal
 *.db-wal
