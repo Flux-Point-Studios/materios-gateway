@@ -66,7 +66,7 @@ export const config = {
   // (`GET /v2/attestation_evidence/pending` + `POST .../mark_submitted` —
   // see routes/attestation_evidence_submission.ts). Day-one fallback to the
   // sponsored-receipt submitter token preserves operational simplicity
-  // (operators don't need to set a second secret to roll out task #143);
+  //;
   // operators that want to split the privileged paths can set
   // EVIDENCE_SUBMITTER_TOKEN to an independent value at any point.
   // The fallback is RUNTIME — read at call time — so a flip in env between

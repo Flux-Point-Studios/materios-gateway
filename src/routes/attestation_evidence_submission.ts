@@ -1,6 +1,6 @@
 /**
  * Daemon-facing endpoints for the chain-submission half of TEE evidence
- * (task #143).
+ *.
  *
  *   GET  /v2/attestation_evidence/pending?since=<rowid>&limit=<N>
  *   POST /v2/attestation_evidence/:row_id/mark_submitted

@@ -732,9 +732,8 @@ export interface UsageSnapshot {
  *                      POST; pass 0 on every chunk PUT. Any other value is
  *                      coerced to {0,1} to keep the counter monotonic.
  *
- * No-op (silent) if the keyHash doesn't exist in api_keys. Phase 2 may
- * flip that to a strict error; for now missing rows indicate an in-flight
- * registration race and we'd rather keep uploads succeeding.
+ * No-op (silent) if the keyHash doesn't exist in api_keys — missing rows
+ * indicate an in-flight registration race; uploads succeed regardless.
  */
 export function recordUsage(
   keyHash: string,

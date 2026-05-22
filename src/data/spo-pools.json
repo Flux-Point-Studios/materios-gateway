@@ -27,7 +27,7 @@
   "0xd2b8899dc82477cccd8ea2513fd426cbe672a6221050a9707a743c293f5b8e01": {
     "label": "Draupnir",
     "trust": "spo",
-    "cardano_pool_id": null
+    "cardano_pool_id": "pool1xcajge8fs2h3krysqeshhy4aus7x2zepp566vpcpnqd4kg8f0c6"
   },
   "0x925fe8605fe32a53a7b391498fc1b0ab91d3af7319607bd70b850b4f5fa9d255": {
     "label": "Node-3",

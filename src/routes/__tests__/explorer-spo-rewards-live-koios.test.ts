@@ -1,7 +1,7 @@
 /**
  * LIVE KOIOS regression test for the SPO roster in `data/spo-pools.json`.
  *
- * Pins task #341's data-quality fix: every NON-NULL `cardano_pool_id` in the
+ * Pins our's data-quality fix: every NON-NULL `cardano_pool_id` in the
  * roster MUST be a real, registered preprod pool that Koios can resolve.
  * Without this guard the rewards tab can silently degrade to "0 ADA" rows
  * whenever someone introduces a bech32 typo (Node-3 history) or links a
@@ -166,7 +166,7 @@ describeMaybe("spo-pools.json roster — LIVE Koios resolution", () => {
 
   test("SPO rows with null pool_id are intentional, not data drift", () => {
     // Document each null SPO so removing one is a deliberate diff. As of the
-    // task #341 fix this is exactly {"Draupnir"} — partner-chain candidate
+    // our fix this is exactly {"Draupnir"} — partner-chain candidate
     // registered (tx 2fb1533d…) but the tx carries zero certificates, so
     // no Cardano pool_registration was ever submitted.
     const labels = spoWithoutPool.map(([, m]) => m.label).sort();

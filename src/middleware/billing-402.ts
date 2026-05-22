@@ -20,7 +20,6 @@
  *   - "measurement" → log what would 402, let the request through
  *   - "live"        → return 402 when balance < price
  *
- * Design ref: phase-2-prepaid-balance-design (internal)
  */
 
 import type { NextFunction, Request, RequestHandler, Response } from "express";
@@ -111,7 +110,7 @@ export function classifyEndpoint(req: Request): EndpointClass {
     if (p.startsWith("/heartbeats/")) return assertEndpointClass("free");
     if (/^\/operators\/[^/]+\/session-keys$/.test(p)) return assertEndpointClass("free");
     if (/^\/operators\/status\/[^/]+$/.test(p)) return assertEndpointClass("free");
-    // Daemon-facing chain-submission feeder (task #143). Bearer-token
+    // Daemon-facing chain-submission feeder. Bearer-token
     // authenticated upstream; not user-billable traffic.
     if (p === "/v2/attestation_evidence/pending") {
       return assertEndpointClass("admin");
@@ -146,7 +145,7 @@ export function classifyEndpoint(req: Request): EndpointClass {
   if (m === "POST" && p === "/v2/attestation_evidence") {
     return assertEndpointClass("tee_evidence_submit");
   }
-  // Daemon mark-submitted callback (task #143). Bearer-token authenticated
+  // Daemon mark-submitted callback. Bearer-token authenticated
   // upstream; price it separately so we can throttle daemon traffic
   // distinctly from end-user evidence submits.
   if (m === "POST" && /^\/v2\/attestation_evidence\/[^/]+\/mark_submitted$/.test(p)) {
@@ -175,7 +174,7 @@ export function classifyEndpoint(req: Request): EndpointClass {
     // Why first-segment, not full path? The billing-402 middleware runs
     // BEFORE auth, so `path` is fully attacker-controlled. Keying on full
     // path makes `lastEmitted` Map grow unboundedly per unique URL — a
-    // memory-DoS lever found in PR #47 security review (HIGH). First-
+    // memory-DoS lever. First-
     // segment is bounded by the number of route roots we actually mount
     // (/blobs, /metering, /v2, /batches, etc — a small constant).
     //
@@ -394,7 +393,7 @@ function payerLogFields(payer: PayerIdentity): {
  *
  * The split is the cleanest way to give vitest a deterministic seam —
  * `vi.mock` of the chain-query module had a module-resolution edge case
- * in PR #43's harness (see deferred-test note in the test file). DI keeps
+ * in the bench harness (see deferred-test note in the test file). DI keeps
  * production code identical while making the test surface trivial.
  */
 export interface BillingMiddlewareDeps {
@@ -581,23 +580,6 @@ export function billing402Middleware(
     }
   };
 }
-
-// ---------------------------------------------------------------------------
-// Test exports
-// ---------------------------------------------------------------------------
-//
-// NOTE: `getOrRollMatraCounter` was removed in #224 (M4) — it was only
-// reachable via this `__test__` export and never wired into the live
-// middleware, which means its SELECT-then-UPDATE race at the UTC-day
-// boundary was a guaranteed-future-incident. The per-key MATRA spend
-// cap will be reintroduced as part of #216 (payer-materios-x402 SDK)
-// with proper transactional atomicity (db.transaction(...)). Until then
-// the surface stays empty.
-//
-// TODO(#216): per-key MATRA spend cap will be wired in when
-// payer-materios-x402 SDK lands. Reintroduce a SELECT+UPDATE wrapper
-// that runs inside `db.transaction(...)` so two concurrent calls at a
-// day boundary can't clobber each other's `matra_day_bucket` reset.
 
 export const __test__ = {
   classifyEndpoint,

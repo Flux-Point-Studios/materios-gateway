@@ -1,12 +1,13 @@
 /**
- * Tests for GET /preprod-explorer/api/spo-rewards (task #341).
+ * Tests for GET /preprod-explorer/api/spo-rewards.
  *
  * Mirrors the test harness pattern from explorer-validators.test.ts:
  *   - the route is built via createExplorerSpoRewardsRouter with injected
  *     `apiFactory` (substrate side) + `koiosFetch` (Cardano side), so we
  *     never hit a real WS RPC or the public Koios endpoint in CI.
  *   - the response shape is exercised against the operator + pool roster
- *     described in task #341 so future drift gets caught here.
+ *     against the canonical operator + pool roster so future drift gets
+ *     caught here.
  *
  * The two data sources have asymmetric failure semantics:
  *   - Materios down → return rows with `matra_lifetime: null` (don't 503).
@@ -71,9 +72,8 @@ async function callApp(
   });
 }
 
-// Known SPO pool roster from task #341 (declared in spo-pools.json so the
-// route loader is exercised in the same way the validator route exercises
-// operators.json).
+// Known SPO pool roster (declared in spo-pools.json so the route loader
+// is exercised in the same way the validator route exercises operators.json).
 const HETZNER_AURA =
   "0x64964344fff93f562d94488c5fc340408817de10c4a4783e5e0dde6c8a4ba53e";
 const TRUEAIDATA_AURA =
@@ -388,7 +388,7 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
     }
   });
 
-  test("roster pool IDs match task #341 corrections (no drift)", async () => {
+  test("roster pool IDs match our corrections (no drift)", async () => {
     // Pinned values that survived live-Koios verification on 2026-05-22.
     // Drift here means someone changed spo-pools.json without re-running
     // the LIVE_KOIOS=1 suite — fail loudly so the rewards tab can't
@@ -406,11 +406,10 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
         trust: "spo",
         pool: "pool1y36klnfa4kc3hyggc3fujrm3j6zlgf9r8jhtyufzmgufz3k5pt2",
       },
-      // Draupnir submitted partner-chain reg (Cardano tx 2fb1533d…) but the
-      // tx carried zero certificates — no Cardano pool_registration ever
-      // landed on L1. Until they register, the route MUST return null
-      // so the frontend renders "Not registered" instead of "0 ADA".
-      Draupnir: { trust: "spo", pool: null },
+      Draupnir: {
+        trust: "spo",
+        pool: "pool1xcajge8fs2h3krysqeshhy4aus7x2zepp566vpcpnqd4kg8f0c6",
+      },
       Gemtek: { trust: "permissioned", pool: null },
       Node_2: { trust: "permissioned", pool: null },
       MacBook: { trust: "permissioned", pool: null },

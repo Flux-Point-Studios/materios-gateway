@@ -7,7 +7,7 @@
  * `GET  /v2/multisig_sigs/{kind}/{key}` — peer cert-daemons (or anyone)
  * fetch the union of sigs published so far. Optional `?digest=` filter.
  *
- * Closes the M-of-N coordination gap (task #286). See design memo
+ * Closes the M-of-N coordination gap — see design memo
  * (internal design doc).
  *
  * Trust model:

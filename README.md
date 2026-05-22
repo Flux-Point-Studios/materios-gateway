@@ -1,14 +1,6 @@
 # Materios Gateway
 
-The Materios partner-chain gateway — a single Express.js service that:
-
-- Stores and serves **blob data** (manifests + chunks) used by the cert-daemon committee to attest receipt availability.
-- Tracks **attestor / observer / fleet-operator registries** and surfaces them as JSON.
-- Implements **402-style billing** (`pallet-billing` payer-side check) for paid endpoints.
-- Surfaces **explorer JSON APIs** (`/preprod-explorer/api/validators`, `/preprod-explorer/api/spo-rewards`, `/trace/*`).
-- Bridges Materios pallets (`orinqReceipts`, `teeAttestation`, `oracle`, `billing`) to the SDK and the public explorer UI.
-
-> **Provenance.** This service was extracted from the `orynq-sdk` monorepo on 2026-05-22 so that the orynq SDK can ship cleanly as a pure cryptographic-process-tracing surface. The gateway has zero workspace dependencies on orynq packages — it is a Materios-side concern only.
+Express.js service for the Materios partner-chain. Stores and serves blob data for the cert-daemon committee, tracks attestor/observer/fleet-operator registries, runs 402-style billing on paid endpoints, and surfaces explorer JSON APIs (`/preprod-explorer/api/validators`, `/preprod-explorer/api/spo-rewards`, `/trace/*`).
 
 ## Architecture
 

@@ -6,10 +6,9 @@
  * operator signing keys and turns the upload into an on-chain receipt.
  *
  * This keeps the gateway free of any sr25519 signer state — signing infra
- * lives in a dedicated service (or, for now, a bespoke operator worker)
- * that is the ONLY place an operator keypair is loaded. If the submitter
- * URL is not configured the hook is a no-op; existing non-sponsored
- * flows (sig-only uploads with their own signer) are unaffected.
+ * lives in a dedicated service or operator worker. If the submitter URL
+ * is not configured the hook is a no-op; existing non-sponsored flows
+ * (sig-only uploads with their own signer) are unaffected.
  *
  * Contract with the submitter (HTTP):
  *   POST <url>

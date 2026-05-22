@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Live smoke test for PR #49 — proves the deployed gateway accepts a
+ * Live smoke test — proves the deployed gateway accepts a
  * secp256r1 (ECDSA-P-256) signature against canonical-CBOR(payload).
  *
  * Generates a fresh P-256 keypair LOCALLY (not from KeyMint — that's
@@ -47,7 +47,7 @@ async function main() {
       pubkey: "0x" + pubHex,
       label: "secp256r1-smoke-" + Date.now(),
       sig_algo: "secp256r1",
-      notes: "PR #49 live smoke test",
+      notes: "secp256r1 live smoke test",
     }),
   });
   console.log("[smoke] register attestor:", r.status, (await r.text()).slice(0, 200));
@@ -94,11 +94,11 @@ async function main() {
   console.log("[smoke] response:", erText);
 
   if (er.ok) {
-    console.log("\n✅ PR #49 LIVE — gateway accepted secp256r1 signature");
+    console.log("\n✅ LIVE — gateway accepted secp256r1 signature");
     console.log("   pubkey:", "0x" + pubHex);
     console.log("   Same wire format the Kotlin signer will use.");
   } else {
-    console.log("\n❌ Gateway rejected — PR #49 deploy not in effect yet or wire-format drift");
+    console.log("\n❌ Gateway rejected — secp256r1 deploy not in effect yet or wire-format drift");
     process.exit(1);
   }
 }

@@ -173,7 +173,7 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
       }
     }
 
-    // Server-side rootHash compute (task #93, paired with task #60).
+    // Server-side rootHash compute.
     //
     // The sponsored-receipt-submitter callback payload includes `rootHash`
     // from `manifest.rootHash`. If a thin SDK client (e.g. Penny's OpenHome

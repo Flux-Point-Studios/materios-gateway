@@ -9,7 +9,7 @@
  * envelope via `attest_settle` / `attest_expire_policy`. The pallet's
  * `ensure_threshold_signatures` requires all sigs in one envelope — no
  * cross-call accumulation — so this gateway-side aggregator closes the
- * autopilot coordination gap (task #286 / settle-sig-aggregation-design.md).
+ * autopilot coordination gap.
  *
  * Trust model:
  *   - Each row is self-authenticating: gateway verifies sr25519(pubkey,
@@ -39,7 +39,7 @@ import { config } from "./config.js";
  *  - `expire` — EXPP attestation sigs over an `expire_policy_mirror`-bound
  *    digest (cert-daemon's expire_policy_attestor path, spec-221).
  *  - `slash` — FRAU attestation sigs over a `slash_bad_settlement_evidence`-
- *    bound digest (cert-daemon's slash_watcher path, spec-225 / task #84).
+ *    bound digest.
  * Each channel uses byte-distinct domain tags (STCA/EXPP/FRAU) so per-
  * channel sigs cannot replay across channels — the gateway only namespaces
  * the storage; payload-level domain separation is the on-chain pallet's

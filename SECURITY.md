@@ -17,7 +17,7 @@ This repository ships the gateway service that:
 - Implements 402-style billing for paid endpoints
 - Surfaces explorer JSON APIs and oracle metadata
 
-Vulnerabilities of interest include — but are not limited to — auth bypasses, signature-verification flaws, cross-tenant data leaks, SQL/command injection, and chain-trust assumptions that can be subverted.
+Vulnerabilities of interest include auth bypasses, signature-verification flaws, cross-tenant data leaks, SQL/command injection, and chain-trust assumptions that can be subverted.
 
 ## Out of Scope
 

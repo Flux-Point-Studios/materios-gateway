@@ -42,7 +42,7 @@
  *   Authorization: Bearer matra_<token>. We inline-verify the token here
  *   (instead of using the shared `bearerAuth` middleware) so we can pull
  *   the optional `tenantId` binding off the verify result and enforce
- *   cross-tenant isolation per task #119. x-api-key auth is intentionally
+ *   cross-tenant isolation. x-api-key auth is intentionally
  *   NOT supported on this route — tenant binding lives on api_tokens, and
  *   the legacy x-api-key path uses a different table without a tenant_id
  *   column.
@@ -257,7 +257,7 @@ billingRouter.get(
         return;
       }
 
-      // ---------- task #119: cross-tenant isolation ----------
+      // ---------- cross-tenant isolation ----------
       // Token has NO tenant_id (legacy/admin) → allow any tenant_id query.
       // Token tenant_id === query.tenant_id → fall through to aggregation.
       // Token tenant_id !== query.tenant_id → 403.

@@ -22,10 +22,7 @@
  * Auth model:
  *   - `GET /witness/targets` is PUBLIC (the witness APK fetches it on every
  *     WorkManager tick — there's no per-device secret to share).
- *   - `POST /admin/witness/targets` is admin-token gated for now. A future
- *     `POST /witness/targets` with bearer-auth + tenant binding will let
- *     site owners self-register; that's deferred until we have a signup
- *     form that mints the bearer.
+ *   - `POST /admin/witness/targets` is admin-token gated.
  */
 
 import Database from "better-sqlite3";

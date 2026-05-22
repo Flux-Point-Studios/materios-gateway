@@ -224,9 +224,8 @@ meteringRouter.post(
         authTier: "bearer",
         schemaHash: schema_hash,
         source: METERING_SOURCE,
-        // No rootHash/manifestHash — those are blob-flow concepts. Worker
-        // SDK can compute the manifest hash itself if the submitter ever
-        // needs it; for now we omit.
+        // No rootHash/manifestHash — those are blob-flow concepts and the
+        // submitter contract does not require them on this path.
       });
 
       res.status(200).json({

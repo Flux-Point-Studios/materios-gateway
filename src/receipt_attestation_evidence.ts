@@ -83,7 +83,7 @@ export function initReceiptAttestationEvidenceDb(
     CREATE INDEX IF NOT EXISTS idx_rae_attestor
       ON receipt_attestation_evidence(attestor_pubkey_hex);
   `);
-  // Additive migration (task #143): track which rows the cert-daemon has
+  // Additive migration: track which rows the cert-daemon has
   // already lifted to chain via TeeAttestation.submit_evidence. Two new
   // columns, both nullable + default-NULL so existing rows + the original
   // `INSERT` paths continue to work unchanged. The cert-daemon polls
@@ -248,7 +248,7 @@ export function insertReceiptEvidence(
  *
  * The SQL `ORDER BY ... attestor_pubkey_hex ASC` is added so any consumer
  * that bypasses this JS sort (or runs SQL directly for inspection) still
- * sees the deterministic order. PR #34 M-2.
+ * sees the deterministic order.
  */
 export function listReceiptEvidence(receipt_id: string): ReceiptEvidenceRow[] {
   if (!db) return [];
@@ -308,7 +308,7 @@ export function recomputeReceiptEvidenceHash(receipt_id: string): {
 }
 
 // ---------------------------------------------------------------------------
-// Chain-submission tracking helpers (task #143)
+// Chain-submission tracking helpers
 //
 // The cert-daemon's `evidence_submitter` polls `listReceiptEvidencePending
 // ChainSubmission()` over HTTP, dispatches `TeeAttestation.submit_evidence`

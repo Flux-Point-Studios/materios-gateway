@@ -91,7 +91,7 @@ async function main() {
       pubkey: "0x" + pubHex,
       label: "polyalg-e2e-fc-" + Date.now(),
       sig_algo: "ed25519",
-      notes: "PR #48 + ArmTZ chain proof",
+      notes: "ArmTZ end-to-end chain proof",
     }),
   });
   console.log("[e2e2] register attestor: " + regRes.status);

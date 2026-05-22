@@ -1,60 +1,7 @@
-/**
- * Cardano L1 anchor resolution for the billing-query endpoint (#112).
- *
- * Given a `cert_hash` (the on-chain availability_cert_hash from a
- * Materios receipt), find the Cardano transaction that anchored it.
- *
- * Sources of truth:
- *
- *  1. **cert-daemon checkpoint-history.json** (default
- *     `/data/checkpoint-history.json`, env `CERT_HISTORY_PATH`) — an
- *     append-only JSON array of checkpoint records. Each record has:
- *
- *       { timestamp, root_hash, manifest_hash, manifest, leaves[] }
- *
- *     where leaves is `[{receipt_id, cert_hash, block_num, leaf_hash}, ...]`.
- *     The Merkle ROOT of a checkpoint is what gets anchored on Cardano —
- *     not the individual cert_hash. So this file alone tells us
- *     `cert_hash → root_hash`, which is half the journey.
- *
- *  2. **anchor-worker log** (default
- *     `<ANCHOR_WORKER_LOG_PATH>`, env
- *     `ANCHOR_WORKER_LOG_PATH`) — append-only line log; each anchor emits a
- *     line of the form
- *
- *       `[anchor-worker] anchored root=<root20chars>... as tx <txhash> [...]`
- *
- *     The root is TRUNCATED to 20 hex chars in the log, which is enough
- *     for unambiguous matching against the full root_hash we read in step 1.
- *     We tolerate the truncation by indexing on the 20-char prefix; the
- *     birthday-bound on collisions across a single chain's checkpoint
- *     history is comfortably astronomical (2^80).
- *
- * Joining the two gives `cert_hash → root_hash → cardano_tx_hash`.
- *
- * Limitations & graceful fallback (this is HARD-CODED to NOT fail the
- * billing query — see the matrix below):
- *
- *   | input               | result                                    |
- *   | ------------------- | ----------------------------------------- |
- *   | history file absent | every cert_hash → null (fallback "unknown") |
- *   | log file absent     | cert_hash maps to root_hash but no tx → null |
- *   | both present, hit   | cert_hash → tx_hash                        |
- *   | both present, miss  | cert_hash → null (anchor not yet submitted) |
- *
- * The route surfaces null as `cardano_anchor_tx: null` and the audit_trail
- * always includes `anchor_resolution_ms` so the customer sees the lookup
- * happened.
- *
- * Caching: file mtime is checked at most once per `MTIME_CACHE_TTL_MS` ms
- * (currently 30s). Within that window, a cached map (cert_hash → tx_hash
- * | null) is reused — billing queries within the same window skip both
- * file reads.
- *
- * Memory budget: a checkpoint with 10 leaves * 1000 checkpoints = 10k
- * cert_hash entries * ~150 bytes ≈ 1.5 MB. We're nowhere near needing
- * pagination of the resolution map.
- */
+// Resolves a Materios cert_hash to its Cardano anchor tx by joining
+// cert-daemon's checkpoint-history.json (cert_hash → root_hash) with the
+// anchor-worker log (root20 → tx_hash). Missing files degrade to null
+// instead of failing the billing query.
 
 import { readFile, stat } from "fs/promises";
 

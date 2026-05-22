@@ -1,21 +1,7 @@
-/**
- * SQLite-backed registry of ATTESTATION-EVIDENCE ATTESTORS — the third
- * parties (Acurast Android phones for Wave 3 Phase 2; SEV-SNP / TDX hosts
- * for Phase 3.x) whose TEE-protected keys sign POST /v2/attestation_evidence
- * payloads.
- *
- * Mirrors `fleet_operators.ts` / `observers.ts` — same shape, same lifecycle,
- * same admin endpoints. Backed by a separate file (`attestors.db`) so its
- * schema migrations stay isolated from the older registries.
- *
- * Trust framing: this registry is the off-chain analogue of the on-chain
- * `enrolled_chip_id_hashes` set described in § 4 of the Wave 3 design doc
- * (internal design doc). The on-chain
- * pallet (built in parallel) keeps the canonical chip-ID set; this gateway
- * registry is the operator-managed set of "attestor pubkeys we'll accept
- * evidence from at the gateway." Both can be reconciled by ops tooling
- * (planned follow-up — out of scope for this PR).
- */
+// SQLite-backed registry of attestation-evidence attestors (TEE-protected
+// keys that sign POST /v2/attestation_evidence). Off-chain analogue of the
+// on-chain enrolled_chip_id_hashes set; the pallet keeps the canonical set,
+// this gateway tracks the operator-managed pubkeys to accept evidence from.
 
 import Database from "better-sqlite3";
 import { join } from "path";

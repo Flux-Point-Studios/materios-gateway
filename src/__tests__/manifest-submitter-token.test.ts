@@ -1,27 +1,9 @@
-/**
- * Integration tests for task #134 — sponsored-receipt-submitter manifest fetch.
- *
- * The receipt-submitter is a trusted internal service: the gateway hands it
- * `SPONSORED_RECEIPT_SUBMITTER_TOKEN` so the gateway can call it on the
- * inbound POST direction. The submitter, in turn, needs to call BACK to the
- * gateway's GET /blobs/:contentHash/manifest to enrich the receipt with the
- * 14 sub-hash fields required by submit_receipt_v2.
- *
- * Before this fix the submitter had no auth header on that fetch — every
- * request 401'd, the submitter fell back to a synthesised manifest hash,
- * and the receipt_id it wrote on chain disagreed with the gateway's
- * billing-API receipt_id (which derives from content_hash directly).
- * Result: billing API forever showed `attestation_status: "unknown"`.
- *
- * Fix shape (Option B from the task brief): the gateway recognises the SAME
- * `SPONSORED_RECEIPT_SUBMITTER_TOKEN` it shares with the submitter as a
- * privileged read-only credential on GET /blobs/:contentHash/manifest. No
- * new secret channel is added; the existing service-to-service trust is
- * symmetric in both directions.
- *
- * The token is read from `config.sponsoredReceiptSubmitterToken` at request
- * time (not at module load), so tests can flip it on/off per case.
- */
+// The gateway recognises `SPONSORED_RECEIPT_SUBMITTER_TOKEN` as a privileged
+// read-only credential on GET /blobs/:contentHash/manifest — symmetric to
+// the inbound-POST direction so the submitter can fetch the manifest's
+// sub-hashes for submit_receipt_v2 without a separate secret channel.
+// Token is read from `config.sponsoredReceiptSubmitterToken` at request
+// time so tests can flip it on/off per case.
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../rpc-client.js", () => ({
@@ -222,7 +204,7 @@ function buildManifest(): {
 // Tests — sponsored-receipt-submitter token recognition on GET manifest
 // --------------------------------------------------------------------------
 
-describe("GET /blobs/:contentHash/manifest — sponsored-receipt-submitter token (task #134)", () => {
+describe("GET /blobs/:contentHash/manifest", () => {
   let ctx: Awaited<ReturnType<typeof setupApp>>;
 
   beforeEach(async () => {
@@ -338,7 +320,7 @@ describe("GET /blobs/:contentHash/manifest — sponsored-receipt-submitter token
 // Tests — receipt_id agreement between gateway billing + submitter
 // --------------------------------------------------------------------------
 
-describe("receipt_id derivation — submitter must agree with gateway billing (task #134)", () => {
+describe("receipt_id derivation — submitter must agree with gateway billing", () => {
   test("computeReceiptId_is_sha256_of_content_hash_bytes", async () => {
     // This is the canonical scheme the gateway billing API uses:
     //   receipt_id = sha256(content_hash_bytes)
