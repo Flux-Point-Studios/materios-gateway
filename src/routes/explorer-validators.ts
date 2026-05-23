@@ -220,14 +220,38 @@ function headerNumber(header: unknown): number {
   return 0;
 }
 
+function normalizeAuraKey(k: string): string {
+  const hex = k.startsWith("0x") || k.startsWith("0X") ? k.slice(2) : k;
+  return `0x${hex.toLowerCase()}`;
+}
+
+async function readAuraAuthorities(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  api: any,
+): Promise<string[]> {
+  try {
+    const raw = await api.query.aura?.authorities?.();
+    if (raw === undefined || raw === null) return [];
+    const json = (raw as { toJSON?: () => unknown }).toJSON?.() ?? raw;
+    if (!Array.isArray(json)) return [];
+    return json.filter((x): x is string => typeof x === "string").map(normalizeAuraKey);
+  } catch {
+    return [];
+  }
+}
+
 async function scanBlockAuthorCounts(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   api: any,
   headNumber: number,
-  committeeSize: number,
-): Promise<Map<number, number>> {
-  const counts = new Map<number, number>();
-  if (committeeSize === 0) return counts;
+  auraAuthorities: string[],
+): Promise<Map<string, number>> {
+  // Re-key counts by aura pubkey rather than committee index: aura's
+  // slot-leader array (`pallet_aura::Authorities`) is a separate storage
+  // item from `sessionCommitteeManagement.currentCommittee` and the two
+  // can disagree on length or ordering across session rotations.
+  const counts = new Map<string, number>();
+  if (auraAuthorities.length === 0) return counts;
   const startHeight = Math.max(1, headNumber - SCAN_WINDOW_BLOCKS + 1);
   // Fetch hashes + headers in parallel so a 60-block scan completes in two
   // RTTs rather than 120 serial round-trips. WS multiplexing handles the
@@ -239,8 +263,8 @@ async function scanBlockAuthorCounts(
   for (const h of headers) {
     const slot = readAuraSlot(h);
     if (slot === null) continue;
-    const authorIdx = Number(slot % BigInt(committeeSize));
-    counts.set(authorIdx, (counts.get(authorIdx) ?? 0) + 1);
+    const leader = auraAuthorities[Number(slot % BigInt(auraAuthorities.length))];
+    counts.set(leader, (counts.get(leader) ?? 0) + 1);
   }
   return counts;
 }
@@ -307,11 +331,19 @@ async function buildSnapshot(api: ApiPromise): Promise<ValidatorsSnapshot> {
     }
   }
 
-  const counts = await scanBlockAuthorCounts(a, head, currentEntries.length);
+  const auraAuthorities = await readAuraAuthorities(a);
+  // Fallback: if aura.authorities() is unavailable, derive a same-order list
+  // from the committee. Worse than nothing only when ordering actually drifts —
+  // matches the legacy committee-index behaviour so the endpoint stays up.
+  const slotLeaders =
+    auraAuthorities.length > 0
+      ? auraAuthorities
+      : currentEntries.map((e) => normalizeAuraKey(e.aura));
+  const counts = await scanBlockAuthorCounts(a, head, slotLeaders);
 
-  const currentCommittee: CommitteeMember[] = currentEntries.map((entry, idx) => {
+  const currentCommittee: CommitteeMember[] = currentEntries.map((entry) => {
     const op = resolveOperator(entry.sidechainPubkey);
-    const blocksInLast60 = counts.get(idx) ?? 0;
+    const blocksInLast60 = counts.get(normalizeAuraKey(entry.aura)) ?? 0;
     return {
       sidechain: entry.sidechainPubkey,
       aura: entry.aura,
