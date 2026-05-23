@@ -101,6 +101,10 @@ interface FakeChainConfig {
   nextCommittee:
     | { epoch: number; committee: Array<[string, { aura: string; grandpa: string }]> }
     | null;
+  // Aura authority pubkeys in canonical slot-leader order. Defaults to the
+  // current-committee aura order so existing tests keep round-robin semantics
+  // without having to spell it out.
+  auraAuthorities?: string[];
   // Override the head timestamp for stable golden checks
   asOfIso: string;
   scEpoch: number;
@@ -145,6 +149,14 @@ function makeFakeApi(cfg: FakeChainConfig): ReturnType<ExplorerApiFactory> {
               : { toJSON: () => cfg.nextCommittee },
           toJSON: () => cfg.nextCommittee,
         }),
+      },
+      aura: {
+        authorities: async () => {
+          const auths =
+            cfg.auraAuthorities ??
+            cfg.currentCommittee.map(([, keys]) => keys.aura);
+          return { toJSON: () => auths };
+        },
       },
       session: {
         currentIndex: async () => ({ toNumber: () => cfg.scEpoch }),
@@ -318,5 +330,77 @@ describe("GET /preprod-explorer/api/validators", () => {
     expect(node2.blocksInLast60).toBe(0);
     expect(node3.producing).toBe(false);
     expect(node3.blocksInLast60).toBe(0);
+  });
+
+  test("block attribution keys off aura authorities order, not committee order", async () => {
+    // Committee order: [GEMTEK(A), NODE2(B), NODE3(C)]
+    // Aura authorities order: [NODE3, GEMTEK, NODE2] — slot%3 == 0 leader is NODE3.
+    // Every block slot in the window maps to leader index 0 of the aura array.
+    // Only NODE3 should report producing/blocksInLast60 > 0; the others zero.
+    const slotByHeight = new Map<number, bigint>();
+    for (let n = 1; n <= 12; n++) slotByHeight.set(n, BigInt((n - 1) * 3)); // 0,3,6,9,...
+    const cfg: FakeChainConfig = {
+      headNumber: 12,
+      slotByHeight,
+      currentCommittee: [
+        [GEMTEK, { aura: AURA_GEMTEK, grandpa: GRANDPA_GEMTEK }],
+        [NODE2, { aura: AURA_NODE2, grandpa: GRANDPA_NODE2 }],
+        [NODE3, { aura: AURA_NODE3, grandpa: GRANDPA_NODE3 }],
+      ],
+      auraAuthorities: [AURA_NODE3, AURA_GEMTEK, AURA_NODE2],
+      nextCommittee: null,
+      asOfIso: "2026-05-21T14:30:00Z",
+      scEpoch: 494271,
+    };
+    const app = express();
+    app.use(createExplorerValidatorsRouter({ apiFactory: () => makeFakeApi(cfg) }));
+
+    const res = await callApp(app, "/preprod-explorer/api/validators");
+    expect(res.status).toBe(200);
+    const cc = (res.body as { currentCommittee: Array<Record<string, unknown>> })
+      .currentCommittee;
+    const gem = cc.find((c) => c.sidechain === GEMTEK)!;
+    const node2 = cc.find((c) => c.sidechain === NODE2)!;
+    const node3 = cc.find((c) => c.sidechain === NODE3)!;
+    expect(node3.producing).toBe(true);
+    expect(node3.blocksInLast60).toBeGreaterThan(0);
+    expect(gem.producing).toBe(false);
+    expect(gem.blocksInLast60).toBe(0);
+    expect(node2.producing).toBe(false);
+    expect(node2.blocksInLast60).toBe(0);
+  });
+
+  test("aura authority pubkey case + 0x-prefix mismatch still matches committee entry", async () => {
+    // Committee aura keys are lowercase 0x-prefixed; aura.authorities() emits
+    // upper-case hex without prefix. The route must normalize both sides so
+    // attribution still works.
+    const slotByHeight = new Map<number, bigint>();
+    for (let n = 1; n <= 6; n++) slotByHeight.set(n, BigInt(n)); // 1,2,3,4,5,6
+    const cfg: FakeChainConfig = {
+      headNumber: 6,
+      slotByHeight,
+      currentCommittee: [
+        [GEMTEK, { aura: AURA_GEMTEK, grandpa: GRANDPA_GEMTEK }],
+        [NODE2, { aura: AURA_NODE2, grandpa: GRANDPA_NODE2 }],
+      ],
+      auraAuthorities: [
+        AURA_GEMTEK.replace(/^0x/, "").toUpperCase(),
+        AURA_NODE2.replace(/^0x/, "").toUpperCase(),
+      ],
+      nextCommittee: null,
+      asOfIso: "2026-05-21T14:30:00Z",
+      scEpoch: 494271,
+    };
+    const app = express();
+    app.use(createExplorerValidatorsRouter({ apiFactory: () => makeFakeApi(cfg) }));
+
+    const res = await callApp(app, "/preprod-explorer/api/validators");
+    expect(res.status).toBe(200);
+    const cc = (res.body as { currentCommittee: Array<Record<string, unknown>> })
+      .currentCommittee;
+    const gem = cc.find((c) => c.sidechain === GEMTEK)!;
+    const node2 = cc.find((c) => c.sidechain === NODE2)!;
+    expect(gem.blocksInLast60).toBeGreaterThan(0);
+    expect(node2.blocksInLast60).toBeGreaterThan(0);
   });
 });
