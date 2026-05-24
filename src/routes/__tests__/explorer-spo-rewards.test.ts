@@ -27,6 +27,8 @@ import {
   createExplorerSpoRewardsRouter,
   type ExplorerApiFactory,
   type KoiosFetcher,
+  type KoiosCurrentEpochFetcher,
+  type KoiosPoolBlocksInEpochFetcher,
 } from "../explorer-spo-rewards.js";
 
 interface CallResult {
@@ -162,6 +164,22 @@ function makeKoiosFetcher(
   };
 }
 
+function makeCurrentEpochFetcher(
+  epoch: number | null,
+): KoiosCurrentEpochFetcher {
+  return async () => epoch;
+}
+
+function makePoolBlocksInEpochFetcher(
+  counts: Record<string, number | Error>,
+): KoiosPoolBlocksInEpochFetcher {
+  return async (poolBech32: string) => {
+    const v = counts[poolBech32];
+    if (v instanceof Error) throw v;
+    return typeof v === "number" ? v : 0;
+  };
+}
+
 describe("GET /preprod-explorer/api/spo-rewards", () => {
   test("happy path: returns 200 with full operator roster + dual-stream data", async () => {
     const app = express();
@@ -178,6 +196,7 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
         koiosFetch: makeKoiosFetcher({
           [HETZNER_POOL]: POOL_HISTORY_TWO_EPOCHS,
         }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(null),
         disableCache: true,
       }),
     );
@@ -233,6 +252,7 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
         koiosFetch: makeKoiosFetcher({
           [HETZNER_POOL]: POOL_HISTORY_TWO_EPOCHS,
         }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(null),
         disableCache: true,
       }),
     );
@@ -259,6 +279,7 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
           // empty history = registered but never delegated/produced
           [HETZNER_POOL]: [],
         }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(null),
         disableCache: true,
       }),
     );
@@ -304,6 +325,7 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
         koiosFetch: makeKoiosFetcher({
           [HETZNER_POOL]: HISTORY_WITH_BLOCKS,
         }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(null),
         disableCache: true,
       }),
     );
@@ -335,6 +357,7 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
         koiosFetch: makeKoiosFetcher({
           [HETZNER_POOL]: POOL_HISTORY_TWO_EPOCHS,
         }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(null),
         disableCache: true,
       }),
     );
@@ -357,6 +380,7 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
       createExplorerSpoRewardsRouter({
         apiFactory: () => makeFakeMateriosApi({}),
         koiosFetch: makeKoiosFetcher({}),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(null),
         disableCache: true,
       }),
     );
@@ -420,6 +444,7 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
       createExplorerSpoRewardsRouter({
         apiFactory: () => makeFakeMateriosApi({}),
         koiosFetch: makeKoiosFetcher({}),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(null),
         disableCache: true,
       }),
     );
@@ -434,5 +459,89 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
       expect(row!.trust).toBe(trust);
       expect(row!.cardano_pool_id).toBe(pool);
     }
+  });
+
+  test("current-epoch supplement: closed-epoch blocks + open-epoch blocks summed", async () => {
+    // Closed epochs (pool_history) show 5 blocks for Hetzner across 286-288;
+    // the open current epoch (290) is not yet in pool_history but pool_blocks
+    // returns 3 entries. Lifetime must be 5 + 3 = 8.
+    const CLOSED_HISTORY = [
+      { epoch_no: 288, active_stake: "1000", block_cnt: 2, pool_fees: "0", deleg_rewards: "0" },
+      { epoch_no: 287, active_stake: "1000", block_cnt: 3, pool_fees: "0", deleg_rewards: "0" },
+      { epoch_no: 286, active_stake: "1000", block_cnt: 0, pool_fees: "0", deleg_rewards: "0" },
+    ];
+    const app = express();
+    app.use(
+      createExplorerSpoRewardsRouter({
+        apiFactory: () => makeFakeMateriosApi({}),
+        koiosFetch: makeKoiosFetcher({ [HETZNER_POOL]: CLOSED_HISTORY }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(290),
+        koiosPoolBlocksInEpoch: makePoolBlocksInEpochFetcher({
+          [HETZNER_POOL]: 3,
+        }),
+        disableCache: true,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/spo-rewards");
+    expect(res.status).toBe(200);
+    const ops = (res.body as { operators: Array<Record<string, unknown>> }).operators;
+    const hetzner = ops.find((o) => o.label === "Hetzner")!;
+    expect(hetzner.cardano_blocks_lifetime).toBe(8);
+  });
+
+  test("current-epoch fetcher returns null: graceful degrade to closed-epoch total", async () => {
+    const CLOSED_HISTORY = [
+      { epoch_no: 288, active_stake: "1000", block_cnt: 5, pool_fees: "0", deleg_rewards: "0" },
+    ];
+    const app = express();
+    app.use(
+      createExplorerSpoRewardsRouter({
+        apiFactory: () => makeFakeMateriosApi({}),
+        koiosFetch: makeKoiosFetcher({ [HETZNER_POOL]: CLOSED_HISTORY }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(null),
+        koiosPoolBlocksInEpoch: makePoolBlocksInEpochFetcher({
+          [HETZNER_POOL]: 999, // must NOT be consulted when epoch is null
+        }),
+        disableCache: true,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/spo-rewards");
+    expect(res.status).toBe(200);
+    const ops = (res.body as { operators: Array<Record<string, unknown>> }).operators;
+    const hetzner = ops.find((o) => o.label === "Hetzner")!;
+    expect(hetzner.cardano_blocks_lifetime).toBe(5);
+  });
+
+  test("per-pool current-epoch fetch fails: only that pool falls back; others get the supplement", async () => {
+    const NODE3_POOL = "pool1y36klnfa4kc3hyggc3fujrm3j6zlgf9r8jhtyufzmgufz3k5pt2";
+    const HETZNER_HISTORY = [
+      { epoch_no: 288, active_stake: "1000", block_cnt: 5, pool_fees: "0", deleg_rewards: "0" },
+    ];
+    const NODE3_HISTORY = [
+      { epoch_no: 288, active_stake: "1000", block_cnt: 2, pool_fees: "0", deleg_rewards: "0" },
+    ];
+    const app = express();
+    app.use(
+      createExplorerSpoRewardsRouter({
+        apiFactory: () => makeFakeMateriosApi({}),
+        koiosFetch: makeKoiosFetcher({
+          [HETZNER_POOL]: HETZNER_HISTORY,
+          [NODE3_POOL]: NODE3_HISTORY,
+        }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(290),
+        koiosPoolBlocksInEpoch: makePoolBlocksInEpochFetcher({
+          [HETZNER_POOL]: new Error("ETIMEDOUT"),
+          [NODE3_POOL]: 1,
+        }),
+        disableCache: true,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/spo-rewards");
+    expect(res.status).toBe(200);
+    const ops = (res.body as { operators: Array<Record<string, unknown>> }).operators;
+    const hetzner = ops.find((o) => o.label === "Hetzner")!;
+    const node3 = ops.find((o) => o.label === "Node-3")!;
+    expect(hetzner.cardano_blocks_lifetime).toBe(5);
+    expect(node3.cardano_blocks_lifetime).toBe(3);
   });
 });

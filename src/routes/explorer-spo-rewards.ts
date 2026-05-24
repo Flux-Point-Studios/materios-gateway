@@ -32,6 +32,8 @@ import spoPoolsData from "../data/spo-pools.json" with { type: "json" };
 
 const CACHE_TTL_MS = 60_000;
 const KOIOS_PREPROD_URL = "https://preprod.koios.rest/api/v1/pool_history";
+const KOIOS_TIP_URL = "https://preprod.koios.rest/api/v1/tip";
+const KOIOS_POOL_BLOCKS_URL = "https://preprod.koios.rest/api/v1/pool_blocks";
 const KOIOS_TIMEOUT_MS = 15_000;
 const SS58_PREFIX = 42;
 // Materios MATRA decimals on v5 (Cardano cMATRA-compatible).
@@ -61,11 +63,20 @@ export type KoiosFetcher = (
   poolBech32: string,
 ) => Promise<KoiosPoolHistoryRecord[]>;
 
+export type KoiosCurrentEpochFetcher = () => Promise<number | null>;
+
+export type KoiosPoolBlocksInEpochFetcher = (
+  poolBech32: string,
+  epoch: number,
+) => Promise<number>;
+
 export type ExplorerApiFactory = () => Promise<ApiPromise>;
 
 interface RouterDeps {
   apiFactory?: ExplorerApiFactory;
   koiosFetch?: KoiosFetcher;
+  koiosCurrentEpoch?: KoiosCurrentEpochFetcher;
+  koiosPoolBlocksInEpoch?: KoiosPoolBlocksInEpochFetcher;
   disableCache?: boolean;
 }
 
@@ -153,6 +164,67 @@ async function defaultKoiosFetch(
     const body = await resp.json();
     if (!Array.isArray(body)) return [];
     return body as KoiosPoolHistoryRecord[];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// WHY: fail-OPEN — null tells buildSnapshot to skip the open-epoch supplement
+// and serve the closed-epoch aggregate alone, which is the column's existing
+// behavior. Never throws — Koios tip flakiness must not 503 the rewards tab.
+async function defaultKoiosCurrentEpoch(): Promise<number | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), KOIOS_TIMEOUT_MS);
+  try {
+    const resp = await fetch(KOIOS_TIP_URL, { signal: ctrl.signal });
+    if (!resp.ok) {
+      console.warn(`[explorer-spo-rewards] Koios tip ${resp.status}`);
+      return null;
+    }
+    const body = await resp.json();
+    if (!Array.isArray(body) || body.length === 0) return null;
+    const epoch = body[0]?.epoch_no;
+    return typeof epoch === "number" && Number.isFinite(epoch) ? epoch : null;
+  } catch (err) {
+    console.warn(
+      `[explorer-spo-rewards] Koios tip failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function defaultKoiosPoolBlocksInEpoch(
+  poolBech32: string,
+  epoch: number,
+): Promise<number> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), KOIOS_TIMEOUT_MS);
+  try {
+    const resp = await fetch(KOIOS_POOL_BLOCKS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ _pool_bech32: poolBech32, _epoch_no: epoch }),
+      signal: ctrl.signal,
+    });
+    if (!resp.ok) {
+      console.warn(
+        `[explorer-spo-rewards] Koios pool_blocks ${resp.status} for ${poolBech32}`,
+      );
+      return 0;
+    }
+    const body = await resp.json();
+    return Array.isArray(body) ? body.length : 0;
+  } catch (err) {
+    console.warn(
+      `[explorer-spo-rewards] Koios pool_blocks failed for ${poolBech32}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return 0;
   } finally {
     clearTimeout(timer);
   }
@@ -330,6 +402,8 @@ function aggregatePoolHistory(records: KoiosPoolHistoryRecord[]): CardanoAgg {
 async function buildSnapshot(
   apiFactory: ExplorerApiFactory,
   koiosFetch: KoiosFetcher,
+  koiosCurrentEpoch: KoiosCurrentEpochFetcher,
+  koiosPoolBlocksInEpoch: KoiosPoolBlocksInEpochFetcher,
 ): Promise<RewardsSnapshot> {
   const entries = Object.entries(ROSTER);
 
@@ -363,21 +437,43 @@ async function buildSnapshot(
     for (const [auraHex] of entries) balanceByAura.set(auraHex, null);
   }
 
-  // Koios pool histories — parallel; one failure on ANY pool throws and
-  // bubbles to the caller (which 503s). Per-pool 4xx/5xx inside
-  // defaultKoiosFetch is already swallowed to []; only network-level
-  // failures (DNS, TLS, timeout) get here.
+  // Koios pool histories + current-epoch tip — parallel.
+  // pool_history failure (network-level) bubbles → 503. The tip probe is
+  // fail-OPEN: null means we serve the closed-epoch aggregate alone, which
+  // is the column's pre-existing behavior — we never make it WORSE.
   const poolHistByPool = new Map<string, KoiosPoolHistoryRecord[]>();
   const cardanoPools = entries
     .map(([, v]) => v.cardano_pool_id)
     .filter((p): p is string => p !== null);
 
-  await Promise.all(
-    cardanoPools.map(async (poolId) => {
-      const hist = await koiosFetch(poolId);
-      poolHistByPool.set(poolId, hist);
-    }),
-  );
+  const [, currentEpoch] = await Promise.all([
+    Promise.all(
+      cardanoPools.map(async (poolId) => {
+        const hist = await koiosFetch(poolId);
+        poolHistByPool.set(poolId, hist);
+      }),
+    ),
+    koiosCurrentEpoch(),
+  ]);
+
+  const currentEpochBlocksByPool = new Map<string, number>();
+  if (currentEpoch !== null) {
+    await Promise.all(
+      cardanoPools.map(async (poolId) => {
+        try {
+          const n = await koiosPoolBlocksInEpoch(poolId, currentEpoch);
+          currentEpochBlocksByPool.set(poolId, n);
+        } catch (err) {
+          console.warn(
+            `[explorer-spo-rewards] current-epoch blocks failed for ${poolId}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          currentEpochBlocksByPool.set(poolId, 0);
+        }
+      }),
+    );
+  }
 
   const operators: OperatorRewardsRow[] = entries.map(([auraHex, meta]) => {
     const ss58 = auraPubkeyToSs58(auraHex);
@@ -406,9 +502,11 @@ async function buildSnapshot(
     if (meta.cardano_pool_id) {
       const hist = poolHistByPool.get(meta.cardano_pool_id) ?? [];
       const agg = aggregatePoolHistory(hist);
+      const currentEpochBlocks =
+        currentEpochBlocksByPool.get(meta.cardano_pool_id) ?? 0;
       row = {
         ...row,
-        cardano_blocks_lifetime: agg.blocks,
+        cardano_blocks_lifetime: agg.blocks + currentEpochBlocks,
         cardano_pool_fees_lifetime_raw: agg.fees.toString(),
         cardano_pool_fees_lifetime: formatAda(agg.fees, 6),
         cardano_delegator_rewards_lifetime_raw: agg.delegRewards.toString(),
@@ -436,6 +534,9 @@ export function createExplorerSpoRewardsRouter(deps: RouterDeps = {}): Router {
   const router = Router();
   const apiFactory = deps.apiFactory ?? defaultApiFactory;
   const koiosFetch = deps.koiosFetch ?? defaultKoiosFetch;
+  const koiosCurrentEpoch = deps.koiosCurrentEpoch ?? defaultKoiosCurrentEpoch;
+  const koiosPoolBlocksInEpoch =
+    deps.koiosPoolBlocksInEpoch ?? defaultKoiosPoolBlocksInEpoch;
 
   let cached: RewardsSnapshot | null = null;
   let cachedAt = 0;
@@ -454,7 +555,12 @@ export function createExplorerSpoRewardsRouter(deps: RouterDeps = {}): Router {
       }
 
       try {
-        const snapshot = await buildSnapshot(apiFactory, koiosFetch);
+        const snapshot = await buildSnapshot(
+          apiFactory,
+          koiosFetch,
+          koiosCurrentEpoch,
+          koiosPoolBlocksInEpoch,
+        );
         cached = snapshot;
         cachedAt = now;
         res.status(200).end(JSON.stringify(snapshot));
