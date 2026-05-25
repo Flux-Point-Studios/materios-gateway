@@ -12,6 +12,7 @@ import express from "express";
 import {
   createExplorerValidatorsRouter,
   type ExplorerApiFactory,
+  type HeartbeatProvider,
 } from "../explorer-validators.js";
 
 interface CallResult {
@@ -69,6 +70,18 @@ const UNKNOWN_PUBKEY =
 const AURA_GEMTEK = "0x" + "11".repeat(32);
 const AURA_NODE2 = "0x" + "22".repeat(32);
 const AURA_NODE3 = "0x" + "33".repeat(32);
+
+// SS58-encoded equivalents (Substrate prefix 42) of the aura hex pubkeys above.
+// Derived once and pinned so tests don't depend on @polkadot/util-crypto at runtime.
+const AURA_GEMTEK_SS58 = "5CT5jwBEAhveEjgiSCQbkaKcKcUyF3VJ8qNXM9rXsuQyn3Kd";
+const AURA_NODE2_SS58 = "5CqTdCcXCC7kv1Nwq2sCeJUNVqxbBPXjMAUXrbhRJtrUiyPP";
+const AURA_NODE3_SS58 = "5DDqWU3pDgJsbH5BDsKoY2d8g5SD7jaAZVaYN3YJjtHygLwZ";
+
+// Synthetic cert-daemon SS58s (separate signers from aura keys; matches real
+// deployment where cert-daemon and validator run on distinct keypairs).
+const CERTD_GEMTEK = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+const CERTD_NODE2 = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty";
+const CERTD_NODE3 = "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy";
 
 const GRANDPA_GEMTEK = "0x" + "aa".repeat(32);
 const GRANDPA_NODE2 = "0x" + "bb".repeat(32);
@@ -402,5 +415,296 @@ describe("GET /preprod-explorer/api/validators", () => {
     const node2 = cc.find((c) => c.sidechain === NODE2)!;
     expect(gem.blocksInLast60).toBeGreaterThan(0);
     expect(node2.blocksInLast60).toBeGreaterThan(0);
+  });
+});
+
+describe("stale heartbeat detection", () => {
+  // Fixed head + committee shared across every test in this block.
+  // We vary only the heartbeat provider per test so each branch is isolated.
+  const HEAD = 1000;
+  const baseSlots = new Map<number, bigint>();
+  for (let n = 1; n <= HEAD; n++) baseSlots.set(n, BigInt(n));
+  const baseCfg: FakeChainConfig = {
+    headNumber: HEAD,
+    slotByHeight: baseSlots,
+    currentCommittee: [
+      [GEMTEK, { aura: AURA_GEMTEK, grandpa: GRANDPA_GEMTEK }],
+      [NODE2, { aura: AURA_NODE2, grandpa: GRANDPA_NODE2 }],
+      [NODE3, { aura: AURA_NODE3, grandpa: GRANDPA_NODE3 }],
+    ],
+    nextCommittee: null,
+    asOfIso: "2026-05-24T00:00:00Z",
+    scEpoch: 500000,
+  };
+  const baseBindings = {
+    [AURA_GEMTEK_SS58]: CERTD_GEMTEK,
+    [AURA_NODE2_SS58]: CERTD_NODE2,
+    [AURA_NODE3_SS58]: CERTD_NODE3,
+  };
+
+  function heartbeatProvider(byCertDaemonSs58: Record<string, number>): HeartbeatProvider {
+    return () => ({
+      bindings: baseBindings,
+      heartbeats: Object.entries(byCertDaemonSs58).map(([ss58, bestBlock]) => ({
+        validatorId: ss58,
+        bestBlock,
+      })),
+    });
+  }
+
+  test("gap below threshold → status stays 'online', staleHeartbeat:false", async () => {
+    // GEMTEK 50 blocks behind; threshold 100; should not be stale.
+    const app = express();
+    app.use(
+      createExplorerValidatorsRouter({
+        apiFactory: () => makeFakeApi(baseCfg),
+        heartbeatProvider: heartbeatProvider({
+          [CERTD_GEMTEK]: HEAD - 50,
+          [CERTD_NODE2]: HEAD,
+          [CERTD_NODE3]: HEAD,
+        }),
+        staleThresholdBlocks: 100,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/validators");
+    expect(res.status).toBe(200);
+    const cc = (res.body as { currentCommittee: Array<Record<string, unknown>> })
+      .currentCommittee;
+    const gem = cc.find((c) => c.sidechain === GEMTEK)!;
+    expect(gem.status).toBe("online");
+    expect(gem.staleHeartbeat).toBe(false);
+    expect(gem.heartbeatBestBlock).toBe(HEAD - 50);
+    expect(gem.heartbeatGap).toBe(50);
+  });
+
+  test("gap above threshold → status flips to 'stale', staleHeartbeat:true", async () => {
+    // NODE3 117k blocks behind (production-observed wedge); threshold 100.
+    const app = express();
+    app.use(
+      createExplorerValidatorsRouter({
+        apiFactory: () => makeFakeApi({ ...baseCfg, headNumber: 323_574 }),
+        heartbeatProvider: heartbeatProvider({
+          [CERTD_GEMTEK]: 323_574,
+          [CERTD_NODE2]: 323_570,
+          [CERTD_NODE3]: 206_207,
+        }),
+        staleThresholdBlocks: 100,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/validators");
+    expect(res.status).toBe(200);
+    const cc = (res.body as { currentCommittee: Array<Record<string, unknown>> })
+      .currentCommittee;
+    const node3 = cc.find((c) => c.sidechain === NODE3)!;
+    expect(node3.status).toBe("stale");
+    expect(node3.staleHeartbeat).toBe(true);
+    expect(node3.heartbeatBestBlock).toBe(206_207);
+    expect(node3.heartbeatGap).toBe(323_574 - 206_207);
+
+    // Sibling validators with fresh heartbeats remain online.
+    const gem = cc.find((c) => c.sidechain === GEMTEK)!;
+    expect(gem.status).toBe("online");
+    expect(gem.staleHeartbeat).toBe(false);
+  });
+
+  test("gap exactly at threshold → online (boundary is gap > threshold)", async () => {
+    const app = express();
+    app.use(
+      createExplorerValidatorsRouter({
+        apiFactory: () => makeFakeApi(baseCfg),
+        heartbeatProvider: heartbeatProvider({
+          [CERTD_GEMTEK]: HEAD - 100,
+          [CERTD_NODE2]: HEAD,
+          [CERTD_NODE3]: HEAD,
+        }),
+        staleThresholdBlocks: 100,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/validators");
+    const cc = (res.body as { currentCommittee: Array<Record<string, unknown>> })
+      .currentCommittee;
+    const gem = cc.find((c) => c.sidechain === GEMTEK)!;
+    expect(gem.heartbeatGap).toBe(100);
+    expect(gem.staleHeartbeat).toBe(false);
+    expect(gem.status).toBe("online");
+  });
+
+  test("heartbeat missing entirely → status:'offline', heartbeatBestBlock:null", async () => {
+    const app = express();
+    app.use(
+      createExplorerValidatorsRouter({
+        apiFactory: () => makeFakeApi(baseCfg),
+        heartbeatProvider: heartbeatProvider({
+          [CERTD_GEMTEK]: HEAD,
+          [CERTD_NODE2]: HEAD,
+          // NODE3 deliberately absent — no heartbeat received.
+        }),
+        staleThresholdBlocks: 100,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/validators");
+    const cc = (res.body as { currentCommittee: Array<Record<string, unknown>> })
+      .currentCommittee;
+    const node3 = cc.find((c) => c.sidechain === NODE3)!;
+    expect(node3.status).toBe("offline");
+    expect(node3.staleHeartbeat).toBe(false);
+    expect(node3.heartbeatBestBlock).toBeNull();
+    expect(node3.heartbeatGap).toBeNull();
+  });
+
+  test("heartbeat ahead of chain.head → gap clamped to 0, status:'online'", async () => {
+    // Shouldn't happen in practice (heartbeat best_block > our seen head),
+    // but a momentarily-ahead daemon must not produce negative gaps.
+    const app = express();
+    app.use(
+      createExplorerValidatorsRouter({
+        apiFactory: () => makeFakeApi(baseCfg),
+        heartbeatProvider: heartbeatProvider({
+          [CERTD_GEMTEK]: HEAD + 5,
+          [CERTD_NODE2]: HEAD,
+          [CERTD_NODE3]: HEAD,
+        }),
+        staleThresholdBlocks: 100,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/validators");
+    const cc = (res.body as { currentCommittee: Array<Record<string, unknown>> })
+      .currentCommittee;
+    const gem = cc.find((c) => c.sidechain === GEMTEK)!;
+    expect(gem.heartbeatGap).toBe(0);
+    expect(gem.staleHeartbeat).toBe(false);
+    expect(gem.status).toBe("online");
+  });
+
+  test("EXPLORER_STALE_HEARTBEAT_BLOCKS env override changes the threshold", async () => {
+    const original = process.env.EXPLORER_STALE_HEARTBEAT_BLOCKS;
+    process.env.EXPLORER_STALE_HEARTBEAT_BLOCKS = "30";
+    try {
+      const app = express();
+      app.use(
+        createExplorerValidatorsRouter({
+          apiFactory: () => makeFakeApi(baseCfg),
+          heartbeatProvider: heartbeatProvider({
+            [CERTD_GEMTEK]: HEAD - 50,
+            [CERTD_NODE2]: HEAD,
+            [CERTD_NODE3]: HEAD,
+          }),
+          // No staleThresholdBlocks override → falls back to env.
+        }),
+      );
+      const res = await callApp(app, "/preprod-explorer/api/validators");
+      const cc = (res.body as { currentCommittee: Array<Record<string, unknown>> })
+        .currentCommittee;
+      const gem = cc.find((c) => c.sidechain === GEMTEK)!;
+      expect(gem.heartbeatGap).toBe(50);
+      expect(gem.status).toBe("stale");
+      expect(gem.staleHeartbeat).toBe(true);
+    } finally {
+      if (original === undefined) delete process.env.EXPLORER_STALE_HEARTBEAT_BLOCKS;
+      else process.env.EXPLORER_STALE_HEARTBEAT_BLOCKS = original;
+    }
+  });
+
+  test("offline never overridden by stale even if a stale heartbeat row exists", async () => {
+    // Operational invariant: if the cert-daemon stops POSTing entirely it's
+    // offline. Even though best_block is stale, "offline" is the more severe
+    // signal and must win — there's nothing to be stale ABOUT once no
+    // heartbeat is being received.
+    //
+    // The heartbeat provider here returns rows for GEMTEK/NODE2 only.
+    // NODE3 has no row at all (the production "offline" path). The route
+    // must report offline, not stale, regardless of any old data.
+    const app = express();
+    app.use(
+      createExplorerValidatorsRouter({
+        apiFactory: () => makeFakeApi(baseCfg),
+        heartbeatProvider: heartbeatProvider({
+          [CERTD_GEMTEK]: HEAD - 200, // stale, gap 200
+          [CERTD_NODE2]: HEAD,
+        }),
+        staleThresholdBlocks: 100,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/validators");
+    const cc = (res.body as { currentCommittee: Array<Record<string, unknown>> })
+      .currentCommittee;
+    const node3 = cc.find((c) => c.sidechain === NODE3)!;
+    expect(node3.status).toBe("offline");
+    const gem = cc.find((c) => c.sidechain === GEMTEK)!;
+    expect(gem.status).toBe("stale");
+    expect(gem.heartbeatGap).toBe(200);
+  });
+});
+
+describe("HTML page /materios/explorer/validators", () => {
+  test("stale validator renders the warn badge and the formatted gap", async () => {
+    const slotByHeight = new Map<number, bigint>();
+    for (let n = 1; n <= 60; n++) slotByHeight.set(n, BigInt(n));
+    const cfg: FakeChainConfig = {
+      headNumber: 323_574,
+      slotByHeight,
+      currentCommittee: [
+        [GEMTEK, { aura: AURA_GEMTEK, grandpa: GRANDPA_GEMTEK }],
+        [NODE3, { aura: AURA_NODE3, grandpa: GRANDPA_NODE3 }],
+      ],
+      nextCommittee: null,
+      asOfIso: "2026-05-24T00:00:00Z",
+      scEpoch: 500_000,
+    };
+    const heartbeats: HeartbeatProvider = () => ({
+      bindings: {
+        [AURA_GEMTEK_SS58]: CERTD_GEMTEK,
+        [AURA_NODE3_SS58]: CERTD_NODE3,
+      },
+      heartbeats: [
+        { validatorId: CERTD_GEMTEK, bestBlock: 323_574 },
+        { validatorId: CERTD_NODE3, bestBlock: 206_207 },
+      ],
+    });
+    const app = express();
+    app.use(
+      createExplorerValidatorsRouter({
+        apiFactory: () => makeFakeApi(cfg),
+        heartbeatProvider: heartbeats,
+        staleThresholdBlocks: 100,
+      }),
+    );
+    const res = await callApp(app, "/materios/explorer/validators");
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toMatch(/text\/html/);
+    const html = String(res.body);
+    // Yellow "Stale" badge for NODE3, with the gap rendered next to it.
+    expect(html).toMatch(/badge warn[^>]*>\s*Stale\s*</);
+    expect(html).toContain("117,367 blocks behind");
+    // GEMTEK still shows an Online badge.
+    expect(html).toMatch(/badge ok[^>]*>\s*Online\s*</);
+  });
+
+  test("html escapes the gap formatting (defense-in-depth)", async () => {
+    const slotByHeight = new Map<number, bigint>();
+    for (let n = 1; n <= 60; n++) slotByHeight.set(n, BigInt(n));
+    const cfg: FakeChainConfig = {
+      headNumber: 1000,
+      slotByHeight,
+      currentCommittee: [[NODE2, { aura: AURA_NODE2, grandpa: GRANDPA_NODE2 }]],
+      nextCommittee: null,
+      asOfIso: "2026-05-24T00:00:00Z",
+      scEpoch: 500_000,
+    };
+    const heartbeats: HeartbeatProvider = () => ({
+      bindings: { [AURA_NODE2_SS58]: CERTD_NODE2 },
+      heartbeats: [{ validatorId: CERTD_NODE2, bestBlock: 1000 }],
+    });
+    const app = express();
+    app.use(
+      createExplorerValidatorsRouter({
+        apiFactory: () => makeFakeApi(cfg),
+        heartbeatProvider: heartbeats,
+      }),
+    );
+    const res = await callApp(app, "/materios/explorer/validators");
+    expect(res.status).toBe(200);
+    // No script injection vectors in the rendered shell.
+    expect(String(res.body)).not.toContain("<script>alert");
   });
 });
