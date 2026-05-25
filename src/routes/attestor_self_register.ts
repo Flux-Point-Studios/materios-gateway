@@ -29,6 +29,7 @@
 
 import type { Express, Request, Response } from "express";
 import { selfRegisterAttestor } from "../attestor_self_register.js";
+import { LABEL_FORBIDDEN } from "../label_validation.js";
 
 export function registerAttestorSelfRegisterRoutes(app: Express): void {
   app.post("/v2/attestor_self_register", (req: Request, res: Response) => {
@@ -87,10 +88,20 @@ export function registerAttestorSelfRegisterRoutes(app: Express): void {
         }
       }
 
-      const label =
-        typeof body.label === "string" && body.label.trim()
-          ? body.label.trim().slice(0, 100)
-          : null;
+      let label: string | null = null;
+      if (typeof body.label === "string" && body.label.trim()) {
+        const trimmed = body.label.trim();
+        if (LABEL_FORBIDDEN.test(trimmed)) {
+          res.status(400).json({
+            ok: false,
+            code: "LABEL_INVALID",
+            message:
+              "label must not contain HTML metachars (<, >, &, \", ') or control characters",
+          });
+          return;
+        }
+        label = trimmed.slice(0, 100);
+      }
 
       const outcome = selfRegisterAttestor(
         {

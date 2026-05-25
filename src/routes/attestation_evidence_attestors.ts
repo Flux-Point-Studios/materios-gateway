@@ -15,6 +15,7 @@
 import type { Express, Request, Response } from "express";
 import { config } from "../config.js";
 import { adminGuard } from "../bearer-auth.js";
+import { LABEL_FORBIDDEN } from "../label_validation.js";
 import {
   registerAttestationEvidenceAttestor,
   revokeAttestationEvidenceAttestor,
@@ -89,10 +90,18 @@ export function registerAttestationEvidenceAttestorRoutes(
           });
           return;
         }
-        const label =
-          typeof body.label === "string" && body.label.trim()
-            ? body.label.trim()
-            : null;
+        let label: string | null = null;
+        if (typeof body.label === "string" && body.label.trim()) {
+          const trimmed = body.label.trim();
+          if (LABEL_FORBIDDEN.test(trimmed)) {
+            res.status(400).json({
+              error:
+                "label must not contain HTML metachars (<, >, &, \", ') or control characters",
+            });
+            return;
+          }
+          label = trimmed;
+        }
         const notes =
           typeof body.notes === "string" && body.notes.trim()
             ? body.notes.trim()

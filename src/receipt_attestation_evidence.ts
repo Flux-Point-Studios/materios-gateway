@@ -407,3 +407,31 @@ export function markReceiptEvidenceSubmittedToChain(input: {
     .get(input.row_id) as ReceiptEvidenceRow;
   return { status: "marked", row: updated };
 }
+
+/**
+ * Distinct receipt_ids that a given attestor has signed within `windowMs`
+ * before `nowMs`. Used by the witness-network topology builder to fan
+ * per-attestor chain trust-score lookups.
+ *
+ * Empty array when the DB has no matching rows or isn't initialised.
+ */
+export function listReceiptsForAttestorSince(
+  attestorPubkeyHex: string,
+  nowMs: number,
+  windowMs: number,
+): string[] {
+  if (!db) return [];
+  const cutoff = nowMs - windowMs;
+  const normalized = attestorPubkeyHex.startsWith("0x")
+    ? attestorPubkeyHex.slice(2).toLowerCase()
+    : attestorPubkeyHex.toLowerCase();
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT receipt_id
+         FROM receipt_attestation_evidence
+        WHERE attestor_pubkey_hex = ?
+          AND submitted_at_ms > ?`,
+    )
+    .all(normalized, cutoff) as Array<{ receipt_id: string }>;
+  return rows.map((r) => r.receipt_id);
+}

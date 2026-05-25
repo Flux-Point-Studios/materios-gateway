@@ -93,6 +93,7 @@ import {
   recomputeReceiptEvidenceHash,
 } from "../receipt_attestation_evidence.js";
 import { getManifest, computeReceiptId } from "../storage.js";
+import { recordWitnessObservationFromRequest } from "../witness_observation_hook.js";
 
 export const attestationEvidenceRouter = Router();
 
@@ -526,6 +527,26 @@ attestationEvidenceRouter.post(
       const summary = recomputeReceiptEvidenceHash(canonicalReceiptId);
       // Spec wire status: "accepted" on first store, "replay" on second.
       const wireStatus = outcome.status === "inserted" ? "accepted" : "replay";
+
+      // Record a witness-network observation IFF this was the first store
+      // (not a replay) — replays don't represent new uptime evidence.
+      // The hook is privacy-preserving: hashes the IP with a per-process
+      // salt before any persistence, and persists only city-centroid geo.
+      // Any failure inside the hook is swallowed so it cannot break the
+      // 200 OK return on the existing evidence-ingestion contract.
+      if (outcome.status === "inserted") {
+        try {
+          recordWitnessObservationFromRequest({
+            attestorPubkeyHex: attestorPubHex,
+            req,
+            nowMs: Date.now(),
+          });
+        } catch {
+          // Fail-open: a stale geoip DB or sqlite hiccup must not 500 the
+          // evidence sink. The route handler's outer catch covers logging.
+        }
+      }
+
       res.status(200).json({
         ok: true,
         status: wireStatus,

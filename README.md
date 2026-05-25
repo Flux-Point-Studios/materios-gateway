@@ -33,6 +33,8 @@ SDK / Operator  -->  Blob Gateway  -->  Disk storage (/data/blobs)
 | `GET` | `/locators/:receiptId` | Resolve receipt to blob location |
 | `GET` | `/chunks/:receiptId/:i` | Download chunk by index |
 | `GET` | `/batches/:anchorId` | Batch metadata for Merkle verification |
+| `GET` | `/api/witness-network/topology` | Witness Network live topology JSON (per-attestor city geo + trust score) |
+| `GET` | `/witness/map` | Witness Network live map UI (Leaflet + OpenStreetMap) |
 
 ### Authenticated (signature or API key)
 
