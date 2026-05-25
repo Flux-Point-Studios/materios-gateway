@@ -26,7 +26,7 @@ import {
   headerNumber,
   normalizeAuraKey,
   readAuraAuthorities,
-  readAuraSlot,
+  readAuraSlotFromRawHeader,
   readScEpoch,
 } from "./explorer-chain.js";
 
@@ -175,11 +175,23 @@ async function scanAuthors(api: any, head: number, auras: string[]): Promise<Aut
   const startHeight = Math.max(1, head - SCAN_WINDOW_BLOCKS + 1);
   const heights: number[] = [];
   for (let n = startHeight; n <= head; n++) heights.push(n);
-  // Fan out hashes + headers in parallel — same shape as explorer-validators.
+  // Fan out hashes in parallel, then fetch raw headers. We use the raw
+  // JSON-RPC path (`getHeader.raw`) because the decorated polkadot.js
+  // `getHeader(hash)` is fronted by `state_getRuntimeVersion(hash)` so the
+  // client can pick the right metadata to decode against — and that
+  // sidecar call 4003s "State already discarded" for any block past the
+  // node's pruning depth (default 256). Headers themselves are always
+  // retained regardless of state pruning. Aura slot decoding only needs
+  // the SCALE-encoded preRuntime digest log; runtime metadata is irrelevant.
   const hashes = await Promise.all(heights.map((n) => api.rpc.chain.getBlockHash(n)));
-  const headers = await Promise.all(hashes.map((h: unknown) => api.rpc.chain.getHeader(h)));
+  const headers = await Promise.all(
+    hashes.map((h: unknown) => {
+      const hex = (h as { toHex?: () => string }).toHex?.() ?? h;
+      return api.rpc.chain.getHeader.raw(hex);
+    }),
+  );
   for (let i = 0; i < headers.length; i++) {
-    const slot = readAuraSlot(headers[i]);
+    const slot = readAuraSlotFromRawHeader(headers[i]);
     if (slot === null) continue;
     const leader = auras[Number(slot % BigInt(auras.length))];
     leaderByHeight.set(heights[i], leader);
