@@ -55,6 +55,13 @@ import { attestationEvidenceSubmissionRouter } from "./routes/attestation_eviden
 import { FirehoseBus } from "./firehose/bus.js";
 import { startFirehoseSubscriber } from "./firehose/start.js";
 import { createFirehoseRouter } from "./routes/firehose.js";
+import {
+  registerWitnessTopologyRoutes,
+  setWitnessTrustScoreProvider,
+} from "./routes/witness_topology.js";
+import { initWitnessObservationsDb } from "./witness_observations.js";
+import { listReceiptsForAttestorSince } from "./receipt_attestation_evidence.js";
+import { queryCompositeTrustScoresByReceiptId } from "./billing/chain_query.js";
 // initChainInfoPoller is re-exported for consumers that want to pre-warm the
 // cache at startup; we also call it in start() so the first /chain-info hit
 // after cold-start returns 200 instead of 503.
@@ -126,6 +133,7 @@ registerObserverRoutes(app);      // Wave 1+2: compute_metering_v2 optional co-s
 registerAttestationEvidenceAttestorRoutes(app); // Wave 3 Phase 2: TEE attestor pubkey registry (admin-only)
 registerWitnessTargetRoutes(app); // Witness Network: probe-target URL roster — public GET, admin POST/DELETE
 registerAttestorSelfRegisterRoutes(app); // Witness Network: POST /v2/attestor_self_register — phones self-onboard via Android Key Attestation cert chain
+registerWitnessTopologyRoutes(app); // Witness Network: GET /api/witness-network/topology + /witness/map live map page
 registerMultisigSigsRoutes(app); // Task #286: GET/POST /v2/multisig_sigs/{kind}/{key} — cert-daemon M-of-N envelope coordination (settle/expire)
 
 // Receipt firehose — live SSE feed of ReceiptSubmitted / AvailabilityCertified
@@ -156,8 +164,10 @@ async function start(): Promise<void> {
   // schema migrations stay isolated from operators.db / quota.db.
   initFleetOperatorsDb();
   initObserversDb();
-  // Witness Network: per-URL probe-target roster (witness_targets.db).
+  // Witness Network: per-URL probe-target roster (witness_targets.db) +
+  // privacy-preserving per-attestor observation log (witness_observations.db).
   initWitnessTargetsDb();
+  initWitnessObservationsDb();
   // Wave 3 Phase 2 — TEE attestor registry + per-receipt evidence vector.
   initAttestationEvidenceAttestorsDb();
   initReceiptAttestationEvidenceDb();
@@ -186,12 +196,25 @@ async function start(): Promise<void> {
     console.error("[receipt-indexer] Failed to start:", err),
   );
 
-  // Receipt firehose subscriber — connects to chain WS and publishes
-  // OrinqReceipts events onto `firehoseBus`. The /api/firehose/stream SSE
-  // handler reads from the same bus.
   startFirehoseSubscriber(firehoseBus).catch((err) =>
     console.error("[firehose] subscriber boot failed:", err),
   );
+
+  setWitnessTrustScoreProvider(async (attestorPubkeyHex) => {
+    const windowMs = 24 * 3600 * 1000;
+    const receiptIds = listReceiptsForAttestorSince(
+      attestorPubkeyHex,
+      Date.now(),
+      windowMs,
+    );
+    if (receiptIds.length === 0) return null;
+    const scores = await queryCompositeTrustScoresByReceiptId(receiptIds);
+    const concrete = scores
+      .map((s) => s.composite_trust_score)
+      .filter((s): s is number => s !== null);
+    if (concrete.length === 0) return null;
+    return concrete.reduce((a, b) => a + b, 0) / concrete.length;
+  });
 
   app.listen(config.port, () => {
     console.log(`[blob-gateway] Service started on port ${config.port}`);

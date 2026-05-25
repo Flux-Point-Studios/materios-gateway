@@ -291,59 +291,99 @@ export async function queryCompositeTrustScores(
   // from a forkless upgrade not yet picked up) degrades only that record,
   // not the whole batch.
   const out = await Promise.all(
-    ids.map(async ({ content_hash, receipt_id }): Promise<ChainTrustScore> => {
-      try {
-        // The pallet may not be present on chains that haven't received
-        // the spec-213/214 runtime upgrade — guard against undefined to
-        // avoid throwing inside the .map.
-        const teeQuery = api.query?.teeAttestation?.compositeTrustScores;
-        if (typeof teeQuery !== "function") {
-          return { content_hash, receipt_id, composite_trust_score: null };
-        }
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const result: any = await teeQuery(receipt_id);
-        if (result?.isEmpty === true) {
-          // OptionQuery / forward-compat path: treat as "no evidence".
-          return { content_hash, receipt_id, composite_trust_score: 0 };
-        }
-        // `CompositeTrustScore(pub u8)` — substrate may decode this as a
-        // bare number, a `{ value: number }` shape, or a Codec with
-        // `.toNumber()`. Handle all three so the gateway doesn't rev-lock
-        // to a specific @polkadot/api version.
-        const raw = result?.toJSON?.() ?? result;
-        let score: number | null = null;
-        if (typeof raw === "number") {
-          score = raw;
-        } else if (raw && typeof raw === "object") {
-          const o = raw as Record<string, unknown>;
-          const cand = o.value ?? o[0] ?? o;
-          if (typeof cand === "number") {
-            score = cand;
-          } else if (cand && typeof (cand as { toNumber?: () => number }).toNumber === "function") {
-            score = (cand as { toNumber: () => number }).toNumber();
-          }
-        }
-        if (score === null && typeof (result as { toNumber?: () => number })?.toNumber === "function") {
-          score = (result as { toNumber: () => number }).toNumber();
-        }
-        if (score === null || !Number.isFinite(score)) {
-          return { content_hash, receipt_id, composite_trust_score: null };
-        }
-        // Clamp to the expected 0..=4 band — anything else is a decode
-        // bug, not a valid score, so surface null rather than confuse the
-        // consumer with a fabricated value.
-        const intScore = Math.trunc(score);
-        if (intScore < 0 || intScore > 4) {
-          return { content_hash, receipt_id, composite_trust_score: null };
-        }
-        return { content_hash, receipt_id, composite_trust_score: intScore };
-      } catch {
-        return { content_hash, receipt_id, composite_trust_score: null };
-      }
-    }),
+    ids.map(async ({ content_hash, receipt_id }): Promise<ChainTrustScore> => ({
+      content_hash,
+      receipt_id,
+      composite_trust_score: await queryOneCompositeTrustScore(api, receipt_id),
+    })),
   );
 
   return out;
+}
+
+/**
+ * Shared decode logic for `teeAttestation.compositeTrustScores(receipt_id)`.
+ *
+ *   - Null  = couldn't ask chain (pallet absent, decoder threw, score
+ *             outside expected 0..=4 band).
+ *   - 0     = chain reachable, no TEE evidence yet for this receipt.
+ *   - 1..=4 = concrete band value.
+ *
+ * `CompositeTrustScore(pub u8)` may arrive from substrate as a bare
+ * number, a `{ value: number }` shape, or a Codec with `.toNumber()` —
+ * handle all three so the gateway doesn't rev-lock to a specific
+ * @polkadot/api version.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function queryOneCompositeTrustScore(api: any, receiptId: string): Promise<number | null> {
+  try {
+    const teeQuery = api.query?.teeAttestation?.compositeTrustScores;
+    if (typeof teeQuery !== "function") return null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result: any = await teeQuery(receiptId);
+    if (result?.isEmpty === true) return 0;
+
+    const raw = result?.toJSON?.() ?? result;
+    let score: number | null = null;
+    if (typeof raw === "number") {
+      score = raw;
+    } else if (raw && typeof raw === "object") {
+      const o = raw as Record<string, unknown>;
+      const cand = o.value ?? o[0] ?? o;
+      if (typeof cand === "number") {
+        score = cand;
+      } else if (cand && typeof (cand as { toNumber?: () => number }).toNumber === "function") {
+        score = (cand as { toNumber: () => number }).toNumber();
+      }
+    }
+    if (score === null && typeof (result as { toNumber?: () => number })?.toNumber === "function") {
+      score = (result as { toNumber: () => number }).toNumber();
+    }
+    if (score === null || !Number.isFinite(score)) return null;
+
+    const intScore = Math.trunc(score);
+    if (intScore < 0 || intScore > 4) return null;
+    return intScore;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Per-receipt-id variant of `queryCompositeTrustScores`. Skips the
+ * content_hash → receipt_id derivation because callers (witness-network
+ * topology) already hold the canonical receipt_id from their local store.
+ *
+ * Returns one entry per input receipt_id. Null score means "couldn't ask
+ * chain"; 0 means "chain reachable, no TEE evidence yet"; 1..=4 are
+ * concrete band values. The receipt_id passed in is echoed back so
+ * callers can map results without an extra index.
+ */
+export async function queryCompositeTrustScoresByReceiptId(
+  receiptIds: readonly string[],
+  apiOverride?: unknown,
+): Promise<Array<{ receipt_id: string; composite_trust_score: number | null }>> {
+  if (receiptIds.length === 0) return [];
+  const ids = Array.from(new Set(receiptIds.map((r) => (r.startsWith("0x") ? r : "0x" + r))));
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let api: any = apiOverride;
+  if (api === undefined) {
+    const pending = getOrConnectApi();
+    if (!pending) return ids.map((r) => ({ receipt_id: r, composite_trust_score: null }));
+    try {
+      api = await pending;
+    } catch {
+      return ids.map((r) => ({ receipt_id: r, composite_trust_score: null }));
+    }
+  }
+
+  return await Promise.all(
+    ids.map(async (receipt_id) => ({
+      receipt_id,
+      composite_trust_score: await queryOneCompositeTrustScore(api, receipt_id),
+    })),
+  );
 }
 
 // ---------------------------------------------------------------------------
