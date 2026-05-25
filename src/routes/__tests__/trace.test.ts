@@ -311,9 +311,13 @@ describe("GET /trace/:contentHash", () => {
     expect(html).toContain("certified_at_block");
     expect(html).toContain("91131");
 
-    // Viewport meta + no external script/stylesheet refs.
+    // Viewport meta + lineage graph CDN script is the only external script.
     expect(html).toContain('name="viewport"');
-    expect(html).not.toMatch(/<script[^>]+src=/);
+    expect(html).toMatch(/<script[^>]+src="https:\/\/unpkg\.com\/cytoscape@/);
+    const externalScripts = html.match(/<script[^>]+src=["']([^"']+)["']/g) ?? [];
+    expect(externalScripts).toHaveLength(1);
+    // The lineage payload is inline JSON only.
+    expect(html).toContain('<script id="lineage-data" type="application/json">');
     expect(html).not.toMatch(/<link[^>]+href=["']https?:\/\//);
 
     // CORS open for read.
