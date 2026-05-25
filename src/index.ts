@@ -23,6 +23,7 @@ import { registerTokenRoutes } from "./routes/tokens.js";
 import { chainInfoRouter, initChainInfoPoller } from "./routes/chain-info.js";
 import { explorerValidatorsRouter } from "./routes/explorer-validators.js";
 import { explorerSpoRewardsRouter } from "./routes/explorer-spo-rewards.js";
+import { explorerOperatorRouter } from "./routes/explorer-operator.js";
 import { traceRouter } from "./routes/trace.js";
 import { faucetRouter } from "./routes/faucet.js";
 import { registerAdminKeysRoutes } from "./routes/admin-keys.js";
@@ -111,6 +112,7 @@ app.use(operatorsRouter);   // Invite-only operator registration
 app.use(chainInfoRouter);   // Public: /chain-info — used by flux1 explorer + cert-daemon auto-discovery
 app.use(explorerValidatorsRouter); // Task #337: GET /preprod-explorer/api/validators — public committee snapshot for SPO operators.
 app.use(explorerSpoRewardsRouter); // Task #341: GET /preprod-explorer/api/spo-rewards — dual-stream MATRA+ADA lifetime rewards by operator.
+app.use(explorerOperatorRouter); // Per-operator detail surface: JSON at /preprod-explorer/api/operator/:ss58, HTML at /materios/explorer/operator/:ss58.
 app.use(traceRouter);       // GET /trace/:contentHash (HTML lineage graph) + GET /trace/api/lineage/:contentHash (JSON).
 app.use(faucetRouter);      // Public: /faucet/drip — operator onboarding (MATRA + MOTRA bootstrap). Volume-mounted overrides accepted; see ops compose templates.
 app.use(meteringRouter);    // Task #109: POST /metering/submit — compute_metering_v1 ingestion + sponsored-receipt forwarding.
