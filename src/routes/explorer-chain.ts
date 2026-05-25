@@ -46,6 +46,46 @@ export function readAuraSlot(header: unknown): bigint | null {
 }
 
 /**
+ * Decode the aura slot from a raw JSON-RPC header (the shape returned by
+ * `api.rpc.chain.getHeader.raw(hash)`), where `digest.logs` is a list of
+ * hex-encoded log entries rather than Codec objects.
+ *
+ * This path is required for historical block authorship scans on a Substrate
+ * node running the default --state-pruning=256: the standard polkadot.js
+ * getHeader(hash) call is fronted by state_getRuntimeVersion(hash) so the
+ * client can pick the right metadata to decode under, and that lookup 4003s
+ * for any block whose state has been discarded. Headers themselves are
+ * always retained, and the raw shape doesn't need state.
+ *
+ * Each preRuntime log is SCALE-encoded as:
+ *   variant(0x06) | engine_id(4 bytes ASCII) | compact_len | payload
+ * For aura the engine_id is "aura", payload is u64 LE slot (8 bytes), and
+ * the compact-length byte for an 8-byte payload is 0x20 (= 8 << 2).
+ */
+// PreRuntime digest variant in `sp_runtime::DigestItem` SCALE encoding.
+const DIGEST_PRERUNTIME_VARIANT = 0x06;
+// Minimum preRuntime+aura log size: 1 variant + 4 engine + 1 compact + 8 slot.
+const MIN_AURA_LOG_BYTES = 14;
+
+export function readAuraSlotFromRawHeader(rawHeader: unknown): bigint | null {
+  if (typeof rawHeader !== "object" || rawHeader === null) return null;
+  const h = rawHeader as { digest?: { logs?: unknown[] } };
+  const logs = h.digest?.logs ?? [];
+  for (const log of logs) {
+    if (typeof log !== "string") continue;
+    const hex = log.startsWith("0x") ? log.slice(2) : log;
+    if (hex.length < MIN_AURA_LOG_BYTES * 2) continue;
+    const buf = Buffer.from(hex, "hex");
+    if (buf.length < MIN_AURA_LOG_BYTES) continue;
+    if (buf[0] !== DIGEST_PRERUNTIME_VARIANT) continue;
+    if (buf.toString("ascii", 1, 5) !== "aura") continue;
+    // buf[5] is the SCALE compact-length byte (0x20 for an 8-byte payload).
+    return buf.readBigUInt64LE(6);
+  }
+  return null;
+}
+
+/**
  * Best-effort head-number extractor. polkadot.js gives a Codec-shaped
  * number — `.toNumber()` is the canonical accessor; `.toJSON()` returns a
  * hex string. We tolerate both for test ergonomics.

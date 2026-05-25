@@ -110,6 +110,25 @@ interface FakeChainConfig {
   // per-receipt; the route returns the latest score we've observed for
   // this signer. Tests short-circuit by keying directly off the aura.
   compositeTrustByAura?: Map<string, number>;
+  // Simulate Substrate's --state-pruning=N: blocks deeper than this throw
+  // 4003 from the polkadot.js-decorated getHeader(hash) path. Headers are
+  // still served by the raw JSON-RPC path. Undefined = archive semantics.
+  pruneDepth?: number;
+}
+
+/**
+ * Encode a Substrate digest log as a hex string the way `chain_getHeader`
+ * returns it over JSON-RPC. The aura preRuntime log is:
+ *   0x06 | engine_id ("aura" = 0x61757261) | SCALE-compact-len | u64 LE slot
+ * With an 8-byte payload the SCALE compact-length byte is 0x20 (= 8 << 2).
+ */
+function encodeAuraPreRuntimeHex(slot: bigint): string {
+  const buf = Buffer.alloc(1 + 4 + 1 + 8);
+  buf[0] = 0x06;
+  buf.write("aura", 1, 4, "ascii");
+  buf[5] = 0x20;
+  buf.writeBigUInt64LE(slot, 6);
+  return "0x" + buf.toString("hex");
 }
 
 function makeFakeApi(cfg: FakeChainConfig): unknown {
@@ -120,18 +139,54 @@ function makeFakeApi(cfg: FakeChainConfig): unknown {
       logs: cfg.slotByHeight.has(n) ? makeDigest(cfg.slotByHeight.get(n)!) : [],
     },
   });
+  // Raw JSON-RPC shape: digest.logs are hex strings (not Codec objects).
+  // Mirrors what `api.rpc.chain.getHeader.raw(hash)` returns.
+  const rawHeaderFor = (n: number) => ({
+    parentHash: `0x${(n - 1).toString(16).padStart(64, "0")}`,
+    number: `0x${n.toString(16)}`,
+    stateRoot: "0x" + "00".repeat(32),
+    extrinsicsRoot: "0x" + "00".repeat(32),
+    digest: {
+      logs: cfg.slotByHeight.has(n)
+        ? [encodeAuraPreRuntimeHex(cfg.slotByHeight.get(n)!)]
+        : [],
+    },
+  });
+  const heightFromHash = (hash: unknown): number => {
+    const hex = String((hash as { toHex?: () => string }).toHex?.() ?? hash);
+    return parseInt(hex.replace(/^0x/, ""), 16);
+  };
+  /**
+   * Substrate's default --state-pruning=256 keeps state for the last 256
+   * blocks; older blocks return 4003 "State already discarded" from
+   * api.rpc.chain.getHeader (which polkadot.js fronts with a runtime-version
+   * lookup that needs state). The raw JSON-RPC shape (.raw) has no such
+   * dependency. cfg.pruneDepth simulates that boundary.
+   */
+  const isStatePruned = (n: number): boolean => {
+    if (cfg.pruneDepth === undefined) return false;
+    return cfg.headNumber - n > cfg.pruneDepth;
+  };
+  const getHeaderFn = async (hash?: unknown) => {
+    if (hash === undefined) return headerFor(cfg.headNumber);
+    const n = heightFromHash(hash);
+    if (isStatePruned(n)) {
+      throw new Error(
+        `4003: Client error: Api called for an unknown Block: State already discarded for 0x${n.toString(16).padStart(64, "0")}`,
+      );
+    }
+    return headerFor(n);
+  };
+  // .raw is polkadot.js's escape hatch — returns the plain JSON-RPC result
+  // without metadata-aware decoding, so it works for any header the node
+  // retains (which Substrate keeps independent of state pruning).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (getHeaderFn as any).raw = async (hash: unknown) => rawHeaderFor(heightFromHash(hash));
 
   return {
     rpc: {
       chain: {
-        getHeader: async (hash?: unknown) => {
-          if (hash === undefined) return headerFor(cfg.headNumber);
-          const hex = String(
-            (hash as { toHex?: () => string }).toHex?.() ?? hash,
-          );
-          const n = parseInt(hex.replace(/^0x/, ""), 16);
-          return headerFor(n);
-        },
+        getHeader: getHeaderFn,
         getBlockHash: async (n: number) => ({
           toHex: () => `0x${n.toString(16).padStart(64, "0")}`,
         }),
@@ -489,6 +544,82 @@ describe("GET /preprod-explorer/api/operator/:ss58", () => {
     expect(anchors.length).toBe(1);
     expect(anchors[0].cardano_tx_hash).toBe(anchorTx);
     expect(anchors[0].cexplorer_url).toBe(`https://preprod.cexplorer.io/tx/${anchorTx}`);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Regression: PR #6 used api.rpc.chain.getHeader(hash) for the full ~1800
+  // block author scan. On a node with the Substrate default --state-pruning=256
+  // that path 4003s for any block deeper than 256 (polkadot.js fronts the call
+  // with state_getRuntimeVersion(hash), which needs pruned state). Headers
+  // themselves are retained — the raw JSON-RPC path keeps working.
+  // ---------------------------------------------------------------------------
+  test("deep history with state pruning: scan succeeds via raw header path → 200 + blockProduction populated", async () => {
+    const HEAD = 5000;
+    const PRUNE_DEPTH = 256;
+    // Round-robin authorship across 3 aura authorities, slot == height so the
+    // slot leader for height N is auraAuthorities[N % 3].
+    const slots = new Map<number, bigint>();
+    for (let n = 1; n <= HEAD; n++) slots.set(n, BigInt(n));
+    const cfg: FakeChainConfig = {
+      headNumber: HEAD,
+      scEpoch: 632,
+      slotByHeight: slots,
+      auraAuthorities: [NODE3_AURA, GEMTEK_AURA, HETZNER_AURA],
+      pruneDepth: PRUNE_DEPTH,
+    };
+    const app = express();
+    app.use(createExplorerOperatorRouter(makeDeps(cfg)));
+    const res = await call(app, `/preprod-explorer/api/operator/${NODE3_SS58}`);
+    expect(res.status).toBe(200);
+    const body = res.body as Record<string, unknown>;
+    const bp = body.blockProduction as Record<string, unknown>;
+    // Scan window is 1800 blocks; round-robin every 3rd is NODE3 → ≈ 600
+    // observed for the operator. Tolerate ±5 for the boundary +1 (`startHeight = max(1, head - SCAN_WINDOW + 1)`).
+    const observed = bp.lifetime_blocks_observed as number;
+    expect(observed).toBeGreaterThan(550);
+    expect(observed).toBeLessThan(650);
+    // Sparkline must cover 30 epochs end-to-end (we walked headers that
+    // existed below the 256-block state-pruning depth).
+    const sparkline = bp.blocks_per_epoch_sparkline as Array<{
+      epoch: number;
+      blocks: number;
+    }>;
+    expect(sparkline.length).toBe(30);
+    // Earliest sparkline epoch must have a non-zero block count for an
+    // authority that owns 1/3 of slots; this proves we authored deep-history
+    // blocks without depending on pruned state.
+    const earliest = sparkline[0];
+    expect(earliest.blocks).toBeGreaterThan(0);
+  });
+
+  test("regression: live Gemtek SS58 with state-pruned deep history → 200", async () => {
+    const HEAD = 325000;
+    const PRUNE_DEPTH = 256;
+    // Make Gemtek author every slot for the deep range so the test asserts
+    // that header walks attribute to the right operator across the full
+    // 1800-block window.
+    const slots = new Map<number, bigint>();
+    for (let n = 1; n <= HEAD; n++) slots.set(n, BigInt(n * 3));
+    // slot % 3 == 0 → GEMTEK_AURA when GEMTEK is at index 0
+    const cfg: FakeChainConfig = {
+      headNumber: HEAD,
+      scEpoch: 632,
+      slotByHeight: slots,
+      auraAuthorities: [GEMTEK_AURA, NODE3_AURA, HETZNER_AURA],
+      pruneDepth: PRUNE_DEPTH,
+    };
+    const liveGemtekSs58 = "5Dd7WuLMyb71NT1Bea6oEZH8Je3MkQzamHVeU4tmQbtPWq2v";
+    const app = express();
+    app.use(createExplorerOperatorRouter(makeDeps(cfg)));
+    const res = await call(app, `/preprod-explorer/api/operator/${liveGemtekSs58}`);
+    expect(res.status).toBe(200);
+    const body = res.body as Record<string, unknown>;
+    const id = body.identity as Record<string, unknown>;
+    expect(id.ss58).toBe(liveGemtekSs58);
+    expect(id.label).toBe("Gemtek");
+    const bp = body.blockProduction as Record<string, unknown>;
+    // Gemtek owns every slot in the fixture → all 1800 window blocks attributed.
+    expect(bp.lifetime_blocks_observed).toBeGreaterThan(1700);
   });
 });
 
