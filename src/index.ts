@@ -51,6 +51,9 @@ import { registerAttestorSelfRegisterRoutes } from "./routes/attestor_self_regis
 import { registerAttestationEvidenceAttestorRoutes } from "./routes/attestation_evidence_attestors.js";
 import { attestationEvidenceRouter } from "./routes/attestation_evidence.js";
 import { attestationEvidenceSubmissionRouter } from "./routes/attestation_evidence_submission.js";
+import { FirehoseBus } from "./firehose/bus.js";
+import { startFirehoseSubscriber } from "./firehose/start.js";
+import { createFirehoseRouter } from "./routes/firehose.js";
 // initChainInfoPoller is re-exported for consumers that want to pre-warm the
 // cache at startup; we also call it in start() so the first /chain-info hit
 // after cold-start returns 200 instead of 503.
@@ -123,6 +126,12 @@ registerWitnessTargetRoutes(app); // Witness Network: probe-target URL roster �
 registerAttestorSelfRegisterRoutes(app); // Witness Network: POST /v2/attestor_self_register — phones self-onboard via Android Key Attestation cert chain
 registerMultisigSigsRoutes(app); // Task #286: GET/POST /v2/multisig_sigs/{kind}/{key} — cert-daemon M-of-N envelope coordination (settle/expire)
 
+// Receipt firehose — live SSE feed of ReceiptSubmitted / AvailabilityCertified
+// / BatchAnchored events. The bus is shared with the chain-events subscriber
+// started inside `start()`.
+const firehoseBus = new FirehoseBus();
+app.use(createFirehoseRouter({ bus: firehoseBus }));
+
 async function start(): Promise<void> {
   // Initialize sr25519/ed25519 WASM (required for signatureVerify)
   await cryptoWaitReady();
@@ -173,6 +182,13 @@ async function start(): Promise<void> {
   // Start receipt indexer (polls chain for receipt→content_hash mapping)
   startReceiptIndexer().catch((err) =>
     console.error("[receipt-indexer] Failed to start:", err),
+  );
+
+  // Receipt firehose subscriber — connects to chain WS and publishes
+  // OrinqReceipts events onto `firehoseBus`. The /api/firehose/stream SSE
+  // handler reads from the same bus.
+  startFirehoseSubscriber(firehoseBus).catch((err) =>
+    console.error("[firehose] subscriber boot failed:", err),
   );
 
   app.listen(config.port, () => {
