@@ -439,6 +439,12 @@ function renderMapPage(): string {
     return id.slice(0, 6) + "…" + id.slice(-6);
   }
 
+  function escHtml(s){
+    var d = document.createElement("div");
+    d.textContent = (s == null ? "" : String(s));
+    return d.innerHTML;
+  }
+
   function showPanel(w){
     document.getElementById("side-empty").style.display = "none";
     var p = document.getElementById("side-panel");
@@ -488,7 +494,7 @@ function renderMapPage(): string {
         fillOpacity: 0.7,
       });
       marker.bindTooltip(
-        (w.label || truncId(w.ss58)) + " · " + (w.city || w.country || "unknown"),
+        escHtml(w.label || truncId(w.ss58)) + " · " + escHtml(w.city || w.country || "unknown"),
         { direction: "top", offset: [0, -4] },
       );
       marker.on("click", function(){ showPanel(w); });
