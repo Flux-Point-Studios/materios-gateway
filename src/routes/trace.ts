@@ -18,6 +18,7 @@
 import { Router, type Request, type Response } from "express";
 import { config } from "../config.js";
 import { getManifest, getBatch } from "../storage.js";
+import { cexplorerTxUrl } from "./explorer-chain.js";
 
 export const traceRouter = Router();
 
@@ -358,11 +359,6 @@ export interface LineageResponse {
   };
 }
 
-function cexplorerUrl(txHash: string, network: "preprod" | "mainnet"): string {
-  const host = network === "mainnet" ? "cexplorer.io" : "preprod.cexplorer.io";
-  return `https://${host}/tx/${txHash}`;
-}
-
 function shortHash(hex: string, head = 8, tail = 6): string {
   const h = hex.startsWith("0x") ? hex.slice(2) : hex;
   if (h.length <= head + tail) return hex;
@@ -609,7 +605,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
       blockHeight: anchor.cardanoBlockHeight,
       metadataLabel: anchor.cardanoMetadataLabel,
     },
-    href: cexplorerUrl(anchor.cardanoTxHash, anchor.cardanoNetwork),
+    href: cexplorerTxUrl(anchor.cardanoTxHash, anchor.cardanoNetwork),
   });
   edges.push({
     from: batchId,
@@ -1011,7 +1007,7 @@ function renderAnchorCard(rootHash: string | null, anchor: AnchorInfo): string {
   }. The Materios → Cardano anchor batch rolls up multiple certified receipts and posts a single L1 transaction every ~5 minutes.</div>
 </div>`;
   }
-  const explorer = cexplorerUrl(anchor.cardanoTxHash, anchor.cardanoNetwork);
+  const explorer = cexplorerTxUrl(anchor.cardanoTxHash, anchor.cardanoNetwork);
   return `
 <h2>Cardano L1 anchor</h2>
 <div class="card">

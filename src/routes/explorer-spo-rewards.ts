@@ -25,10 +25,11 @@
  */
 
 import { Router, type Request, type Response } from "express";
-import { ApiPromise, WsProvider } from "@polkadot/api";
 import { encodeAddress } from "@polkadot/util-crypto";
-import { config } from "../config.js";
 import spoPoolsData from "../data/spo-pools.json" with { type: "json" };
+import { createExplorerApiFactory, type ExplorerApiFactory } from "./explorer-rpc.js";
+
+export type { ExplorerApiFactory };
 
 const CACHE_TTL_MS = 60_000;
 const KOIOS_PREPROD_URL = "https://preprod.koios.rest/api/v1/pool_history";
@@ -40,7 +41,6 @@ const SS58_PREFIX = 42;
 const MATRA_DECIMALS = 6;
 // Cardano lovelace decimals are universally 6 (1 ADA = 1e6 lovelace).
 const ADA_DECIMALS = 6;
-const API_CONNECT_TIMEOUT_MS = 25_000;
 
 interface OperatorRosterEntry {
   label: string;
@@ -69,8 +69,6 @@ export type KoiosPoolBlocksInEpochFetcher = (
   poolBech32: string,
   epoch: number,
 ) => Promise<number>;
-
-export type ExplorerApiFactory = () => Promise<ApiPromise>;
 
 interface RouterDeps {
   apiFactory?: ExplorerApiFactory;
@@ -104,45 +102,7 @@ interface RewardsSnapshot {
   operators: OperatorRewardsRow[];
 }
 
-let defaultApiSingleton: Promise<ApiPromise> | null = null;
-let defaultApiLastAttempt = 0;
-const DEFAULT_API_RECONNECT_COOLDOWN_MS = 30_000;
-
-function defaultApiFactory(): Promise<ApiPromise> {
-  if (defaultApiSingleton) return defaultApiSingleton;
-  if (Date.now() - defaultApiLastAttempt < DEFAULT_API_RECONNECT_COOLDOWN_MS) {
-    return Promise.reject(new Error("api recently failed, in cooldown"));
-  }
-  defaultApiLastAttempt = Date.now();
-
-  const provider = new WsProvider(config.materiosRpcUrl, 5000);
-  const racing = Promise.race<ApiPromise>([
-    ApiPromise.create({ provider, noInitWarn: true, throwOnConnect: true }),
-    new Promise<ApiPromise>((_resolve, reject) =>
-      setTimeout(
-        () => reject(new Error("api connect timeout")),
-        API_CONNECT_TIMEOUT_MS,
-      ),
-    ),
-  ]);
-
-  defaultApiSingleton = racing;
-  racing
-    .then((api) => {
-      api.on("disconnected", () => {
-        console.warn("[explorer-spo-rewards] RPC disconnected");
-        defaultApiSingleton = null;
-      });
-      api.on("error", (err) => {
-        console.warn(`[explorer-spo-rewards] RPC error: ${err}`);
-        defaultApiSingleton = null;
-      });
-    })
-    .catch(() => {
-      defaultApiSingleton = null;
-    });
-  return racing;
-}
+const defaultApiFactory = createExplorerApiFactory("explorer-spo-rewards");
 
 async function defaultKoiosFetch(
   poolBech32: string,
