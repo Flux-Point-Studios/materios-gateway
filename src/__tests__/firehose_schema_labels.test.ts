@@ -20,6 +20,9 @@ describe("schema-labels", () => {
     expect(labelForSchemaHash(sha256Hex("compute_metering_v2.1"))).toBe("Compute Metering v2.1");
     expect(labelForSchemaHash(sha256Hex("compute_metering_v1"))).toBe("Compute Metering v1");
     expect(labelForSchemaHash(sha256Hex("orynq_trace_v1"))).toBe("Orynq Trace v1");
+    expect(labelForSchemaHash(sha256Hex("ai_capability_observation_v1"))).toBe(
+      "AI Capability Observation v1",
+    );
   });
 
   test("unknown discriminator → raw normalised hex", () => {

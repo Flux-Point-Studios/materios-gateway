@@ -21,7 +21,17 @@ const SCHEMA_VERSIONS: SchemaEntry[] = [
   { version: "compute_metering_v2", label: "Compute Metering v2" },
   { version: "compute_metering_v2.1", label: "Compute Metering v2.1" },
   { version: "orynq_trace_v1", label: "Orynq Trace v1" },
+  { version: "ai_capability_observation_v1", label: "AI Capability Observation v1" },
 ];
+
+/**
+ * Exported sha256 of the AI capability observation schema literal. The
+ * observations list endpoint filters by exact match against this hash so the
+ * registry never accidentally surfaces compute_metering or trace rows.
+ */
+export const AI_CAPABILITY_OBSERVATION_V1_SCHEMA_HASH = sha256Hex(
+  "ai_capability_observation_v1",
+);
 
 const HASH_TO_LABEL: ReadonlyMap<string, string> = new Map(
   SCHEMA_VERSIONS.map((e) => [sha256Hex(e.version).toLowerCase(), e.label] as const),
