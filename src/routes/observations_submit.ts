@@ -43,7 +43,13 @@ import {
   type ValidateErrorCode,
 } from "../schemas/ai_capability_observation_v1.js";
 import { notifySponsoredReceiptSubmitter } from "../sponsored-receipts.js";
-import { saveManifest, updateReceiptMeta, getManifest } from "../storage.js";
+import {
+  saveManifest,
+  saveRawBytes,
+  updateReceiptMeta,
+  getManifest,
+} from "../storage.js";
+import { legacyObservationsSubmitPathTotal } from "../metrics.js";
 
 export const observationsSubmitRouter = Router();
 
@@ -207,204 +213,229 @@ interface SubmitWireBody {
   observer_signature?: unknown;
 }
 
-observationsSubmitRouter.post(
-  "/observations/submit",
-  bearerAuth({ required: true }),
-  async (req: Request, res: Response) => {
-    const r = req as AuthedRequest;
-    const operator = r.account;
-    const authTier = r.authTier;
-    if (!operator || !authTier) {
-      reject(res, 401, "OBSERVER_SIG_INVALID", "auth required");
-      return;
-    }
-    if (authTier !== "bearer" && authTier !== "api-key") {
-      reject(res, 401, "OBSERVER_SIG_INVALID", "sponsored tier required");
-      return;
-    }
+async function handleSubmit(req: Request, res: Response): Promise<void> {
+  const r = req as AuthedRequest;
+  const operator = r.account;
+  const authTier = r.authTier;
+  if (!operator || !authTier) {
+    reject(res, 401, "OBSERVER_SIG_INVALID", "auth required");
+    return;
+  }
+  if (authTier !== "bearer" && authTier !== "api-key") {
+    reject(res, 401, "OBSERVER_SIG_INVALID", "sponsored tier required");
+    return;
+  }
 
-    const body = (req.body ?? {}) as SubmitWireBody;
-    if (typeof body !== "object" || body === null) {
-      reject(res, 400, "INVALID_JSON", "request body must be a JSON object");
-      return;
-    }
+  const body = (req.body ?? {}) as SubmitWireBody;
+  if (typeof body !== "object" || body === null) {
+    reject(res, 400, "INVALID_JSON", "request body must be a JSON object");
+    return;
+  }
 
-    // -------------------- shape gates --------------------
-    if (
-      typeof body.content_hash !== "string" ||
-      !HEX64.test(body.content_hash)
-    ) {
-      reject(
-        res,
-        400,
-        "HEX_FORMAT",
-        "content_hash must be 64-char lowercase hex",
-        "content_hash",
-      );
-      return;
-    }
-    if (
-      typeof body.observer_pubkey !== "string" ||
-      !HEX64.test(body.observer_pubkey)
-    ) {
-      reject(
-        res,
-        400,
-        "HEX_FORMAT",
-        "observer_pubkey must be 64-char lowercase hex",
-        "observer_pubkey",
-      );
-      return;
-    }
-    if (
-      typeof body.observer_signature !== "string" ||
-      !HEX128.test(body.observer_signature)
-    ) {
-      reject(
-        res,
-        400,
-        "HEX_FORMAT",
-        "observer_signature must be 128-char lowercase hex",
-        "observer_signature",
-      );
-      return;
-    }
-    if (body.schema_version !== SCHEMA_VERSION) {
-      reject(
-        res,
-        400,
-        "WRONG_SCHEMA_VERSION",
-        `schema_version must be "${SCHEMA_VERSION}"`,
-        "schema_version",
-      );
-      return;
-    }
-    if (typeof body.schema_hash !== "string" || body.schema_hash !== SCHEMA_HASH_HEX) {
-      reject(
-        res,
-        400,
-        "WRONG_SCHEMA_VERSION",
-        `schema_hash must match sha256("${SCHEMA_VERSION}") = ${SCHEMA_HASH_HEX}`,
-        "schema_hash",
-      );
-      return;
-    }
-
-    // -------------------- structural validate --------------------
-    const sv = validateAiCapabilityObservationV1(body.record);
-    if (!sv.ok) {
-      reject(res, statusForStructuralCode(sv.code), sv.code, sv.message, sv.field);
-      return;
-    }
-    const { record, contentHash, preImage } = sv;
-
-    // -------------------- content_hash equality --------------------
-    if (contentHash !== body.content_hash) {
-      reject(
-        res,
-        422,
-        "CONTENT_HASH_MISMATCH",
-        `client content_hash ${body.content_hash} != gateway recomputed ${contentHash}`,
-        "content_hash",
-      );
-      return;
-    }
-
-    // -------------------- observer pubkey matches SS58 --------------------
-    const expectedPubkeyHex = ss58ToPubkeyHex(record.observer.ss58);
-    if (!expectedPubkeyHex) {
-      reject(
-        res,
-        400,
-        "SS58_FORMAT",
-        "could not decode observer.ss58",
-        "observer.ss58",
-      );
-      return;
-    }
-    if (expectedPubkeyHex !== body.observer_pubkey.toLowerCase()) {
-      logAuthFail("pubkey_ss58_mismatch", body.observer_pubkey);
-      reject(
-        res,
-        401,
-        "OBSERVER_PUBKEY_MISMATCH",
-        "observer_pubkey does not derive to observer.ss58",
-        "observer_pubkey",
-      );
-      return;
-    }
-
-    // -------------------- sr25519 signature --------------------
-    if (!verifyObserverSig(preImage, body.observer_pubkey, body.observer_signature)) {
-      logAuthFail("observer_sig_invalid", body.observer_pubkey);
-      reject(
-        res,
-        401,
-        "OBSERVER_SIG_INVALID",
-        "observer_signature does not verify against observer_pubkey over the canonical pre-image",
-        "observer_signature",
-      );
-      return;
-    }
-
-    // -------------------- persist manifest --------------------
-    // We always re-save the manifest, even on replay: the SDK signature has
-    // already cleared, and the bytes are deterministic from `record`, so an
-    // idempotent rewrite is safe AND lets us self-heal a corrupted manifest
-    // without an operator stepping in. The notify-submitter side IS short-
-    // circuited on replay (see below) — the chain-side idempotency lives in
-    // the receipt-submitter's content_hash dedup ledger.
-    const existing = await getManifest(contentHash);
-    const isReplay = existing !== null;
-    const nowMs = Date.now();
-    const manifest = buildRegistryManifest(record, nowMs);
-    try {
-      await saveManifest(contentHash, manifest);
-      await updateReceiptMeta(contentHash, { uploaderAddress: operator });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error(
-        `[blob-gateway] observations_submit storage error content=${contentHash} err=${msg}`,
-      );
-      reject(res, 500, "INTERNAL", `manifest persistence failed: ${msg}`);
-      return;
-    }
-
-    if (isReplay) {
-      res.status(200).json({
-        ok: true,
-        status: "replay",
-        content_hash: contentHash,
-        schema_hash: SCHEMA_HASH_HEX,
-        observer_ss58: record.observer.ss58,
-      });
-      return;
-    }
-
-    // -------------------- notify --------------------
-    void notifySponsoredReceiptSubmitter({
-      contentHash,
-      operator,
-      authTier,
-      schemaHash: SCHEMA_HASH_HEX,
-      source: OBSERVATIONS_SOURCE,
-      rootHash: contentHash,
-    });
-
-    console.log(
-      `[blob-gateway] event=observations_submit_accepted content=${contentHash} observer_ss58=${record.observer.ss58} taxonomy=${record.capability.taxonomyId} severity=${record.capability.severity} operator=${operator} tier=${authTier}`,
+  // -------------------- shape gates --------------------
+  if (
+    typeof body.content_hash !== "string" ||
+    !HEX64.test(body.content_hash)
+  ) {
+    reject(
+      res,
+      400,
+      "HEX_FORMAT",
+      "content_hash must be 64-char lowercase hex",
+      "content_hash",
     );
+    return;
+  }
+  if (
+    typeof body.observer_pubkey !== "string" ||
+    !HEX64.test(body.observer_pubkey)
+  ) {
+    reject(
+      res,
+      400,
+      "HEX_FORMAT",
+      "observer_pubkey must be 64-char lowercase hex",
+      "observer_pubkey",
+    );
+    return;
+  }
+  if (
+    typeof body.observer_signature !== "string" ||
+    !HEX128.test(body.observer_signature)
+  ) {
+    reject(
+      res,
+      400,
+      "HEX_FORMAT",
+      "observer_signature must be 128-char lowercase hex",
+      "observer_signature",
+    );
+    return;
+  }
+  if (body.schema_version !== SCHEMA_VERSION) {
+    reject(
+      res,
+      400,
+      "WRONG_SCHEMA_VERSION",
+      `schema_version must be "${SCHEMA_VERSION}"`,
+      "schema_version",
+    );
+    return;
+  }
+  if (typeof body.schema_hash !== "string" || body.schema_hash !== SCHEMA_HASH_HEX) {
+    reject(
+      res,
+      400,
+      "WRONG_SCHEMA_VERSION",
+      `schema_hash must match sha256("${SCHEMA_VERSION}") = ${SCHEMA_HASH_HEX}`,
+      "schema_hash",
+    );
+    return;
+  }
 
+  // -------------------- structural validate --------------------
+  const sv = validateAiCapabilityObservationV1(body.record);
+  if (!sv.ok) {
+    reject(res, statusForStructuralCode(sv.code), sv.code, sv.message, sv.field);
+    return;
+  }
+  const { record, contentHash, preImage } = sv;
+
+  // -------------------- content_hash equality --------------------
+  if (contentHash !== body.content_hash) {
+    reject(
+      res,
+      422,
+      "CONTENT_HASH_MISMATCH",
+      `client content_hash ${body.content_hash} != gateway recomputed ${contentHash}`,
+      "content_hash",
+    );
+    return;
+  }
+
+  // -------------------- observer pubkey matches SS58 --------------------
+  const expectedPubkeyHex = ss58ToPubkeyHex(record.observer.ss58);
+  if (!expectedPubkeyHex) {
+    reject(
+      res,
+      400,
+      "SS58_FORMAT",
+      "could not decode observer.ss58",
+      "observer.ss58",
+    );
+    return;
+  }
+  if (expectedPubkeyHex !== body.observer_pubkey.toLowerCase()) {
+    logAuthFail("pubkey_ss58_mismatch", body.observer_pubkey);
+    reject(
+      res,
+      401,
+      "OBSERVER_PUBKEY_MISMATCH",
+      "observer_pubkey does not derive to observer.ss58",
+      "observer_pubkey",
+    );
+    return;
+  }
+
+  // -------------------- sr25519 signature --------------------
+  if (!verifyObserverSig(preImage, body.observer_pubkey, body.observer_signature)) {
+    logAuthFail("observer_sig_invalid", body.observer_pubkey);
+    reject(
+      res,
+      401,
+      "OBSERVER_SIG_INVALID",
+      "observer_signature does not verify against observer_pubkey over the canonical pre-image",
+      "observer_signature",
+    );
+    return;
+  }
+
+  // -------------------- persist manifest + raw pre-image --------------------
+  // We always re-save the manifest AND the canonical CBOR bytes, even on
+  // replay: the SDK signature has already cleared, the bytes are
+  // deterministic from `record`, so an idempotent rewrite is safe AND lets
+  // us self-heal a corrupted manifest without an operator stepping in. The
+  // notify-submitter side IS short-circuited on replay (see below) — the
+  // chain-side idempotency lives in the receipt-submitter's content_hash
+  // dedup ledger.
+  //
+  // The raw pre-image bytes are what `GET /api/observations/:contentHash/raw`
+  // serves; cert-daemon fetches that endpoint and re-hashes them to verify
+  // the on-chain content_hash without needing schema knowledge.
+  const existing = await getManifest(contentHash);
+  const isReplay = existing !== null;
+  const nowMs = Date.now();
+  const manifest = buildRegistryManifest(record, nowMs);
+  try {
+    await saveManifest(contentHash, manifest);
+    await saveRawBytes(contentHash, preImage);
+    await updateReceiptMeta(contentHash, { uploaderAddress: operator });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(
+      `[blob-gateway] observations_submit storage error content=${contentHash} err=${msg}`,
+    );
+    reject(res, 500, "INTERNAL", `manifest persistence failed: ${msg}`);
+    return;
+  }
+
+  if (isReplay) {
     res.status(200).json({
       ok: true,
-      status: "accepted",
+      status: "replay",
       content_hash: contentHash,
       schema_hash: SCHEMA_HASH_HEX,
       observer_ss58: record.observer.ss58,
-      accepted_at: new Date(nowMs).toISOString(),
-      sponsored_receipt_submitter_configured: Boolean(
-        config.sponsoredReceiptSubmitterUrl,
-      ),
     });
+    return;
+  }
+
+  // -------------------- notify --------------------
+  void notifySponsoredReceiptSubmitter({
+    contentHash,
+    operator,
+    authTier,
+    schemaHash: SCHEMA_HASH_HEX,
+    source: OBSERVATIONS_SOURCE,
+    rootHash: contentHash,
+  });
+
+  console.log(
+    `[blob-gateway] event=observations_submit_accepted content=${contentHash} observer_ss58=${record.observer.ss58} taxonomy=${record.capability.taxonomyId} severity=${record.capability.severity} operator=${operator} tier=${authTier}`,
+  );
+
+  res.status(200).json({
+    ok: true,
+    status: "accepted",
+    content_hash: contentHash,
+    schema_hash: SCHEMA_HASH_HEX,
+    observer_ss58: record.observer.ss58,
+    accepted_at: new Date(nowMs).toISOString(),
+    sponsored_receipt_submitter_configured: Boolean(
+      config.sponsoredReceiptSubmitterUrl,
+    ),
+  });
+}
+
+// Canonical path — matches the `/api/observations` read prefix.
+observationsSubmitRouter.post(
+  "/api/observations/submit",
+  bearerAuth({ required: true }),
+  handleSubmit,
+);
+
+// Legacy alias kept to avoid breaking pre-rename SDK clients (orynq-observe
+// 0.4.x and earlier). Hits are counted in `legacy_observations_submit_path_total`
+// so the rate can be observed before deciding whether to retire the alias.
+observationsSubmitRouter.post(
+  "/observations/submit",
+  (req: Request, _res: Response, next) => {
+    legacyObservationsSubmitPathTotal.inc();
+    console.warn(
+      `[blob-gateway] event=observations_submit_legacy_path path=${req.path} ua="${req.headers["user-agent"] ?? ""}"`,
+    );
+    next();
   },
+  bearerAuth({ required: true }),
+  handleSubmit,
 );

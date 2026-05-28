@@ -27,7 +27,7 @@
 import { Router, type Request, type Response } from "express";
 import { xxhashAsHex } from "@polkadot/util-crypto";
 import { config } from "../config.js";
-import { getManifest } from "../storage.js";
+import { getManifest, getRawBytes } from "../storage.js";
 import { AI_CAPABILITY_OBSERVATION_V1_SCHEMA_HASH } from "../firehose/schema-labels.js";
 
 export const observationsRouter = Router();
@@ -485,6 +485,60 @@ observationsRouter.get(
       const msg = err instanceof Error ? err.message : String(err);
       res.status(502).json({ error: "Failed to load observation", detail: msg });
     }
+  },
+);
+
+/**
+ * `GET /api/observations/:contentHash/raw` — canonical CBOR pre-image bytes.
+ *
+ * Returns the exact byte string whose SHA-256 equals the on-chain
+ * `content_hash`. The cert-daemon committee fetches this URL from the
+ * locator response (single-blob shape) and re-hashes the body to satisfy
+ * the verifier's ROOT_VERIFIED gate. No schema knowledge is required on
+ * the daemon side — given a URL plus an expected SHA-256, fetch and
+ * verify.
+ *
+ * 404 when the bytes are not stored. Pre-2026-05-27 observation manifests
+ * were ingested without persisting the raw bytes; for those, no canonical
+ * pre-image is recoverable and `GET /raw` returns 404. Cert-daemon treats
+ * that the same as any other un-verifiable receipt — it refuses to attest
+ * rather than guess.
+ */
+const RAW_LOCATOR_CACHE_CONTROL =
+  "public, max-age=86400, immutable";
+
+observationsRouter.get(
+  "/api/observations/:contentHash/raw",
+  async (req: Request, res: Response) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Vary", "Origin");
+
+    const contentHash = normalizeContentHash(req.params.contentHash || "");
+    if (!contentHash) {
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.status(400).json({
+        error: "contentHash must be 64 lowercase hex characters",
+      });
+      return;
+    }
+
+    const bytes = await getRawBytes(contentHash);
+    if (!bytes) {
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.status(404).json({
+        error:
+          "Canonical pre-image not stored for this content hash. The receipt " +
+          "predates byte-preserving ingestion and cannot be verified against " +
+          "content_hash.",
+        contentHash,
+      });
+      return;
+    }
+
+    res.setHeader("Content-Type", "application/cbor");
+    res.setHeader("Content-Length", String(bytes.length));
+    res.setHeader("Cache-Control", RAW_LOCATOR_CACHE_CONTROL);
+    res.status(200).send(bytes);
   },
 );
 

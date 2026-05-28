@@ -3,7 +3,7 @@
  */
 
 import { Router, type Request, type Response } from "express";
-import { resolveReceiptId, getManifest } from "../storage.js";
+import { resolveReceiptId, getManifest, getRawBytes } from "../storage.js";
 import { config } from "../config.js";
 
 export const locatorsRouter = Router();
@@ -35,8 +35,10 @@ interface Manifest {
  *   1. Chunked (legacy / blob uploads): `manifest.chunks: [{index, sha256, size}, ...]`
  *   2. Single-blob (observations / self-rooted records): no `chunks` array;
  *      content is one record addressed by `contentHash`. The locator response
- *      collapses to chunk_count=1 with a synthetic chunk pointing at the
- *      public observations registry detail endpoint.
+ *      collapses to chunk_count=1 pointing at `GET /api/observations/:contentHash/raw`,
+ *      which serves the canonical pre-image bytes whose SHA-256 IS the
+ *      `content_hash`. The daemon-side verifier re-hashes the response body
+ *      and accepts on match.
  */
 locatorsRouter.get("/locators/:receiptId", async (req: Request, res: Response) => {
   try {
@@ -65,16 +67,18 @@ locatorsRouter.get("/locators/:receiptId", async (req: Request, res: Response) =
     if (!chunks || chunks.length === 0) {
       // Single-blob layout — no chunked merkle to walk. The on-chain
       // `content_hash` IS the blob digest, so the daemon's SHA-256 check is
-      // satisfied by fetching the manifest body and rehashing it. The
-      // observation detail endpoint is public read-only and serves the
-      // canonical manifest JSON.
-      //
-      // size + total_size default to 0 (not null) because the daemon-side
-      // parser sums chunk sizes as ints and chokes on None. The byte count
-      // is informational here; the SHA-256 check is what the daemon
-      // actually relies on.
+      // satisfied by fetching the canonical pre-image bytes and rehashing
+      // them. The `/raw` endpoint serves the byte-exact pre-image whose
+      // SHA-256 IS the content_hash; older observation manifests that
+      // predate byte-preserving ingestion return 404 there and remain
+      // un-anchorable.
+      const raw = await getRawBytes(contentHashClean);
       const singleSize =
-        typeof manifest.total_size === "number" ? manifest.total_size : 0;
+        raw !== null
+          ? raw.length
+          : typeof manifest.total_size === "number"
+            ? manifest.total_size
+            : 0;
       res.json({
         receipt_id: receiptIdPrefixed,
         content_hash: contentHashPrefixed,
@@ -85,7 +89,7 @@ locatorsRouter.get("/locators/:receiptId", async (req: Request, res: Response) =
             index: 0,
             sha256: contentHashClean,
             size: singleSize,
-            url: `${baseUrl}/api/observations/${contentHashClean}`,
+            url: `${baseUrl}/api/observations/${contentHashClean}/raw`,
           },
         ],
       });
