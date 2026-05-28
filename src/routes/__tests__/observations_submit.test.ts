@@ -17,6 +17,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { AddressInfo } from "node:net";
+import { createHash } from "node:crypto";
 import { Keyring } from "@polkadot/api";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { u8aToHex } from "@polkadot/util";
@@ -35,6 +36,7 @@ import {
   SCHEMA_VERSION,
   type AiCapabilityObservationV1,
 } from "../../schemas/ai_capability_observation_v1.js";
+import { resetMetricsForTests, metricsRegistry } from "../../metrics.js";
 
 let keyring: Keyring;
 
@@ -511,5 +513,159 @@ describe("POST /observations/submit — rejection paths", () => {
     );
     expect(res.status).toBe(400);
     expect((res.body as { code: string }).code).toBe("HEX_FORMAT");
+  });
+});
+
+describe("POST submit — canonical path, legacy alias, raw persistence", () => {
+  let ctx: Ctx;
+  beforeEach(async () => {
+    ctx = await setupApp();
+    resetMetricsForTests();
+  });
+  afterEach(async () => {
+    await teardown(ctx);
+  });
+
+  async function legacyCounterValue(): Promise<number> {
+    // prom-client returns text — parse the single sample line to a number.
+    const text = await metricsRegistry.metrics();
+    const match = text.match(/^legacy_observations_submit_path_total\s+(\d+)/m);
+    return match ? Number(match[1]) : 0;
+  }
+
+  test("canonical /api/observations/submit accepts; raw.bin persists; counter NOT bumped", async () => {
+    const built = buildSignedRecord({ uri: "//ObserveTester1" });
+    const before = await legacyCounterValue();
+    const res = await fetchJson(
+      ctx.app,
+      "/api/observations/submit",
+      {
+        schema_version: SCHEMA_VERSION,
+        schema_hash: SCHEMA_HASH_HEX,
+        record: built.record,
+        content_hash: built.contentHash,
+        observer_pubkey: built.observerPubkeyHex,
+        observer_signature: built.observerSignatureHex,
+      },
+      ctx.bearerToken,
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { status: string }).status).toBe("accepted");
+
+    const rawPath = join(ctx.storage, "receipts", built.contentHash, "raw.bin");
+    expect(existsSync(rawPath)).toBe(true);
+    const rawBuf = readFileSync(rawPath);
+    expect(createHash("sha256").update(rawBuf).digest("hex")).toBe(
+      built.contentHash,
+    );
+
+    // Canonical path must not bump the legacy counter.
+    expect(await legacyCounterValue()).toBe(before);
+  });
+
+  test("legacy /observations/submit accepts; raw.bin persists; counter bumps", async () => {
+    const built = buildSignedRecord({ uri: "//ObserveTester2" });
+    const before = await legacyCounterValue();
+    const res = await fetchJson(
+      ctx.app,
+      "/observations/submit",
+      {
+        schema_version: SCHEMA_VERSION,
+        schema_hash: SCHEMA_HASH_HEX,
+        record: built.record,
+        content_hash: built.contentHash,
+        observer_pubkey: built.observerPubkeyHex,
+        observer_signature: built.observerSignatureHex,
+      },
+      ctx.bearerToken,
+    );
+    expect(res.status).toBe(200);
+    expect((res.body as { status: string }).status).toBe("accepted");
+
+    const rawPath = join(ctx.storage, "receipts", built.contentHash, "raw.bin");
+    expect(existsSync(rawPath)).toBe(true);
+
+    expect(await legacyCounterValue()).toBe(before + 1);
+  });
+
+  test("end-to-end: submit → locator → raw fetch → SHA-256 matches content_hash", async () => {
+    // Load the read-side router + locator + raw route inline to drive the
+    // full chain-of-custody loop in-process. This mirrors what cert-daemon
+    // does in production: hit /locators/:receiptId, follow the chunk URL,
+    // re-hash the body.
+    const { observationsRouter } = await import("../observations.js");
+    const { locatorsRouter } = await import("../locators.js");
+    const { computeReceiptId } = await import("../../storage.js");
+
+    // Mount both the submit router AND the read routes onto a single app
+    // so the locator response URL is reachable in this same listener.
+    const app = express();
+    app.use(express.json({ limit: "2mb" }));
+    app.use(observationsSubmitRouter);
+    app.use(observationsRouter);
+    app.use(locatorsRouter);
+
+    // Configure baseUrl to point at this app's listen address (filled in
+    // when the server starts).
+    const prevBase = config.gatewayBaseUrl;
+
+    const built = buildSignedRecord({ uri: "//ObserveTester3" });
+
+    const result = await new Promise<{
+      submitStatus: number;
+      locatorUrl: string;
+      rawSha256: string;
+    }>((resolve, reject) => {
+      const server = app.listen(0, async () => {
+        try {
+          const addr = server.address();
+          if (typeof addr === "string" || addr === null)
+            throw new Error("no address");
+          const base = `http://127.0.0.1:${addr.port}`;
+          config.gatewayBaseUrl = base;
+
+          const submitRes = await fetch(`${base}/api/observations/submit`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer ${ctx.bearerToken}`,
+            },
+            body: JSON.stringify({
+              schema_version: SCHEMA_VERSION,
+              schema_hash: SCHEMA_HASH_HEX,
+              record: built.record,
+              content_hash: built.contentHash,
+              observer_pubkey: built.observerPubkeyHex,
+              observer_signature: built.observerSignatureHex,
+            }),
+          });
+          const submitStatus = submitRes.status;
+
+          const receiptId = computeReceiptId(built.contentHash);
+          const locRes = await fetch(`${base}/locators/${receiptId}`);
+          const loc = (await locRes.json()) as {
+            chunks: Array<{ url: string; sha256: string }>;
+          };
+          const locatorUrl = loc.chunks[0]!.url;
+
+          const rawRes = await fetch(locatorUrl);
+          const rawBytes = Buffer.from(await rawRes.arrayBuffer());
+          const rawSha256 = createHash("sha256").update(rawBytes).digest("hex");
+
+          resolve({ submitStatus, locatorUrl, rawSha256 });
+        } catch (err) {
+          reject(err);
+        } finally {
+          server.close();
+        }
+      });
+    });
+
+    config.gatewayBaseUrl = prevBase;
+
+    expect(result.submitStatus).toBe(200);
+    expect(result.locatorUrl).toContain("/raw");
+    // The chain-of-custody assertion that everything in this PR exists for:
+    expect(result.rawSha256).toBe(built.contentHash);
   });
 });

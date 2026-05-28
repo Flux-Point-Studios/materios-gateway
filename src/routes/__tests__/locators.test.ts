@@ -17,7 +17,7 @@ import { join } from "path";
 
 import { config } from "../../config.js";
 import { locatorsRouter } from "../locators.js";
-import { saveManifest, computeReceiptId } from "../../storage.js";
+import { saveManifest, saveRawBytes, computeReceiptId } from "../../storage.js";
 
 interface Ctx {
   app: express.Express;
@@ -177,7 +177,34 @@ describe("GET /locators/:receiptId — single-blob (observation) manifest", () =
     expect(body.chunks[0]!.index).toBe(0);
     expect(body.chunks[0]!.sha256).toBe(contentHash);
     expect(body.chunks[0]!.size).toBe(0);
-    expect(body.chunks[0]!.url).toBe(`http://gateway.test/api/observations/${contentHash}`);
+    expect(body.chunks[0]!.url).toBe(`http://gateway.test/api/observations/${contentHash}/raw`);
+  });
+
+  test("when raw bytes are stored, size reflects their length", async () => {
+    // New submissions persist the canonical pre-image bytes; the locator
+    // response surfaces their length so the daemon can sanity-check
+    // Content-Length on the fetch.
+    const contentHash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const receiptId = computeReceiptId(contentHash);
+    const rawBytes = new Uint8Array([0x85, 0x78, 0x1b, 0x61, 0x69]); // 5 bytes
+    await saveManifest(contentHash, {
+      schema: "ai_capability_observation_v1",
+      chunks: [],
+      rootHash: contentHash,
+    });
+    await saveRawBytes(contentHash, rawBytes);
+
+    const res = await getJson(ctx.app, `/locators/${receiptId}`);
+    expect(res.status).toBe(200);
+    const body = res.body as {
+      total_size: number;
+      chunks: Array<{ size: number; url: string }>;
+    };
+    expect(body.total_size).toBe(5);
+    expect(body.chunks[0]!.size).toBe(5);
+    expect(body.chunks[0]!.url).toBe(
+      `http://gateway.test/api/observations/${contentHash}/raw`,
+    );
   });
 
   test("undefined chunks does not 500 — guard fires before reduce", async () => {
@@ -218,7 +245,7 @@ describe("GET /locators/:receiptId — single-blob (observation) manifest", () =
     };
     expect(body.chunk_count).toBe(1);
     expect(body.total_size).toBe(0);
-    expect(body.chunks[0]!.url).toBe(`http://gateway.test/api/observations/${contentHash}`);
+    expect(body.chunks[0]!.url).toBe(`http://gateway.test/api/observations/${contentHash}/raw`);
     expect(body.chunks[0]!.sha256).toBe(contentHash);
   });
 });

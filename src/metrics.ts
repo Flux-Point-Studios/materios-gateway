@@ -49,6 +49,21 @@ export const billingMiddlewareErrorTotal = new Counter({
   labelNames: ["phase"] as const,
 });
 
+/**
+ * Counter for hits against the legacy `POST /observations/submit` path. The
+ * canonical path is `POST /api/observations/submit`; the legacy alias remains
+ * to avoid breaking pre-rename SDK clients. Track usage here so we can
+ * decide later when (or if) to retire the alias — high sustained values
+ * mean we still have callers on the old shape.
+ */
+export const legacyObservationsSubmitPathTotal = new Counter({
+  name: "legacy_observations_submit_path_total",
+  help:
+    "Hits against the legacy `POST /observations/submit` route. The " +
+    "canonical path is `POST /api/observations/submit`; the legacy alias " +
+    "is retained for backward compatibility with pre-rename SDK clients.",
+});
+
 let defaultsCollected = false;
 
 /**

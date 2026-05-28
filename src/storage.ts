@@ -104,6 +104,40 @@ export async function getManifest(contentHash: string): Promise<object | null> {
 }
 
 /**
+ * Persist the canonical pre-image bytes (the exact bytes whose SHA-256 is the
+ * content_hash) at `receipts/{contentHash}/raw.bin`. Used by self-rooted
+ * single-blob schemas (e.g. ai_capability_observation_v1) so the daemon-side
+ * verifier can re-fetch and re-hash without re-running schema-specific
+ * canonicalization.
+ *
+ * Callers MUST hash the bytes themselves and pass a matching contentHash;
+ * the storage layer does not re-verify.
+ */
+export async function saveRawBytes(
+  contentHash: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  const dir = receiptsDir(contentHash);
+  await ensureDir(dir);
+  await writeFile(join(dir, "raw.bin"), Buffer.from(bytes));
+}
+
+/**
+ * Read the canonical pre-image bytes for a content hash, or null if not
+ * stored. Pre-2026-05-27 observation manifests will not have these bytes
+ * (the gateway didn't persist them) — the GET /raw route surfaces that as
+ * a 404 so the caller can distinguish "missing" from "tampered."
+ */
+export async function getRawBytes(contentHash: string): Promise<Buffer | null> {
+  const rawPath = join(receiptsDir(contentHash), "raw.bin");
+  try {
+    return await readFile(rawPath);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Save a chunk binary. After saving, checks completeness and writes .complete sentinel.
  * Notifies daemon when upload is complete.
  */
