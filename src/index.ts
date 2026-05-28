@@ -26,6 +26,7 @@ import { explorerSpoRewardsRouter } from "./routes/explorer-spo-rewards.js";
 import { explorerOperatorRouter } from "./routes/explorer-operator.js";
 import { traceRouter } from "./routes/trace.js";
 import { observationsRouter } from "./routes/observations.js";
+import { observationsSubmitRouter } from "./routes/observations_submit.js";
 import { faucetRouter } from "./routes/faucet.js";
 import { registerAdminKeysRoutes } from "./routes/admin-keys.js";
 import { meteringRouter } from "./routes/metering.js";
@@ -123,6 +124,7 @@ app.use(explorerSpoRewardsRouter); // Task #341: GET /preprod-explorer/api/spo-r
 app.use(explorerOperatorRouter); // Per-operator detail surface: JSON at /preprod-explorer/api/operator/:ss58, HTML at /materios/explorer/operator/:ss58.
 app.use(traceRouter);       // GET /trace/:contentHash (HTML lineage graph) + GET /trace/api/lineage/:contentHash (JSON).
 app.use(observationsRouter); // GET /api/observations + GET /api/observations/:contentHash — filtered view of ai_capability_observation_v1 receipts.
+app.use(observationsSubmitRouter); // POST /observations/submit — orynq-observe SDK ingress (sponsored Bearer-token tier).
 app.use(faucetRouter);      // Public: /faucet/drip — operator onboarding (MATRA + MOTRA bootstrap). Volume-mounted overrides accepted; see ops compose templates.
 app.use(meteringRouter);    // Task #109: POST /metering/submit — compute_metering_v1 ingestion + sponsored-receipt forwarding.
 app.use(billingRouter);     // Task #112: GET /billing/usage — verifiable compute-metering billing query.
