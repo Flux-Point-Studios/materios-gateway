@@ -68,16 +68,23 @@ locatorsRouter.get("/locators/:receiptId", async (req: Request, res: Response) =
       // satisfied by fetching the manifest body and rehashing it. The
       // observation detail endpoint is public read-only and serves the
       // canonical manifest JSON.
+      //
+      // size + total_size default to 0 (not null) because the daemon-side
+      // parser sums chunk sizes as ints and chokes on None. The byte count
+      // is informational here; the SHA-256 check is what the daemon
+      // actually relies on.
+      const singleSize =
+        typeof manifest.total_size === "number" ? manifest.total_size : 0;
       res.json({
         receipt_id: receiptIdPrefixed,
         content_hash: contentHashPrefixed,
-        total_size: typeof manifest.total_size === "number" ? manifest.total_size : null,
+        total_size: singleSize,
         chunk_count: 1,
         chunks: [
           {
             index: 0,
             sha256: contentHashClean,
-            size: typeof manifest.total_size === "number" ? manifest.total_size : null,
+            size: singleSize,
             url: `${baseUrl}/api/observations/${contentHashClean}`,
           },
         ],

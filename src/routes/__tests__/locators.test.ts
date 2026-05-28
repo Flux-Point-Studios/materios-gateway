@@ -165,16 +165,18 @@ describe("GET /locators/:receiptId — single-blob (observation) manifest", () =
     const body = res.body as {
       receipt_id: string;
       content_hash: string;
-      total_size: number | null;
+      total_size: number;
       chunk_count: number;
-      chunks: Array<{ index: number; sha256: string; size: number | null; url: string }>;
+      chunks: Array<{ index: number; sha256: string; size: number; url: string }>;
     };
     expect(body.receipt_id).toBe(receiptId);
     expect(body.content_hash).toBe("0x" + contentHash);
     expect(body.chunk_count).toBe(1);
+    expect(body.total_size).toBe(0);
     expect(body.chunks).toHaveLength(1);
     expect(body.chunks[0]!.index).toBe(0);
     expect(body.chunks[0]!.sha256).toBe(contentHash);
+    expect(body.chunks[0]!.size).toBe(0);
     expect(body.chunks[0]!.url).toBe(`http://gateway.test/api/observations/${contentHash}`);
   });
 
