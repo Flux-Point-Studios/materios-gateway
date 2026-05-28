@@ -37,6 +37,7 @@ import { config } from "../config.js";
 import {
   SCHEMA_HASH_HEX,
   SCHEMA_VERSION,
+  canonicalContentHash,
   validateAiCapabilityObservationV1,
   type AiCapabilityObservationV1,
   type ValidateErrorCode,
@@ -162,9 +163,17 @@ function buildRegistryManifest(
       ? artifactRef.slice("blob:".length)
       : null;
 
+  // `chunks` is required by routes/locators.ts (`manifest.chunks.reduce(...)`).
+  // Observation manifests are self-rooted JSON, no chunked blob bytes, so the
+  // array is always empty. `rootHash` = content hash so the receipt-submitter's
+  // verifiability gate passes (see receipt-submitter.mjs § unverifiable_upload)
+  // and `total_size` is 0 so the locator route doesn't blow on a missing field.
   return {
     schema: SCHEMA_VERSION,
     capturedAtMs,
+    chunks: [],
+    rootHash: canonicalContentHash(rec),
+    total_size: 0,
     model: {
       name: rec.model.name,
       version: rec.model.version,
@@ -338,20 +347,15 @@ observationsSubmitRouter.post(
       return;
     }
 
-    // -------------------- replay shortcut --------------------
+    // -------------------- persist manifest --------------------
+    // We always re-save the manifest, even on replay: the SDK signature has
+    // already cleared, and the bytes are deterministic from `record`, so an
+    // idempotent rewrite is safe AND lets us self-heal a corrupted manifest
+    // without an operator stepping in. The notify-submitter side IS short-
+    // circuited on replay (see below) — the chain-side idempotency lives in
+    // the receipt-submitter's content_hash dedup ledger.
     const existing = await getManifest(contentHash);
-    if (existing) {
-      res.status(200).json({
-        ok: true,
-        status: "replay",
-        content_hash: contentHash,
-        schema_hash: SCHEMA_HASH_HEX,
-        observer_ss58: record.observer.ss58,
-      });
-      return;
-    }
-
-    // -------------------- persist + notify --------------------
+    const isReplay = existing !== null;
     const nowMs = Date.now();
     const manifest = buildRegistryManifest(record, nowMs);
     try {
@@ -366,6 +370,18 @@ observationsSubmitRouter.post(
       return;
     }
 
+    if (isReplay) {
+      res.status(200).json({
+        ok: true,
+        status: "replay",
+        content_hash: contentHash,
+        schema_hash: SCHEMA_HASH_HEX,
+        observer_ss58: record.observer.ss58,
+      });
+      return;
+    }
+
+    // -------------------- notify --------------------
     void notifySponsoredReceiptSubmitter({
       contentHash,
       operator,
