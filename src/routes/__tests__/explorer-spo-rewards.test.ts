@@ -29,6 +29,7 @@ import {
   type KoiosFetcher,
   type KoiosCurrentEpochFetcher,
   type KoiosPoolBlocksInEpochFetcher,
+  type KoiosEpochInfoFetcher,
 } from "../explorer-spo-rewards.js";
 
 interface CallResult {
@@ -171,13 +172,24 @@ function makeCurrentEpochFetcher(
 }
 
 function makePoolBlocksInEpochFetcher(
-  counts: Record<string, number | Error>,
+  counts: Record<string, number | Error | Record<number, number | Error>>,
 ): KoiosPoolBlocksInEpochFetcher {
-  return async (poolBech32: string) => {
+  return async (poolBech32: string, epoch: number) => {
     const v = counts[poolBech32];
+    if (v === undefined) return 0;
     if (v instanceof Error) throw v;
-    return typeof v === "number" ? v : 0;
+    if (typeof v === "number") return v;
+    // Per-epoch map: return/throw the entry for this epoch, else 0.
+    const perEpoch = v[epoch];
+    if (perEpoch instanceof Error) throw perEpoch;
+    return typeof perEpoch === "number" ? perEpoch : 0;
   };
+}
+
+function makeEpochInfoFetcher(
+  byEpoch: Record<number, { avg_blk_reward: string | null } | null>,
+): KoiosEpochInfoFetcher {
+  return async (epoch: number) => byEpoch[epoch] ?? null;
 }
 
 describe("GET /preprod-explorer/api/spo-rewards", () => {
@@ -463,8 +475,9 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
 
   test("current-epoch supplement: closed-epoch blocks + open-epoch blocks summed", async () => {
     // Closed epochs (pool_history) show 5 blocks for Hetzner across 286-288;
-    // the open current epoch (290) is not yet in pool_history but pool_blocks
-    // returns 3 entries. Lifetime must be 5 + 3 = 8.
+    // pool_history max epoch is 288, currentEpoch 290 → gap [289, 290].
+    // Gap-fill: epoch 289 → 0 blocks, epoch 290 → 3 blocks. Lifetime is the
+    // closed-epoch aggregate (5) plus the gap sum (3) = 8.
     const CLOSED_HISTORY = [
       { epoch_no: 288, active_stake: "1000", block_cnt: 2, pool_fees: "0", deleg_rewards: "0" },
       { epoch_no: 287, active_stake: "1000", block_cnt: 3, pool_fees: "0", deleg_rewards: "0" },
@@ -477,7 +490,7 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
         koiosFetch: makeKoiosFetcher({ [HETZNER_POOL]: CLOSED_HISTORY }),
         koiosCurrentEpoch: makeCurrentEpochFetcher(290),
         koiosPoolBlocksInEpoch: makePoolBlocksInEpochFetcher({
-          [HETZNER_POOL]: 3,
+          [HETZNER_POOL]: { 289: 0, 290: 3 },
         }),
         disableCache: true,
       }),
@@ -520,6 +533,10 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
     const NODE3_HISTORY = [
       { epoch_no: 288, active_stake: "1000", block_cnt: 2, pool_fees: "0", deleg_rewards: "0" },
     ];
+    // currentEpoch 290, both histories max at 288 → gap [289, 290].
+    // Hetzner's per-epoch fetch throws for every gap epoch → pending 0 →
+    // lifetime falls back to the aggregate (5). Node-3's gap fills 289→0,
+    // 290→1 → pending 1 → lifetime agg(2)+1 = 3.
     const app = express();
     app.use(
       createExplorerSpoRewardsRouter({
@@ -531,7 +548,7 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
         koiosCurrentEpoch: makeCurrentEpochFetcher(290),
         koiosPoolBlocksInEpoch: makePoolBlocksInEpochFetcher({
           [HETZNER_POOL]: new Error("ETIMEDOUT"),
-          [NODE3_POOL]: 1,
+          [NODE3_POOL]: { 289: 0, 290: 1 },
         }),
         disableCache: true,
       }),
@@ -543,5 +560,126 @@ describe("GET /preprod-explorer/api/spo-rewards", () => {
     const node3 = ops.find((o) => o.label === "Node-3")!;
     expect(hetzner.cardano_blocks_lifetime).toBe(5);
     expect(node3.cardano_blocks_lifetime).toBe(3);
+  });
+
+  test("block count includes ALL unsettled gap epochs, not just current", async () => {
+    // Live Hetzner bug: pool_history covers epochs up to 289 (all block_cnt 0
+    // because pool_history lags the tip by ~2 epochs), currentEpoch is 291,
+    // and real blocks were produced in the gap: epoch 290 → 5, epoch 291 → 9.
+    // The old code only added the CURRENT epoch (9), undercounting by 5. The
+    // gap [290, 291] must be summed → pending 14, lifetime agg(0)+14 = 14.
+    const STALE_HISTORY = [
+      { epoch_no: 289, active_stake: "1000", block_cnt: 0, pool_fees: "0", deleg_rewards: "0" },
+      { epoch_no: 288, active_stake: "1000", block_cnt: 0, pool_fees: "0", deleg_rewards: "0" },
+      { epoch_no: 287, active_stake: "1000", block_cnt: 0, pool_fees: "0", deleg_rewards: "0" },
+      { epoch_no: 286, active_stake: "1000", block_cnt: 0, pool_fees: "0", deleg_rewards: "0" },
+    ];
+    const app = express();
+    app.use(
+      createExplorerSpoRewardsRouter({
+        apiFactory: () => makeFakeMateriosApi({}),
+        koiosFetch: makeKoiosFetcher({ [HETZNER_POOL]: STALE_HISTORY }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(291),
+        koiosPoolBlocksInEpoch: makePoolBlocksInEpochFetcher({
+          [HETZNER_POOL]: { 290: 5, 291: 9 },
+        }),
+        disableCache: true,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/spo-rewards");
+    expect(res.status).toBe(200);
+    const ops = (res.body as { operators: Array<Record<string, unknown>> }).operators;
+    const hetzner = ops.find((o) => o.label === "Hetzner")!;
+    expect(hetzner.cardano_blocks_lifetime).toBe(14);
+    expect(hetzner.cardano_pending_blocks).toBe(14);
+  });
+
+  test("estimated pending rewards = pending_blocks × avg_blk_reward", async () => {
+    // 14 pending blocks (epochs 290+291) × network avg_blk_reward for the
+    // reliably-settled epoch (currentEpoch-2 = 289) = 14 × 19_587_488 lovelace
+    // = 274_224_832 lovelace ≈ 274.224 tADA.
+    const STALE_HISTORY = [
+      { epoch_no: 289, active_stake: "1000", block_cnt: 0, pool_fees: "0", deleg_rewards: "0" },
+      { epoch_no: 288, active_stake: "1000", block_cnt: 0, pool_fees: "0", deleg_rewards: "0" },
+    ];
+    const app = express();
+    app.use(
+      createExplorerSpoRewardsRouter({
+        apiFactory: () => makeFakeMateriosApi({}),
+        koiosFetch: makeKoiosFetcher({ [HETZNER_POOL]: STALE_HISTORY }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(291),
+        koiosPoolBlocksInEpoch: makePoolBlocksInEpochFetcher({
+          [HETZNER_POOL]: { 290: 5, 291: 9 },
+        }),
+        koiosEpochInfo: makeEpochInfoFetcher({
+          289: { avg_blk_reward: "19587488" },
+        }),
+        disableCache: true,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/spo-rewards");
+    expect(res.status).toBe(200);
+    const ops = (res.body as { operators: Array<Record<string, unknown>> }).operators;
+    const hetzner = ops.find((o) => o.label === "Hetzner")!;
+    expect(hetzner.cardano_pending_blocks).toBe(14);
+    expect(hetzner.cardano_est_basis_epoch).toBe(289);
+    expect(hetzner.cardano_est_pending_rewards_raw).toBe("274224832");
+    // formatAda(274224832, 3) truncates the 6-decimal lovelace to 3 digits.
+    expect(hetzner.cardano_est_pending_rewards).toBe("274.224");
+  });
+
+  test("no estimate basis (avg_blk_reward null) → est fields null but pending_blocks still set", async () => {
+    const STALE_HISTORY = [
+      { epoch_no: 289, active_stake: "1000", block_cnt: 0, pool_fees: "0", deleg_rewards: "0" },
+    ];
+    const app = express();
+    app.use(
+      createExplorerSpoRewardsRouter({
+        apiFactory: () => makeFakeMateriosApi({}),
+        koiosFetch: makeKoiosFetcher({ [HETZNER_POOL]: STALE_HISTORY }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(291),
+        koiosPoolBlocksInEpoch: makePoolBlocksInEpochFetcher({
+          [HETZNER_POOL]: { 290: 5, 291: 9 },
+        }),
+        // Koios has the epoch row but avg_blk_reward is not yet populated.
+        koiosEpochInfo: makeEpochInfoFetcher({
+          289: { avg_blk_reward: null },
+        }),
+        disableCache: true,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/spo-rewards");
+    expect(res.status).toBe(200);
+    const ops = (res.body as { operators: Array<Record<string, unknown>> }).operators;
+    const hetzner = ops.find((o) => o.label === "Hetzner")!;
+    expect(hetzner.cardano_pending_blocks).toBe(14);
+    expect(hetzner.cardano_est_pending_rewards_raw).toBeNull();
+    expect(hetzner.cardano_est_pending_rewards).toBeNull();
+    expect(hetzner.cardano_est_basis_epoch).toBeNull();
+  });
+
+  test("permissioned operators (no pool) get null cardano pending + est fields", async () => {
+    const app = express();
+    app.use(
+      createExplorerSpoRewardsRouter({
+        apiFactory: () => makeFakeMateriosApi({}),
+        koiosFetch: makeKoiosFetcher({ [HETZNER_POOL]: POOL_HISTORY_TWO_EPOCHS }),
+        koiosCurrentEpoch: makeCurrentEpochFetcher(290),
+        koiosPoolBlocksInEpoch: makePoolBlocksInEpochFetcher({
+          [HETZNER_POOL]: { 289: 0, 290: 0 },
+        }),
+        koiosEpochInfo: makeEpochInfoFetcher({ 288: { avg_blk_reward: "19587488" } }),
+        disableCache: true,
+      }),
+    );
+    const res = await callApp(app, "/preprod-explorer/api/spo-rewards");
+    expect(res.status).toBe(200);
+    const ops = (res.body as { operators: Array<Record<string, unknown>> }).operators;
+    const macbook = ops.find((o) => o.label === "MacBook")!;
+    expect(macbook.trust).toBe("permissioned");
+    expect(macbook.cardano_pending_blocks).toBeNull();
+    expect(macbook.cardano_est_pending_rewards_raw).toBeNull();
+    expect(macbook.cardano_est_pending_rewards).toBeNull();
+    expect(macbook.cardano_est_basis_epoch).toBeNull();
   });
 });
