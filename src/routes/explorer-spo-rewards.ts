@@ -35,7 +35,14 @@ const CACHE_TTL_MS = 60_000;
 const KOIOS_PREPROD_URL = "https://preprod.koios.rest/api/v1/pool_history";
 const KOIOS_TIP_URL = "https://preprod.koios.rest/api/v1/tip";
 const KOIOS_POOL_BLOCKS_URL = "https://preprod.koios.rest/api/v1/pool_blocks";
+const KOIOS_EPOCH_INFO_URL = "https://preprod.koios.rest/api/v1/epoch_info";
 const KOIOS_TIMEOUT_MS = 15_000;
+// Cardano pays rewards ~2 epochs in arrears; epoch_info for currentEpoch-2 is
+// the freshest one whose avg_blk_reward is reliably settled.
+const REWARD_ARREARS_EPOCHS = 2;
+// Cap the gap-fill loop so a badly-stale pool_history can't fan out into an
+// unbounded number of per-epoch Koios calls.
+const MAX_GAP_EPOCHS = 6;
 const SS58_PREFIX = 42;
 // Materios MATRA decimals on v5 (Cardano cMATRA-compatible).
 const MATRA_DECIMALS = 6;
@@ -70,11 +77,16 @@ export type KoiosPoolBlocksInEpochFetcher = (
   epoch: number,
 ) => Promise<number>;
 
+export type KoiosEpochInfoFetcher = (
+  epoch: number,
+) => Promise<{ avg_blk_reward: string | null } | null>;
+
 interface RouterDeps {
   apiFactory?: ExplorerApiFactory;
   koiosFetch?: KoiosFetcher;
   koiosCurrentEpoch?: KoiosCurrentEpochFetcher;
   koiosPoolBlocksInEpoch?: KoiosPoolBlocksInEpochFetcher;
+  koiosEpochInfo?: KoiosEpochInfoFetcher;
   disableCache?: boolean;
 }
 
@@ -94,6 +106,10 @@ interface OperatorRewardsRow {
   cardano_active_stake: string | null;
   cardano_first_epoch: number | null;
   cardano_last_epoch_with_blocks: number | null;
+  cardano_pending_blocks: number | null;
+  cardano_est_pending_rewards_raw: string | null;
+  cardano_est_pending_rewards: string | null;
+  cardano_est_basis_epoch: number | null;
 }
 
 interface RewardsSnapshot {
@@ -185,6 +201,37 @@ async function defaultKoiosPoolBlocksInEpoch(
       }`,
     );
     return 0;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// WHY fail-OPEN (null on any error): the pending-rewards estimate is a
+// best-effort supplement. A missing/flaky epoch_info row must leave the
+// est_* columns null, never 503 the tab or throw into buildSnapshot.
+async function defaultKoiosEpochInfo(
+  epoch: number,
+): Promise<{ avg_blk_reward: string | null } | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), KOIOS_TIMEOUT_MS);
+  try {
+    const url = `${KOIOS_EPOCH_INFO_URL}?_epoch_no=${epoch}`;
+    const resp = await fetch(url, { signal: ctrl.signal });
+    if (!resp.ok) {
+      console.warn(`[explorer-spo-rewards] Koios epoch_info ${resp.status} for epoch ${epoch}`);
+      return null;
+    }
+    const body = await resp.json();
+    if (!Array.isArray(body) || body.length === 0) return null;
+    const raw = body[0]?.avg_blk_reward;
+    return { avg_blk_reward: typeof raw === "string" ? raw : null };
+  } catch (err) {
+    console.warn(
+      `[explorer-spo-rewards] Koios epoch_info failed for epoch ${epoch}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return null;
   } finally {
     clearTimeout(timer);
   }
@@ -300,6 +347,9 @@ interface CardanoAgg {
   activeStake: bigint | null;
   firstEpoch: number | null;
   lastEpochWithBlocks: number | null;
+  // Largest epoch_no present in pool_history (the newest SETTLED epoch).
+  // Drives the unsettled-gap fill in buildSnapshot. Null when empty.
+  maxSettledEpoch: number | null;
 }
 
 function aggregatePoolHistory(records: KoiosPoolHistoryRecord[]): CardanoAgg {
@@ -311,6 +361,7 @@ function aggregatePoolHistory(records: KoiosPoolHistoryRecord[]): CardanoAgg {
       activeStake: null,
       firstEpoch: null,
       lastEpochWithBlocks: null,
+      maxSettledEpoch: null,
     };
   }
 
@@ -356,6 +407,7 @@ function aggregatePoolHistory(records: KoiosPoolHistoryRecord[]): CardanoAgg {
     activeStake: latestActiveStake,
     firstEpoch: Number.isFinite(minEpoch) ? minEpoch : null,
     lastEpochWithBlocks,
+    maxSettledEpoch: Number.isFinite(maxEpoch) ? maxEpoch : null,
   };
 }
 
@@ -364,6 +416,7 @@ async function buildSnapshot(
   koiosFetch: KoiosFetcher,
   koiosCurrentEpoch: KoiosCurrentEpochFetcher,
   koiosPoolBlocksInEpoch: KoiosPoolBlocksInEpochFetcher,
+  koiosEpochInfo: KoiosEpochInfoFetcher,
 ): Promise<RewardsSnapshot> {
   const entries = Object.entries(ROSTER);
 
@@ -416,23 +469,60 @@ async function buildSnapshot(
     koiosCurrentEpoch(),
   ]);
 
-  const currentEpochBlocksByPool = new Map<string, number>();
+  // Aggregate each pool's SETTLED history up front — the unsettled-gap fill
+  // below keys off agg.maxSettledEpoch.
+  const aggByPool = new Map<string, CardanoAgg>();
+  for (const poolId of cardanoPools) {
+    aggByPool.set(poolId, aggregatePoolHistory(poolHistByPool.get(poolId) ?? []));
+  }
+
+  // Unsettled-gap block fill. pool_history lags the tip by ~2 epochs, so any
+  // epoch in (maxSettledEpoch, currentEpoch] is closed-or-current but not yet
+  // in history — its blocks are still real. Sum pool_blocks across that gap.
+  // The loop is bounded to the last MAX_GAP_EPOCHS so a badly-stale history
+  // can't fan out unbounded Koios calls; a per-epoch throw counts as 0 for
+  // that epoch only (one flaky epoch must not zero the whole supplement).
+  const pendingBlocksByPool = new Map<string, number>();
   if (currentEpoch !== null) {
     await Promise.all(
       cardanoPools.map(async (poolId) => {
-        try {
-          const n = await koiosPoolBlocksInEpoch(poolId, currentEpoch);
-          currentEpochBlocksByPool.set(poolId, n);
-        } catch (err) {
-          console.warn(
-            `[explorer-spo-rewards] current-epoch blocks failed for ${poolId}: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-          currentEpochBlocksByPool.set(poolId, 0);
+        const maxSettled = aggByPool.get(poolId)?.maxSettledEpoch ?? null;
+        const lo =
+          maxSettled === null
+            ? currentEpoch
+            : Math.max(maxSettled + 1, currentEpoch - (MAX_GAP_EPOCHS - 1));
+        let pending = 0;
+        for (let epoch = lo; epoch <= currentEpoch; epoch++) {
+          try {
+            pending += await koiosPoolBlocksInEpoch(poolId, epoch);
+          } catch (err) {
+            console.warn(
+              `[explorer-spo-rewards] gap-epoch ${epoch} blocks failed for ${poolId}: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }
         }
+        pendingBlocksByPool.set(poolId, pending);
       }),
     );
+  }
+
+  // Network-wide pending-rewards basis: one epoch_info call for the freshest
+  // reliably-settled epoch (currentEpoch-2). Same for every pool, so fetch
+  // once. avg_blk_reward null (or no current epoch) → no estimate anywhere.
+  const estBasisEpoch =
+    currentEpoch === null ? null : currentEpoch - REWARD_ARREARS_EPOCHS;
+  let avgBlkRewardLovelace: bigint | null = null;
+  if (estBasisEpoch !== null) {
+    const info = await koiosEpochInfo(estBasisEpoch);
+    if (info?.avg_blk_reward != null) {
+      try {
+        avgBlkRewardLovelace = BigInt(info.avg_blk_reward);
+      } catch {
+        avgBlkRewardLovelace = null;
+      }
+    }
   }
 
   const operators: OperatorRewardsRow[] = entries.map(([auraHex, meta]) => {
@@ -457,16 +547,24 @@ async function buildSnapshot(
       cardano_active_stake: null,
       cardano_first_epoch: null,
       cardano_last_epoch_with_blocks: null,
+      cardano_pending_blocks: null,
+      cardano_est_pending_rewards_raw: null,
+      cardano_est_pending_rewards: null,
+      cardano_est_basis_epoch: null,
     };
 
     if (meta.cardano_pool_id) {
-      const hist = poolHistByPool.get(meta.cardano_pool_id) ?? [];
-      const agg = aggregatePoolHistory(hist);
-      const currentEpochBlocks =
-        currentEpochBlocksByPool.get(meta.cardano_pool_id) ?? 0;
+      const agg =
+        aggByPool.get(meta.cardano_pool_id) ??
+        aggregatePoolHistory([]);
+      const pendingBlocks = pendingBlocksByPool.get(meta.cardano_pool_id) ?? 0;
+      const estRaw =
+        avgBlkRewardLovelace === null
+          ? null
+          : (BigInt(pendingBlocks) * avgBlkRewardLovelace).toString();
       row = {
         ...row,
-        cardano_blocks_lifetime: agg.blocks + currentEpochBlocks,
+        cardano_blocks_lifetime: agg.blocks + pendingBlocks,
         cardano_pool_fees_lifetime_raw: agg.fees.toString(),
         cardano_pool_fees_lifetime: formatAda(agg.fees, 6),
         cardano_delegator_rewards_lifetime_raw: agg.delegRewards.toString(),
@@ -477,6 +575,11 @@ async function buildSnapshot(
           agg.activeStake === null ? null : formatAda(agg.activeStake, 3),
         cardano_first_epoch: agg.firstEpoch,
         cardano_last_epoch_with_blocks: agg.lastEpochWithBlocks,
+        cardano_pending_blocks: pendingBlocks,
+        cardano_est_pending_rewards_raw: estRaw,
+        cardano_est_pending_rewards:
+          estRaw === null ? null : formatAda(BigInt(estRaw), 3),
+        cardano_est_basis_epoch: avgBlkRewardLovelace === null ? null : estBasisEpoch,
       };
     }
 
@@ -497,6 +600,7 @@ export function createExplorerSpoRewardsRouter(deps: RouterDeps = {}): Router {
   const koiosCurrentEpoch = deps.koiosCurrentEpoch ?? defaultKoiosCurrentEpoch;
   const koiosPoolBlocksInEpoch =
     deps.koiosPoolBlocksInEpoch ?? defaultKoiosPoolBlocksInEpoch;
+  const koiosEpochInfo = deps.koiosEpochInfo ?? defaultKoiosEpochInfo;
 
   let cached: RewardsSnapshot | null = null;
   let cachedAt = 0;
@@ -520,6 +624,7 @@ export function createExplorerSpoRewardsRouter(deps: RouterDeps = {}): Router {
           koiosFetch,
           koiosCurrentEpoch,
           koiosPoolBlocksInEpoch,
+          koiosEpochInfo,
         );
         cached = snapshot;
         cachedAt = now;
