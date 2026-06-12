@@ -23,6 +23,7 @@ import spoPoolsData from "../data/spo-pools.json" with { type: "json" };
 import { createExplorerApiFactory, type ExplorerApiFactory } from "./explorer-rpc.js";
 import {
   cexplorerTxUrl,
+  escapeHtml,
   headerNumber,
   normalizeAuraKey,
   readAuraAuthorities,
@@ -533,16 +534,6 @@ async function buildPayload(
 // ---------------------------------------------------------------------------
 // HTML rendering
 // ---------------------------------------------------------------------------
-
-function escapeHtml(s: unknown): string {
-  if (s === null || s === undefined) return "";
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
 
 function renderShell(title: string, body: string, withChart: boolean): string {
   const chartScript = withChart
