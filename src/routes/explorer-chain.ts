@@ -1,13 +1,13 @@
 /**
- * Shared @polkadot/api decode helpers used by every explorer route.
+ * Shared @polkadot/api decode + render helpers used by every explorer route.
  *
- * The validators / spo-rewards / operator pages each scan recent headers,
- * read the aura authority array, and pull the current session epoch. The
- * decode shape for each query is non-trivial (toJSON paths, fallback
- * accessors, hex normalization) and has shifted across spec versions, so
- * keeping one copy here avoids the "this page reports epoch 632, that one
- * reports 0" drift that happens when one route gets patched and another
- * doesn't.
+ * The validators / spo-rewards / operator / spo-journey pages each scan
+ * recent headers, read the aura authority array, decode the session
+ * committee, and pull the current session epoch. The decode shape for each
+ * query is non-trivial (toJSON paths, fallback accessors, hex normalization)
+ * and has shifted across spec versions, so keeping one copy here avoids the
+ * "this page reports epoch 632, that one reports 0" drift that happens when
+ * one route gets patched and another doesn't.
  *
  * All helpers are best-effort: they return null / [] / 0 on decode failure
  * rather than throwing. Callers degrade their section instead of 503-ing
@@ -112,6 +112,78 @@ export async function readAuraAuthorities(api: any): Promise<string[]> {
   } catch {
     return [];
   }
+}
+
+export interface CommitteeEntry {
+  sidechainPubkey: string;
+  aura: string;
+  grandpa: string;
+}
+
+/**
+ * Normalize the polkadot.js toJSON() shape of
+ * `sessionCommitteeManagement.currentCommittee()` into flat tuples.
+ *
+ * On chain the shape is roughly:
+ *   { committee: Array<[ sidechain_pubkey, { aura, grandpa } ]> }
+ *
+ * toJSON() flattens the SCALE codec into JSON. We accept multiple shapes
+ * defensively since the runtime metadata has shifted between specs (the
+ * inner record sometimes serialises with snake_case keys, sometimes
+ * camelCase — depends on whether `RuntimeApi` derived names landed).
+ */
+export function parseCommittee(raw: unknown): CommitteeEntry[] {
+  if (raw === null || raw === undefined) return [];
+  // Most common shape: { committee: [[pk, {aura, grandpa}], ...] }
+  let pairs: unknown[] | null = null;
+  if (Array.isArray(raw)) {
+    pairs = raw;
+  } else if (typeof raw === "object" && raw !== null) {
+    const obj = raw as Record<string, unknown>;
+    const list = obj.committee ?? obj.Committee;
+    if (Array.isArray(list)) pairs = list;
+  }
+  if (!pairs) return [];
+
+  const out: CommitteeEntry[] = [];
+  for (const pair of pairs) {
+    if (!Array.isArray(pair) || pair.length !== 2) continue;
+    const [pkRaw, keysRaw] = pair;
+    if (typeof pkRaw !== "string") continue;
+    if (typeof keysRaw !== "object" || keysRaw === null) continue;
+    const keys = keysRaw as Record<string, unknown>;
+    const aura = String(keys.aura ?? keys.Aura ?? "");
+    const grandpa = String(keys.grandpa ?? keys.Grandpa ?? "");
+    out.push({ sidechainPubkey: pkRaw, aura, grandpa });
+  }
+  return out;
+}
+
+/**
+ * `nextCommittee()` returns Option<{epoch, committee}> — accept the unwrapped
+ * shape, the Option-style shape, or null. The toJSON path covers polkadot.js's
+ * normal serialisation; the isNone path is a defensive belt-and-braces for
+ * tests using fake codecs. parseCommittee strips the {epoch, committee}
+ * wrapper itself.
+ */
+export function parseNextCommittee(raw: unknown): CommitteeEntry[] {
+  if (raw === null || raw === undefined) return [];
+  const json =
+    (raw as { isNone?: boolean }).isNone === true
+      ? null
+      : (raw as { toJSON?: () => unknown }).toJSON?.() ?? raw;
+  if (json === null || json === undefined) return [];
+  return parseCommittee(json);
+}
+
+export function escapeHtml(s: unknown): string {
+  if (s === null || s === undefined) return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 export function cexplorerTxUrl(txHash: string, network: "preprod" | "mainnet"): string {

@@ -27,11 +27,15 @@ import { hexToU8a } from "@polkadot/util";
 import operatorsData from "../data/operators.json" with { type: "json" };
 import { createExplorerApiFactory, type ExplorerApiFactory } from "./explorer-rpc.js";
 import {
+  escapeHtml,
   headerNumber,
   normalizeAuraKey,
+  parseCommittee,
+  parseNextCommittee,
   readAuraAuthorities,
   readAuraSlot,
   readScEpoch,
+  type CommitteeEntry,
 } from "./explorer-chain.js";
 import { getAllLatest } from "../heartbeat-store.js";
 import { listAllAuraBindings } from "../quota.js";
@@ -158,51 +162,6 @@ interface RouterDeps {
 
 const defaultApiFactory = createExplorerApiFactory("explorer-validators");
 
-interface CommitteeEntry {
-  sidechainPubkey: string;
-  aura: string;
-  grandpa: string;
-}
-
-/**
- * Normalize the polkadot.js toJSON() shape of
- * `MainChainScripts::CommitteeEntry` into a flat tuple.
- *
- * On chain the shape is roughly:
- *   { committee: Array<[ sidechain_pubkey, { aura, grandpa } ]> }
- *
- * toJSON() flattens the SCALE codec into JSON. We accept multiple shapes
- * defensively since the runtime metadata has shifted between specs (the
- * inner record sometimes serialises with snake_case keys, sometimes
- * camelCase — depends on whether `RuntimeApi` derived names landed).
- */
-function parseCommittee(raw: unknown): CommitteeEntry[] {
-  if (raw === null || raw === undefined) return [];
-  // Most common shape: { committee: [[pk, {aura, grandpa}], ...] }
-  let pairs: unknown[] | null = null;
-  if (Array.isArray(raw)) {
-    pairs = raw;
-  } else if (typeof raw === "object" && raw !== null) {
-    const obj = raw as Record<string, unknown>;
-    const list = obj.committee ?? obj.Committee;
-    if (Array.isArray(list)) pairs = list;
-  }
-  if (!pairs) return [];
-
-  const out: CommitteeEntry[] = [];
-  for (const pair of pairs) {
-    if (!Array.isArray(pair) || pair.length !== 2) continue;
-    const [pkRaw, keysRaw] = pair;
-    if (typeof pkRaw !== "string") continue;
-    if (typeof keysRaw !== "object" || keysRaw === null) continue;
-    const keys = keysRaw as Record<string, unknown>;
-    const aura = String(keys.aura ?? keys.Aura ?? "");
-    const grandpa = String(keys.grandpa ?? keys.Grandpa ?? "");
-    out.push({ sidechainPubkey: pkRaw, aura, grandpa });
-  }
-  return out;
-}
-
 function resolveOperator(sidechainPubkey: string): {
   label: string | null;
   trust: "permissioned" | "spo" | "unknown";
@@ -257,28 +216,7 @@ async function buildSnapshot(
 
   const head = headerNumber(headHeader);
   const currentEntries = parseCommittee(currentRaw?.toJSON?.() ?? currentRaw);
-
-  // `nextCommittee()` returns Option<{epoch, committee}> — we accept the
-  // unwrapped shape, the Option-style shape, or null. The toJSON path
-  // covers polkadot.js's normal serialisation; the isNone path is a
-  // defensive belt-and-braces for tests using fake codecs.
-  let nextEntries: CommitteeEntry[] = [];
-  if (nextRaw !== null && nextRaw !== undefined) {
-    const nextJson =
-      (nextRaw as { isNone?: boolean }).isNone === true
-        ? null
-        : (nextRaw as { toJSON?: () => unknown }).toJSON?.() ?? nextRaw;
-    if (nextJson !== null && nextJson !== undefined) {
-      // Strip the {epoch, committee} wrapper if present.
-      const inner =
-        typeof nextJson === "object" &&
-        nextJson !== null &&
-        "committee" in (nextJson as Record<string, unknown>)
-          ? (nextJson as { committee: unknown }).committee
-          : nextJson;
-      nextEntries = parseCommittee(inner);
-    }
-  }
+  const nextEntries: CommitteeEntry[] = parseNextCommittee(nextRaw);
 
   const auraAuthorities = await readAuraAuthorities(a);
   // Fallback: if aura.authorities() is unavailable, derive a same-order list
@@ -486,16 +424,6 @@ export const explorerValidatorsRouter = createExplorerValidatorsRouter();
 // ---------------------------------------------------------------------------
 // HTML rendering
 // ---------------------------------------------------------------------------
-
-function escapeHtml(s: unknown): string {
-  if (s === null || s === undefined) return "";
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
 
 function formatGap(gap: number): string {
   return `${gap.toLocaleString("en-US")} blocks behind`;
