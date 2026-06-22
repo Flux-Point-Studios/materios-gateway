@@ -30,6 +30,20 @@ let cached: ChainInfo | null = null;
 let lastPoll = 0;
 const POLL_INTERVAL_MS = 30_000;
 
+// Canonical DNS-pinned Gemtek bootnode (#188). Same multiaddr now baked
+// into bootstrap-validator.sh and the operator docs. A freshly-restored
+// node reads this for peer auto-discovery, so the default MUST resolve;
+// the prior /ip4 bastion default was a dead peer. Override per-deploy with
+// the comma-separated BOOTNODES env if the topology changes.
+const DEFAULT_BOOTNODE =
+  "/dns4/bootnode.materios.fluxpointstudios.com/tcp/30333/p2p/12D3KooWPueKoxRAirTTKH4Y2qQAsJDegWMjS4k89Z7izCbZKgkM";
+
+function resolveBootnodes(): string[] {
+  const env = process.env.BOOTNODES?.trim();
+  if (env) return env.split(",").map((s) => s.trim()).filter(Boolean);
+  return [DEFAULT_BOOTNODE];
+}
+
 function stripHexPrefix(hex: string): string {
   return hex.startsWith("0x") ? hex : "0x" + hex;
 }
@@ -59,9 +73,7 @@ async function pollChain(): Promise<void> {
       spec_version: version?.specVersion || 0,
       best_block: parseInt(header?.number || "0x0", 16),
       finalized_block: parseInt(finHeader?.number || "0x0", 16),
-      bootnodes: [
-        "/ip4/5.78.94.109/tcp/30333/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp",
-      ],
+      bootnodes: resolveBootnodes(),
       chain_spec_url:
         process.env.CHAIN_SPEC_URL ||
         "https://materios.fluxpointstudios.com/blobs/chain-spec-raw.json",
@@ -87,3 +99,6 @@ router.get("/chain-info", async (_req: Request, res: Response) => {
 
 export { router as chainInfoRouter };
 export { pollChain as initChainInfoPoller };
+export function __test_getCachedChainInfo(): ChainInfo | null {
+  return cached;
+}
