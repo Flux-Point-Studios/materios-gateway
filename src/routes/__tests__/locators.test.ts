@@ -207,6 +207,30 @@ describe("GET /locators/:receiptId — single-blob (observation) manifest", () =
     );
   });
 
+  test("self-rooted record with no stored pre-image — empty chunks for daemon shortcut", async () => {
+    // Regression (metering cert pipeline down): the metering route stores a
+    // self-rooted manifest (chunks:[], rootHash=content_hash) and does NOT
+    // persist raw.bin — the receipt IS the data. The locator must NOT
+    // synthesize a /raw chunk (it 404s, stalling the cert-daemon at FETCHED).
+    // With chunks:[] the daemon short-circuits to ROOT_VERIFIED on the on-chain
+    // base_root==content_hash, which is the intended self-rooted path.
+    const contentHash =
+      "5e97076941b72789f818dfea1ce55dfb89d20e968324cd0da96d6e91f44d049e";
+    const receiptId = computeReceiptId(contentHash);
+    await saveManifest(contentHash, {
+      schema: "compute_metering_v1",
+      chunks: [],
+      rootHash: contentHash,
+    });
+    // No saveRawBytes — self-rooted records have no separate pre-image.
+
+    const res = await getJson(ctx.app, `/locators/${receiptId}`);
+    expect(res.status).toBe(200);
+    const body = res.body as { chunk_count: number; chunks: unknown[] };
+    expect(body.chunk_count).toBe(0);
+    expect(body.chunks).toHaveLength(0);
+  });
+
   test("undefined chunks does not 500 — guard fires before reduce", async () => {
     // The exact failure mode previously logged in preprod was `TypeError:
     // Cannot read properties of undefined (reading 'reduce')`. Confirm the
@@ -223,10 +247,12 @@ describe("GET /locators/:receiptId — single-blob (observation) manifest", () =
     expect((res.body as { chunk_count: number }).chunk_count).toBe(1);
   });
 
-  test("empty chunks[] is treated as single-blob layout", async () => {
-    // The newer observations_submit.ts path writes `chunks: []` + `total_size: 0`
-    // to keep the legacy locator response consistent. We treat that as the
-    // observation layout too, since walking an empty chunk list is moot.
+  test("self-rooted empty chunks[] with no stored pre-image — empty chunks for daemon shortcut", async () => {
+    // A self-rooted record (rootHash == content_hash) with no stored raw.bin
+    // (observations_submit.ts / metering write `chunks: []`). The locator must
+    // emit an EMPTY chunk list so the cert-daemon short-circuits to
+    // ROOT_VERIFIED on the on-chain base_root==content_hash. Synthesizing a /raw
+    // chunk here 404s (no pre-image stored) and stalls the daemon at FETCHED.
     const contentHash = "e".repeat(64);
     const receiptId = computeReceiptId(contentHash);
     await saveManifest(contentHash, {
@@ -240,13 +266,12 @@ describe("GET /locators/:receiptId — single-blob (observation) manifest", () =
     expect(res.status).toBe(200);
     const body = res.body as {
       chunk_count: number;
-      chunks: Array<{ url: string; sha256: string }>;
+      chunks: unknown[];
       total_size: number;
     };
-    expect(body.chunk_count).toBe(1);
+    expect(body.chunk_count).toBe(0);
+    expect(body.chunks).toHaveLength(0);
     expect(body.total_size).toBe(0);
-    expect(body.chunks[0]!.url).toBe(`http://gateway.test/api/observations/${contentHash}/raw`);
-    expect(body.chunks[0]!.sha256).toBe(contentHash);
   });
 });
 

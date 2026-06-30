@@ -65,14 +65,40 @@ locatorsRouter.get("/locators/:receiptId", async (req: Request, res: Response) =
     const chunks = Array.isArray(manifest.chunks) ? manifest.chunks : null;
 
     if (!chunks || chunks.length === 0) {
-      // Single-blob layout — no chunked merkle to walk. The on-chain
-      // `content_hash` IS the blob digest, so the daemon's SHA-256 check is
-      // satisfied by fetching the canonical pre-image bytes and rehashing
-      // them. The `/raw` endpoint serves the byte-exact pre-image whose
-      // SHA-256 IS the content_hash; older observation manifests that
-      // predate byte-preserving ingestion return 404 there and remain
-      // un-anchorable.
+      const rootHashClean =
+        typeof manifest.rootHash === "string"
+          ? manifest.rootHash.replace(/^0x/, "")
+          : null;
       const raw = await getRawBytes(contentHashClean);
+
+      if (raw === null && rootHashClean !== null && rootHashClean === contentHashClean) {
+        // Self-rooted record (e.g. compute_metering) with NO stored pre-image:
+        // the manifest rootHash == content_hash and the on-chain receipt's
+        // base_root_sha256 == content_hash, so the record IS its own root. The
+        // cert-daemon short-circuits to ROOT_VERIFIED on (chunks=[] &&
+        // base_root==content_hash) with NO byte fetch (blob_verifier.py). Emit
+        // an EMPTY chunk list so that shortcut fires; synthesizing a /raw chunk
+        // (the pre-image is not stored here) would make chunks non-empty,
+        // defeat the shortcut, and 404 the daemon's fetch.
+        res.json({
+          receipt_id: receiptIdPrefixed,
+          content_hash: contentHashPrefixed,
+          total_size:
+            typeof manifest.total_size === "number" ? manifest.total_size : 0,
+          chunk_count: 0,
+          chunks: [],
+          root_hash: contentHashPrefixed,
+        });
+        return;
+      }
+
+      // Single blob with a stored pre-image (byte-preserving ingestion), or a
+      // legacy record that predates it. The on-chain `content_hash` IS the blob
+      // digest, so the daemon's SHA-256 check is satisfied by fetching the
+      // canonical pre-image bytes and rehashing them. The `/raw` endpoint serves
+      // the byte-exact pre-image whose SHA-256 IS the content_hash; manifests
+      // that predate byte-preserving ingestion return 404 there and remain
+      // un-anchorable.
       const singleSize =
         raw !== null
           ? raw.length
