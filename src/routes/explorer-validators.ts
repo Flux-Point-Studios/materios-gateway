@@ -429,7 +429,15 @@ function formatGap(gap: number): string {
   return `${gap.toLocaleString("en-US")} blocks behind`;
 }
 
-function statusBadge(status: MemberStatus, gap: number | null): string {
+function statusBadge(status: MemberStatus, gap: number | null, producing: boolean): string {
+  // On-chain block authorship is the authoritative liveness signal. A member
+  // producing blocks is live even if it never sends cert-daemon heartbeats
+  // (trustless finality-only validators run the node with no cert-daemon), so
+  // the heartbeat-derived status must not read as "Offline"/"Stale" for them.
+  // The underlying heartbeat status stays discoverable via the badge tooltip.
+  if (producing) {
+    return `<span class="badge ok" title="Heartbeat: ${escapeHtml(status)}">Producing</span>`;
+  }
   if (status === "stale") {
     const gapText = gap !== null ? ` (${formatGap(gap)})` : "";
     return `<span class="badge warn">Stale</span><span class="small">${escapeHtml(gapText)}</span>`;
@@ -451,7 +459,7 @@ function renderCommitteeRow(m: CommitteeMember): string {
   return `<tr>
   <td>${label}</td>
   <td>${trustBadge(m.trust)}</td>
-  <td>${statusBadge(m.status, m.heartbeatGap)}</td>
+  <td>${statusBadge(m.status, m.heartbeatGap, m.producing)}</td>
   <td>${escapeHtml(m.heartbeatBestBlock ?? "—")}</td>
   <td>${escapeHtml(m.blocksInLast60)}</td>
   <td class="mono">${escapeHtml(m.sidechain)}</td>

@@ -680,6 +680,44 @@ describe("HTML page /materios/explorer/validators", () => {
     expect(html).toMatch(/badge ok[^>]*>\s*Online\s*</);
   });
 
+  test("producing validator with no heartbeat renders green Producing badge, not Offline", async () => {
+    // Trustless finality-only validator: authoring blocks on-chain but runs
+    // no cert-daemon, so it has no heartbeat row (status:"offline"). The HTML
+    // must show a green "Producing" badge, never the scary "Offline" badge.
+    const slotByHeight = new Map<number, bigint>();
+    for (let n = 1; n <= 10; n++) slotByHeight.set(n, BigInt(n));
+    const cfg: FakeChainConfig = {
+      headNumber: 10,
+      slotByHeight,
+      currentCommittee: [[GEMTEK, { aura: AURA_GEMTEK, grandpa: GRANDPA_GEMTEK }]],
+      nextCommittee: null,
+      asOfIso: "2026-05-24T00:00:00Z",
+      scEpoch: 500_000,
+    };
+    const app = express();
+    app.use(
+      createExplorerValidatorsRouter({
+        apiFactory: () => makeFakeApi(cfg),
+        heartbeatProvider: () => ({ bindings: {}, heartbeats: [] }),
+        staleThresholdBlocks: 100,
+      }),
+    );
+    const res = await callApp(app, "/materios/explorer/validators");
+    expect(res.status).toBe(200);
+    const html = String(res.body);
+    // Green "Producing" badge overrides the offline heartbeat status.
+    expect(html).toMatch(/badge ok[^>]*>\s*Producing\s*</);
+    expect(html).not.toMatch(/badge err[^>]*>\s*Offline\s*</);
+
+    // JSON route still reports the raw heartbeat status untouched (offline).
+    const json = await callApp(app, "/preprod-explorer/api/validators");
+    const cc = (json.body as { currentCommittee: Array<Record<string, unknown>> })
+      .currentCommittee;
+    const gem = cc.find((c) => c.sidechain === GEMTEK)!;
+    expect(gem.status).toBe("offline");
+    expect(gem.producing).toBe(true);
+  });
+
   test("html escapes the gap formatting (defense-in-depth)", async () => {
     const slotByHeight = new Map<number, bigint>();
     for (let n = 1; n <= 60; n++) slotByHeight.set(n, BigInt(n));
