@@ -1,0 +1,24 @@
+# Woodpecker CI for Flux-Point-Studios/materios-gateway.
+# Translates the test job of the retired .github/workflows/build-and-push.yml 1:1
+# (GitHub Actions stopped scheduling runs org-wide 2026-05-30). Reports the commit
+# status ci/woodpecker/pr/woodpecker so branch protection can gate merges.
+#
+# NOT yet ported: the old `publish` job (docker build + push to GHCR). That needs a
+# write:packages token as a Woodpecker secret (tracked with #480); `npm run build`
+# here proves the TS compiles, so the image's `COPY dist/` will succeed.
+when:
+  - event: [push, pull_request]
+    branch: main
+
+steps:
+  - name: test
+    image: node:20-bookworm
+    commands:
+      - npm ci
+      # Install chromium into $HOME/.cache/ms-playwright so the browser E2E test RUNS
+      # rather than self-skipping (its detector checks that exact path). Matches the
+      # retired Actions step; @playwright/test is pinned 1.60.0.
+      - npx playwright install --with-deps chromium
+      - npm run typecheck
+      - npm test
+      - npm run build
