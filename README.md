@@ -1,5 +1,7 @@
 # Materios Gateway
 
+[![CI](https://ci.fluxpointstudios.com/api/badges/Flux-Point-Studios/materios-gateway/status.svg)](https://ci.fluxpointstudios.com/repos/Flux-Point-Studios/materios-gateway)
+
 Express.js service for the Materios partner-chain. Stores and serves blob data for the cert-daemon committee, tracks attestor/observer/fleet-operator registries, runs 402-style billing on paid endpoints, and surfaces explorer JSON APIs (`/preprod-explorer/api/validators`, `/preprod-explorer/api/spo-rewards`, `/trace/*`).
 
 ## Architecture
