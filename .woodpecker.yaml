@@ -1,11 +1,8 @@
 # Woodpecker CI for Flux-Point-Studios/materios-gateway.
-# Translates the test job of the retired .github/workflows/build-and-push.yml 1:1
-# (GitHub Actions stopped scheduling runs org-wide 2026-05-30). Reports the commit
-# status ci/woodpecker/pr/woodpecker so branch protection can gate merges.
-#
-# NOT yet ported: the old `publish` job (docker build + push to GHCR). That needs a
-# write:packages token as a Woodpecker secret (tracked with #480); `npm run build`
-# here proves the TS compiles, so the image's `COPY dist/` will succeed.
+# Translates the retired .github/workflows/build-and-push.yml (GitHub Actions
+# stopped scheduling runs org-wide 2026-05-30). `test` reports the commit status
+# ci/woodpecker/pr/woodpecker so branch protection can gate merges; `publish`
+# builds + pushes the GHCR image on main merges (the old `publish` job).
 when:
   - event: [push, pull_request]
     branch: main
@@ -21,4 +18,23 @@ steps:
       - npx playwright install --with-deps chromium
       - npm run typecheck
       - npm test
-      - npm run build
+      - npm run build   # emits dist/ into the shared workspace for the publish step's COPY
+
+  # Build + push the image on main merges only (never on PRs → no push from an
+  # untrusted PR context). Kaniko builds in userspace (no privileged/docker.sock),
+  # so it grants no more than the `test` step already has on this shared host.
+  - name: publish
+    image: woodpeckerci/plugin-kaniko
+    settings:
+      registry: ghcr.io
+      repo: ghcr.io/flux-point-studios/materios-gateway
+      dockerfile: Dockerfile
+      tags:
+        - latest
+        - ${CI_COMMIT_SHA}
+      username: realdecimalist
+      password:
+        from_secret: gchr_token
+    when:
+      - event: push
+        branch: main
