@@ -17,6 +17,7 @@ import { Router, type Request, type Response } from "express";
 import { signatureVerify } from "@polkadot/util-crypto";
 import { stringToU8a } from "@polkadot/util";
 import { lookupValidatorInfo, listAllAuraBindings } from "../quota.js";
+import { isActiveChainValidator } from "../chain-validators.js";
 import { resolveAuth } from "../auth.js";
 import {
   upsertHeartbeat,
@@ -120,6 +121,40 @@ heartbeatsRouter.post("/heartbeats", async (req: Request, res: Response) => {
       return;
     }
 
+    // Sanity caps — heartbeat fields are stored and served back to the
+    // explorer, so bound them before any auth/crypto work. Block numbers are
+    // u32 on chain; the counters/uptime ceilings are generous but finite.
+    const MAX_BLOCK = 0xffff_ffff;
+    const MAX_COUNTER = 1_000_000_000;
+    const capViolation = (v: unknown, max: number): boolean =>
+      v !== undefined && v !== null &&
+      (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0 || v > max);
+    for (const [field, v, max] of [
+      ["seq", seq, Number.MAX_SAFE_INTEGER],
+      ["best_block", best_block, MAX_BLOCK],
+      ["finalized_block", finalized_block, MAX_BLOCK],
+      ["finality_gap", finality_gap, MAX_BLOCK],
+      ["pending_receipts", pending_receipts, MAX_COUNTER],
+      ["certs_submitted", certs_submitted, MAX_COUNTER],
+      ["uptime_seconds", uptime_seconds, MAX_COUNTER],
+    ] as Array<[string, unknown, number]>) {
+      if (capViolation(v, max)) {
+        res.status(400).json({ error: `Invalid ${field}: must be an integer in [0, ${max}]` });
+        return;
+      }
+    }
+    if (validator_id.length > 64) {
+      res.status(400).json({ error: "Invalid validator_id: too long" });
+      return;
+    }
+    if (version !== undefined && version !== null) {
+      // eslint-disable-next-line no-control-regex
+      if (typeof version !== "string" || version.length > 64 || /[\x00-\x1f\x7f]/.test(version)) {
+        res.status(400).json({ error: "Invalid version: max 64 printable characters" });
+        return;
+      }
+    }
+
     const ip = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "";
 
     // --- AUTH: Bearer token → legacy x-api-key → sr25519 x-heartbeat-sig ---
@@ -174,14 +209,24 @@ heartbeatsRouter.post("/heartbeats", async (req: Request, res: Response) => {
       }
       authTier = auth.tier as typeof authTier;
     } else {
-      // Keyless path: validator must be in registry, sig is the real auth.
+      // Keyless path: the sig is the real auth. Enrollment is either a
+      // registry row (manual override) or on-chain committee membership —
+      // being one of the chain's aura authorities IS the registration, so
+      // seated validators never have to ask FPS to enable their feed.
       const info = lookupValidatorInfo(validator_id);
-      if (!info) {
-        logReject(validator_id, "unregistered validator (no API key, not in registry)", ip);
+      if (info) {
+        label = info.name;
+      } else if (await isActiveChainValidator(validator_id)) {
+        label = validator_id;
+      } else {
+        logReject(
+          validator_id,
+          "unregistered validator (no API key, not in registry, not an active authority)",
+          ip,
+        );
         res.status(403).json({ error: "Validator not registered" });
         return;
       }
-      label = info.name;
       authTier = "sig-only";
     }
 
