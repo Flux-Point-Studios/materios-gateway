@@ -22,6 +22,14 @@ vi.mock("../rpc-client.js", () => ({
   disconnectRpc: vi.fn(async () => {}),
 }));
 
+// chain-validators opens its own WS ApiPromise to read aura.authorities —
+// stub it so tests control chain membership without a live chain. Default
+// false = the SS58 is NOT an on-chain authority.
+vi.mock("../chain-validators.js", () => ({
+  isActiveChainValidator: vi.fn(async () => false),
+}));
+
+import { isActiveChainValidator } from "../chain-validators.js";
 import express from "express";
 import Database from "better-sqlite3";
 import { createHash } from "crypto";
@@ -512,5 +520,103 @@ describe("POST /heartbeats: unified auth (Bearer / x-api-key / x-heartbeat-sig)"
     });
     expect(res.status).toBe(403);
     expect((res.body as { error: string }).error).toMatch(/does not match/i);
+  });
+});
+
+// --------------------------------------------------------------------------
+// Chain-membership auto-enrollment + field sanity caps
+// --------------------------------------------------------------------------
+
+describe("POST /heartbeats: chain auto-enrollment + field caps", () => {
+  let ctx: HarnessCtx;
+  let nextSeq = 9_000_000;
+
+  beforeEach(async () => {
+    // No registry row — these tests exercise the chain-membership path.
+    ctx = await setupApp({ registerValidator: false });
+    vi.mocked(isActiveChainValidator).mockResolvedValue(false);
+    nextSeq += 1_000;
+  });
+
+  afterEach(() => {
+    config.storagePath = ctx.prevStoragePath;
+    rmSync(ctx.tmpStorage, { recursive: true, force: true });
+  });
+
+  test("test_heartbeat_accepts_active_chain_validator_without_registry", async () => {
+    vi.mocked(isActiveChainValidator).mockResolvedValue(true);
+    const seq = nextSeq++;
+    const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq);
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: { "x-heartbeat-sig": sig },
+      jsonBody: body,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: "ok", seq });
+    expect((res.body as { auth_tier?: string }).auth_tier).toBe("sig-only");
+    expect(vi.mocked(isActiveChainValidator)).toHaveBeenCalledWith(ctx.ss58);
+  });
+
+  test("test_heartbeat_rejects_when_neither_registry_nor_chain", async () => {
+    const seq = nextSeq++;
+    const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq);
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: { "x-heartbeat-sig": sig },
+      jsonBody: body,
+    });
+    expect(res.status).toBe(403);
+    expect((res.body as { error: string }).error).toMatch(/not registered/i);
+  });
+
+  test("test_heartbeat_rejects_oversized_version", async () => {
+    const seq = nextSeq++;
+    const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq, {
+      version: "v".repeat(65),
+    });
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: { "x-heartbeat-sig": sig },
+      jsonBody: body,
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/version/i);
+  });
+
+  test("test_heartbeat_rejects_control_chars_in_version", async () => {
+    const seq = nextSeq++;
+    const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq, {
+      version: "1.0.0\u0007evil",
+    });
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: { "x-heartbeat-sig": sig },
+      jsonBody: body,
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/version/i);
+  });
+
+  test("test_heartbeat_rejects_best_block_over_u32", async () => {
+    const seq = nextSeq++;
+    const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq, {
+      best_block: 2 ** 40,
+    });
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: { "x-heartbeat-sig": sig },
+      jsonBody: body,
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/best_block/i);
+  });
+
+  test("test_heartbeat_rejects_negative_uptime", async () => {
+    const seq = nextSeq++;
+    const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq, {
+      uptime_seconds: -1,
+    });
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: { "x-heartbeat-sig": sig },
+      jsonBody: body,
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/uptime_seconds/i);
   });
 });
