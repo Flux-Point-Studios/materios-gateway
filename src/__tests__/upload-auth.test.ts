@@ -42,6 +42,7 @@ import { Keyring } from "@polkadot/api";
 import { u8aToHex, stringToU8a } from "@polkadot/util";
 
 import { config } from "../config.js";
+import { checkFunded } from "../rpc-client.js"; // mocked above — overridable per test
 import { blobsRouter } from "../routes/blobs.js";
 import { setQuotaDbForTests, migrateUsageColumns, migrateBindingColumn } from "../quota.js";
 import {
@@ -260,6 +261,8 @@ describe("upload endpoints: unified auth (Bearer / x-api-key / sig)", () => {
 
   beforeEach(async () => {
     ctx = await setupApp();
+    // default: funded — individual tests override to false to probe the tier boundary
+    vi.mocked(checkFunded).mockResolvedValue(true);
   });
 
   afterEach(() => {
@@ -389,6 +392,67 @@ describe("upload endpoints: unified auth (Bearer / x-api-key / sig)", () => {
     });
     expect(res.status).toBe(401);
     expect(res.body).toHaveProperty("error");
+  });
+
+  // ------------------------------------------------------------------------
+  // 5b. A heartbeat-only registry row must NOT confer the upload tier.
+  //     Node-only validators (lite-heartbeat) get an `enabled` api_keys row so
+  //     the keyless heartbeat endpoint accepts them, but that row has a
+  //     `heartbeat-only:<ss58>` key_hash and zero quotas and must not let the
+  //     aura key upload blobs for free — an unfunded heartbeat-only signer is
+  //     rejected, not promoted to registered-validator.
+  // ------------------------------------------------------------------------
+  test("heartbeat_only_row_does_not_grant_upload_tier_when_unfunded", async () => {
+    await cryptoWaitReady();
+    const pair = new Keyring({ type: "sr25519" }).addFromUri("//HeartbeatOnlyValidator");
+    const addr = pair.address;
+    ctx.quotaDb
+      .prepare(
+        `INSERT INTO api_keys
+         (key_hash, name, enabled, max_receipts_per_day, max_bytes_per_day, max_concurrent_uploads, validator_id)
+         VALUES (?, 'heartbeat-only-test', 1, 0, 0, 0, ?)`,
+      )
+      .run(`heartbeat-only:${addr}`, addr);
+    vi.mocked(checkFunded).mockResolvedValue(false); // this validator has no funded account
+
+    const { manifest, contentHash } = buildSingleChunkManifest(Buffer.from("hb-only-upload-attempt"));
+    const ts = Math.floor(Date.now() / 1000);
+    const sig = u8aToHex(pair.sign(stringToU8a(`materios-upload-v1|${contentHash}|${addr}|${ts}`)));
+    const res = await fetchJson(ctx.app, "POST", `/blobs/${contentHash}/manifest`, {
+      headers: { "x-upload-sig": sig, "x-uploader-address": addr, "x-upload-ts": String(ts) },
+      jsonBody: manifest,
+    });
+    // rejected (authenticated signer, but no funded account) — NOT promoted to
+    // the registered-validator tier that would have let it upload for free.
+    expect(res.status).toBe(403);
+    expect(res.body).toHaveProperty("error");
+  });
+
+  // ------------------------------------------------------------------------
+  // 5c. A real registered validator (proper key_hash) still gets the upload
+  //     tier even when unfunded — regression guard that 5b didn't break them.
+  // ------------------------------------------------------------------------
+  test("real_registered_validator_keeps_upload_tier_when_unfunded", async () => {
+    await cryptoWaitReady();
+    const pair = new Keyring({ type: "sr25519" }).addFromUri("//RealRegisteredValidator");
+    const addr = pair.address;
+    ctx.quotaDb
+      .prepare(
+        `INSERT INTO api_keys
+         (key_hash, name, enabled, max_receipts_per_day, max_bytes_per_day, max_concurrent_uploads, validator_id)
+         VALUES (?, 'real-validator-test', 1, 100, 1073741824, 5, ?)`,
+      )
+      .run(createHash("sha256").update(randomBytes(32)).digest("hex"), addr);
+    vi.mocked(checkFunded).mockResolvedValue(false);
+
+    const { manifest, contentHash } = buildSingleChunkManifest(Buffer.from("real-validator-upload"));
+    const ts = Math.floor(Date.now() / 1000);
+    const sig = u8aToHex(pair.sign(stringToU8a(`materios-upload-v1|${contentHash}|${addr}|${ts}`)));
+    const res = await fetchJson(ctx.app, "POST", `/blobs/${contentHash}/manifest`, {
+      headers: { "x-upload-sig": sig, "x-uploader-address": addr, "x-upload-ts": String(ts) },
+      jsonBody: manifest,
+    });
+    expect(res.status).toBe(201);
   });
 
   // ------------------------------------------------------------------------
