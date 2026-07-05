@@ -396,6 +396,21 @@ export function lookupValidatorInfo(validatorId: string): { name: string } | nul
 }
 
 /**
+ * Upload-eligibility variant of lookupValidatorInfo. A heartbeat-only registry
+ * row (key_hash `heartbeat-only:<ss58>`, created for node-only validators that
+ * report liveness but never upload) IS registered for the heartbeat feed, but
+ * must NOT confer the `registered-validator` upload tier — it has no funded
+ * account and zero quotas. Excluding it here makes the upload-sig path fall
+ * through to the funded-account check instead of granting free uploads.
+ */
+export function lookupUploadEligibleValidator(validatorId: string): { name: string } | null {
+  const row = db.prepare(
+    "SELECT name FROM api_keys WHERE validator_id = ? AND enabled = 1 AND key_hash NOT LIKE 'heartbeat-only:%' LIMIT 1",
+  ).get(validatorId) as { name: string } | undefined;
+  return row ?? null;
+}
+
+/**
  * Resolve full KeyInfo by SS58 validator_id. Used by the Bearer-token path in
  * resolveAuth() — a bearer token identifies the account, and we need to find
  * the operator's registered api_keys row so upload quotas apply to the same

@@ -9,7 +9,7 @@
  */
 
 import type { Request } from "express";
-import { resolveKey, resolveKeyByAccount, lookupValidatorInfo, type KeyInfo } from "./quota.js";
+import { resolveKey, resolveKeyByAccount, lookupUploadEligibleValidator, type KeyInfo } from "./quota.js";
 import { verifyUploadSig } from "./upload-auth.js";
 import { checkFunded } from "./rpc-client.js";
 import {
@@ -106,8 +106,8 @@ export async function resolveAuth(req: Request, contentHash?: string): Promise<A
   if (contentHash) {
     const sigResult = verifyUploadSig(req, contentHash);
     if (sigResult.valid && sigResult.address) {
-      // Is this a registered validator? → highest quota tier
-      const info = lookupValidatorInfo(sigResult.address);
+      // Is this a registered validator (excluding heartbeat-only rows)? → highest quota tier
+      const info = lookupUploadEligibleValidator(sigResult.address);
       if (info) {
         return { authenticated: true, tier: "registered-validator", identity: sigResult.address };
       }
