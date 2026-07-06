@@ -111,6 +111,15 @@ function cleanupLogStmt(): Database.Statement {
 export function initHeartbeatDb(): void {
   const dbPath = join(config.storagePath, "heartbeat.db");
   db = new Database(dbPath);
+  // Prepared statements bind to a specific db handle — drop them so a
+  // re-init doesn't keep reading/writing the previous database.
+  _upsertStmt = null;
+  _getLastSeqStmt = null;
+  _getAllLatestStmt = null;
+  _logRejectStmt = null;
+  _pruneRejectLogStmt = null;
+  _appendLogStmt = null;
+  _cleanupLogStmt = null;
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 5000");
 
