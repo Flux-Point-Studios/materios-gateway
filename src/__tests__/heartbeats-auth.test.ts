@@ -619,4 +619,56 @@ describe("POST /heartbeats: chain auto-enrollment + field caps", () => {
     expect(res.status).toBe(400);
     expect((res.body as { error: string }).error).toMatch(/uptime_seconds/i);
   });
+
+  // ------------------------------------------------------------------------
+  // Self-labeling: a chain-enrolled validator (no registry row) can carry an
+  // optional display label in the body — that's what the explorer shows
+  // instead of the raw SS58. Registry names stay the curated override.
+  // ------------------------------------------------------------------------
+  test("test_chain_enrolled_body_label_becomes_display_label", async () => {
+    vi.mocked(isActiveChainValidator).mockResolvedValue(true);
+    const seq = nextSeq++;
+    const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq);
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: { "x-heartbeat-sig": sig },
+      jsonBody: { ...body, label: "ONLY" },
+    });
+    expect(res.status).toBe(200);
+    const status = await fetchJson(ctx.app, "GET", "/heartbeats/status");
+    const row = (status.body as { validators: Record<string, { label: string }> }).validators[
+      ctx.ss58
+    ];
+    expect(row.label).toBe("ONLY");
+  });
+
+  test("test_body_label_rejected_when_invalid", async () => {
+    vi.mocked(isActiveChainValidator).mockResolvedValue(true);
+    const seq = nextSeq++;
+    const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq);
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: { "x-heartbeat-sig": sig },
+      jsonBody: { ...body, label: "x".repeat(33) },
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/label/i);
+  });
+
+  test("test_registry_name_wins_over_body_label", async () => {
+    // Re-setup WITH a registry row — its curated name must beat the body label.
+    config.storagePath = ctx.prevStoragePath;
+    rmSync(ctx.tmpStorage, { recursive: true, force: true });
+    ctx = await setupApp({ registerValidator: true });
+    const seq = nextSeq++;
+    const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq);
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: { "x-heartbeat-sig": sig },
+      jsonBody: { ...body, label: "Impostor" },
+    });
+    expect(res.status).toBe(200);
+    const status = await fetchJson(ctx.app, "GET", "/heartbeats/status");
+    const row = (status.body as { validators: Record<string, { label: string }> }).validators[
+      ctx.ss58
+    ];
+    expect(row.label).toBe("operator-heartbeat-test");
+  });
 });

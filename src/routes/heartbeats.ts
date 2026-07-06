@@ -154,6 +154,19 @@ heartbeatsRouter.post("/heartbeats", async (req: Request, res: Response) => {
         return;
       }
     }
+    // Optional self-chosen display label (chain-enrolled validators have no
+    // registry row to carry a name). Outside the v1 signing string, so it is
+    // validated like version and only ever labels the signer's own row.
+    const rawLabel = (req.body as { label?: unknown }).label;
+    let bodyLabel: string | undefined;
+    if (rawLabel !== undefined && rawLabel !== null) {
+      // eslint-disable-next-line no-control-regex
+      if (typeof rawLabel !== "string" || rawLabel.length === 0 || rawLabel.length > 32 || /[\x00-\x1f\x7f]/.test(rawLabel)) {
+        res.status(400).json({ error: "Invalid label: 1-32 printable characters" });
+        return;
+      }
+      bodyLabel = rawLabel;
+    }
 
     const ip = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "";
 
@@ -217,7 +230,7 @@ heartbeatsRouter.post("/heartbeats", async (req: Request, res: Response) => {
       if (info) {
         label = info.name;
       } else if (await isActiveChainValidator(validator_id)) {
-        label = validator_id;
+        label = bodyLabel ?? validator_id;
       } else {
         logReject(
           validator_id,
