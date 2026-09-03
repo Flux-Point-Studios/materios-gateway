@@ -20,6 +20,7 @@ import Database from "better-sqlite3";
 import { join } from "path";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { config } from "../config.js";
+import { isAnonymous, type OperatorIdentity } from "../operator_identity.js";
 
 export const operatorsRouter = Router();
 
@@ -82,15 +83,85 @@ export function initOperatorsDb(): void {
     );
   `);
 
-  // Migrate existing databases that lack the new columns
-  const cols = db.prepare("PRAGMA table_info(registrations)").all() as Array<{ name: string }>;
-  const colNames = new Set(cols.map((c) => c.name));
-  if (!colNames.has("session_keys")) {
-    db.exec("ALTER TABLE registrations ADD COLUMN session_keys TEXT");
+  migrateRegistrationsSchema(db);
+}
+
+/**
+ * Additive, idempotent migration of `registrations`.
+ *
+ * Every column is nullable: SQLite's ALTER TABLE ADD COLUMN cannot add a
+ * NOT NULL column without a default, and live preprod carries 132 faucet
+ * auto-registrations that must survive untouched with NULL in anything new.
+ * Presence is checked via PRAGMA rather than by catching a duplicate-column
+ * error, so a genuine failure still surfaces.
+ *
+ * Takes the handle explicitly so the migration is exercisable against an
+ * in-memory database holding the pre-migration schema.
+ */
+export function migrateRegistrationsSchema(database: Database.Database): void {
+  const cols = database.prepare("PRAGMA table_info(registrations)").all() as Array<{
+    name: string;
+  }>;
+  const present = new Set(cols.map((c) => c.name));
+
+  const additive: Array<[string, string]> = [
+    ["session_keys", "TEXT"],
+    ["peer_id", "TEXT"],
+    // Optional self-declared identity, supplied on the faucet drip. Separate
+    // from `label` (which stays 'faucet-attestor') so no existing consumer of
+    // that column changes behaviour.
+    ["operator_label", "TEXT DEFAULT NULL"],
+    ["contact", "TEXT DEFAULT NULL"],
+    ["cardano_pool_id", "TEXT DEFAULT NULL"],
+  ];
+
+  for (const [name, type] of additive) {
+    if (present.has(name)) continue;
+    database.exec(`ALTER TABLE registrations ADD COLUMN ${name} ${type}`);
   }
-  if (!colNames.has("peer_id")) {
-    db.exec("ALTER TABLE registrations ADD COLUMN peer_id TEXT");
-  }
+}
+
+/**
+ * Record (or refresh) the registration row a faucet drip creates.
+ *
+ * `label` is always 'faucet-attestor' — a self-chosen name lands in
+ * `operator_label` instead, so the funnel query that counts faucet
+ * registrations and every reader of `label` are unaffected.
+ *
+ * Identity is merged with COALESCE(?, column): a supplied value wins, an
+ * omitted one leaves whatever is stored alone. A repeat drip therefore can
+ * never blank an identity the operator declared earlier, and an operator who
+ * first dripped anonymously can still declare one later.
+ */
+export function recordFaucetRegistration(
+  database: Database.Database,
+  args: { ss58Address: string; apiKeyHash: string; identity: OperatorIdentity },
+): void {
+  const { ss58Address, apiKeyHash, identity } = args;
+
+  // invite_token_hash, label and api_key_hash are all NOT NULL; a faucet
+  // registration has no invite, so the token hash is stored as an empty string.
+  database
+    .prepare(
+      `INSERT OR IGNORE INTO registrations
+         (ss58_address, public_key, label, api_key_hash, invite_token_hash, registered_at, approved_at, status)
+       VALUES (?, '', 'faucet-attestor', ?, '', datetime('now'), datetime('now'), 'approved')`,
+    )
+    .run(ss58Address, apiKeyHash);
+
+  // The anonymous drip stops here, leaving exactly the row the pre-identity
+  // faucet wrote.
+  if (isAnonymous(identity)) return;
+
+  database
+    .prepare(
+      `UPDATE registrations
+          SET operator_label  = COALESCE(?, operator_label),
+              contact         = COALESCE(?, contact),
+              cardano_pool_id = COALESCE(?, cardano_pool_id)
+        WHERE ss58_address = ?`,
+    )
+    .run(identity.operatorLabel, identity.contact, identity.cardanoPoolId, ss58Address);
 }
 
 function hashToken(plaintext: string): string {
@@ -238,8 +309,8 @@ operatorsRouter.get("/operators/status/:ss58", (req: Request, res: Response) => 
   try {
     const { ss58 } = req.params;
     const reg = db.prepare(
-      "SELECT ss58_address, label, registered_at, approved_at, status, session_keys, peer_id FROM registrations WHERE ss58_address = ?",
-    ).get(ss58) as { ss58_address: string; label: string; registered_at: string; approved_at: string | null; status: string; session_keys: string | null; peer_id: string | null } | undefined;
+      "SELECT ss58_address, label, registered_at, approved_at, status, session_keys, peer_id, operator_label, cardano_pool_id, contact FROM registrations WHERE ss58_address = ?",
+    ).get(ss58) as { ss58_address: string; label: string; registered_at: string; approved_at: string | null; status: string; session_keys: string | null; peer_id: string | null; operator_label: string | null; cardano_pool_id: string | null; contact: string | null } | undefined;
 
     if (!reg) {
       res.status(404).json({ error: "Address not registered" });
@@ -254,6 +325,13 @@ operatorsRouter.get("/operators/status/:ss58", (req: Request, res: Response) => 
       status: reg.status,
       has_session_keys: !!reg.session_keys,
       peer_id: reg.peer_id,
+      // Self-declared, non-PII: the operator chose to publish these.
+      operator_label: reg.operator_label,
+      cardano_pool_id: reg.cardano_pool_id,
+      // This endpoint is UNAUTHENTICATED, so the contact handle is reported as
+      // a boolean only — same treatment as has_session_keys above. The value
+      // is admin-gated on GET /operators/:ss58/session-keys.
+      has_contact: !!reg.contact,
     });
   } catch (error) {
     console.error("[blob-gateway] Operator status error:", error);
@@ -333,8 +411,8 @@ operatorsRouter.get("/operators/:ss58/session-keys", (req: Request, res: Respons
 
     const { ss58 } = req.params;
     const reg = db.prepare(
-      "SELECT ss58_address, label, session_keys, peer_id, status FROM registrations WHERE ss58_address = ?",
-    ).get(ss58) as { ss58_address: string; label: string; session_keys: string | null; peer_id: string | null; status: string } | undefined;
+      "SELECT ss58_address, label, session_keys, peer_id, status, operator_label, contact, cardano_pool_id FROM registrations WHERE ss58_address = ?",
+    ).get(ss58) as { ss58_address: string; label: string; session_keys: string | null; peer_id: string | null; status: string; operator_label: string | null; contact: string | null; cardano_pool_id: string | null } | undefined;
 
     if (!reg) {
       res.status(404).json({ error: "Address not registered" });
@@ -347,6 +425,11 @@ operatorsRouter.get("/operators/:ss58/session-keys", (req: Request, res: Respons
       session_keys: reg.session_keys,
       peer_id: reg.peer_id,
       status: reg.status,
+      // Behind the admin token, so the contact handle is safe to return here.
+      // This is the path ops uses to actually reach a self-declared operator.
+      operator_label: reg.operator_label,
+      contact: reg.contact,
+      cardano_pool_id: reg.cardano_pool_id,
     });
   } catch (error) {
     console.error("[blob-gateway] Get session keys error:", error);
