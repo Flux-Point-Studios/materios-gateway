@@ -21,6 +21,7 @@ import { faucetRouter } from "../faucet.js";
 // A structurally valid SS58 (prefix 42) that decodeAddress accepts.
 const VALID_SS58 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
 const REAL_POOL_ID = "pool15ff3v8y3m3c0rj3dksaqjy4qaj6j89s97qdnayugcjp6cp5z6ug";
+const REAL_POOL_ID_HEX = "0f292fcaa02b8b2f9b3c8f9fd8e0bb21abedb692a6d5058df3ef2735";
 
 let app: express.Express;
 let prevRpcUrl: string;
@@ -93,6 +94,10 @@ describe("POST /faucet/drip — optional identity fields are accepted", () => {
     ["operator_label", { operator_label: "OnlyBlocks" }],
     ["contact", { contact: "ops@example.org" }],
     ["cardano_pool_id", { cardano_pool_id: REAL_POOL_ID }],
+    // The two forms an SPO is most likely to paste. Rejecting these 400s the
+    // whole drip for exactly the operator we are trying to recruit.
+    ["uppercase bech32 pool id", { cardano_pool_id: REAL_POOL_ID.toUpperCase() }],
+    ["hex pool id", { cardano_pool_id: REAL_POOL_ID_HEX }],
     [
       "all three",
       {
@@ -126,7 +131,8 @@ describe("POST /faucet/drip — invalid identity is a 400, never a silent trunca
     ["HTML in contact", { contact: "<img src=x onerror=alert(1)>" }, /contact/],
     ["control char in contact", { contact: "ops\u0000evil" }, /contact/],
     ["short pool id", { cardano_pool_id: "pool1abc" }, /cardano_pool_id/],
-    ["uppercase pool id", { cardano_pool_id: REAL_POOL_ID.toUpperCase() }, /cardano_pool_id/],
+    ["mixed-case pool id", { cardano_pool_id: `POOL1${REAL_POOL_ID.slice(5)}` }, /cardano_pool_id/],
+    ["truncated hex pool id", { cardano_pool_id: REAL_POOL_ID_HEX.slice(0, 55) }, /cardano_pool_id/],
     ["pool id with markup", { cardano_pool_id: `${REAL_POOL_ID}<b>` }, /cardano_pool_id/],
   ])("rejects %s with 400", async (_name, extra, pattern) => {
     const res = await drip({ address: VALID_SS58, ...extra });
@@ -149,6 +155,64 @@ describe("POST /faucet/drip — invalid identity is a 400, never a silent trunca
     const res = await drip({ address: VALID_SS58, operator_label: payload });
     expect(res.status).toBe(400);
     expect(JSON.stringify(res.body)).not.toContain("script");
+  });
+});
+
+/**
+ * The polkadot-js decode error embeds the offending input verbatim — newlines
+ * and all. Interpolating it put unvalidated caller input into a log line (log
+ * forging) and into an HTTP response (a reflection sink). The rejection says
+ * only that the address was invalid.
+ */
+describe("POST /faucet/drip — a rejected address is never echoed back or logged", () => {
+  const PAYLOAD = '<script>alert(1)</script>"\nfake-log-line: injected';
+
+  async function dripCapturingLogs(body: unknown): Promise<{
+    res: { status: number; body: any };
+    logs: string;
+  }> {
+    const captured: string[] = [];
+    const sinks = ["log", "warn", "error", "info", "debug"] as const;
+    const originals = sinks.map((s) => console[s]);
+    for (const s of sinks) {
+      console[s] = (...args: unknown[]) => {
+        captured.push(args.map((a) => String(a)).join(" "));
+      };
+    }
+    try {
+      return { res: await drip(body), logs: captured.join("\n") };
+    } finally {
+      sinks.forEach((s, i) => {
+        console[s] = originals[i] as typeof console.log;
+      });
+    }
+  }
+
+  it("does not reflect the rejected address into the response", async () => {
+    const { res } = await dripCapturingLogs({ address: PAYLOAD });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid SS58 address");
+    expect(JSON.stringify(res.body)).not.toContain("script");
+    expect(JSON.stringify(res.body)).not.toContain("fake-log-line");
+  });
+
+  it("does not write the rejected address to any log sink", async () => {
+    const { logs } = await dripCapturingLogs({ address: PAYLOAD });
+    expect(logs).not.toContain("script");
+    expect(logs).not.toContain("fake-log-line");
+    expect(logs).not.toContain("alert(1)");
+  });
+
+  it("emits no raw newline that could forge a second log line", async () => {
+    const { logs } = await dripCapturingLogs({
+      address: "5Grw\nfake-log-line: injected",
+    });
+    expect(logs).not.toContain("fake-log-line");
+  });
+
+  it("logs the canonical address once it has been validated", async () => {
+    const { logs } = await dripCapturingLogs({ address: VALID_SS58 });
+    expect(logs).toContain(VALID_SS58);
   });
 });
 

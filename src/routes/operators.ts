@@ -20,7 +20,7 @@ import Database from "better-sqlite3";
 import { join } from "path";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { config } from "../config.js";
-import { isAnonymous, type OperatorIdentity } from "../operator_identity.js";
+import type { OperatorIdentity } from "../operator_identity.js";
 
 export const operatorsRouter = Router();
 
@@ -68,22 +68,41 @@ export function initOperatorsDb(): void {
       max_bytes_per_day INTEGER NOT NULL DEFAULT 5368709120,
       max_concurrent_uploads INTEGER NOT NULL DEFAULT 5
     );
-
-    CREATE TABLE IF NOT EXISTS registrations (
-      ss58_address TEXT PRIMARY KEY,
-      public_key TEXT,
-      label TEXT NOT NULL,
-      api_key_hash TEXT NOT NULL,
-      invite_token_hash TEXT NOT NULL,
-      registered_at TEXT NOT NULL,
-      approved_at TEXT,
-      status TEXT NOT NULL DEFAULT 'registered',
-      session_keys TEXT,
-      peer_id TEXT
-    );
   `);
 
   migrateRegistrationsSchema(db);
+}
+
+const REGISTRATIONS_DDL = `
+  CREATE TABLE IF NOT EXISTS registrations (
+    ss58_address TEXT PRIMARY KEY,
+    public_key TEXT,
+    label TEXT NOT NULL,
+    api_key_hash TEXT NOT NULL,
+    invite_token_hash TEXT NOT NULL,
+    registered_at TEXT NOT NULL,
+    approved_at TEXT,
+    status TEXT NOT NULL DEFAULT 'registered',
+    session_keys TEXT,
+    peer_id TEXT
+  );
+`;
+
+const ADDITIVE_COLUMNS: Array<[string, string]> = [
+  ["session_keys", "TEXT"],
+  ["peer_id", "TEXT"],
+  // Optional self-declared identity, supplied on the faucet drip. Separate
+  // from `label` (which stays 'faucet-attestor') so no existing consumer of
+  // that column changes behaviour. `cardano_pool_id` holds either a lowercase
+  // bech32 pool id or a 56-character lowercase hex pool hash — see
+  // normalizeCardanoPoolId for the canonical forms.
+  ["operator_label", "TEXT DEFAULT NULL"],
+  ["contact", "TEXT DEFAULT NULL"],
+  ["cardano_pool_id", "TEXT DEFAULT NULL"],
+];
+
+function isDuplicateColumn(err: unknown): boolean {
+  return err instanceof Error && /duplicate column name/i.test(err.message);
 }
 
 /**
@@ -92,46 +111,56 @@ export function initOperatorsDb(): void {
  * Every column is nullable: SQLite's ALTER TABLE ADD COLUMN cannot add a
  * NOT NULL column without a default, and live preprod carries 132 faucet
  * auto-registrations that must survive untouched with NULL in anything new.
- * Presence is checked via PRAGMA rather than by catching a duplicate-column
- * error, so a genuine failure still surfaces.
+ *
+ * Two gateway processes can start at once, so the whole migration runs inside
+ * BEGIN IMMEDIATE — they serialise on the write lock instead of interleaving a
+ * PRAGMA read with the other's ALTER. A duplicate-column error is still
+ * tolerated per column, because a process that read the column list before the
+ * other committed will ask for an ALTER that is already applied. Every other
+ * SQLite error propagates.
  *
  * Takes the handle explicitly so the migration is exercisable against an
  * in-memory database holding the pre-migration schema.
  */
 export function migrateRegistrationsSchema(database: Database.Database): void {
-  const cols = database.prepare("PRAGMA table_info(registrations)").all() as Array<{
-    name: string;
-  }>;
-  const present = new Set(cols.map((c) => c.name));
+  const migrate = database.transaction(() => {
+    // Ordered first: on a database with no `registrations`, PRAGMA returns
+    // zero rows, which reads as "every column is missing" and would send the
+    // loop at a table that does not exist.
+    database.exec(REGISTRATIONS_DDL);
 
-  const additive: Array<[string, string]> = [
-    ["session_keys", "TEXT"],
-    ["peer_id", "TEXT"],
-    // Optional self-declared identity, supplied on the faucet drip. Separate
-    // from `label` (which stays 'faucet-attestor') so no existing consumer of
-    // that column changes behaviour.
-    ["operator_label", "TEXT DEFAULT NULL"],
-    ["contact", "TEXT DEFAULT NULL"],
-    ["cardano_pool_id", "TEXT DEFAULT NULL"],
-  ];
+    const cols = database.prepare("PRAGMA table_info(registrations)").all() as Array<{
+      name: string;
+    }>;
+    const present = new Set(cols.map((c) => c.name));
 
-  for (const [name, type] of additive) {
-    if (present.has(name)) continue;
-    database.exec(`ALTER TABLE registrations ADD COLUMN ${name} ${type}`);
-  }
+    for (const [name, type] of ADDITIVE_COLUMNS) {
+      if (present.has(name)) continue;
+      try {
+        database.exec(`ALTER TABLE registrations ADD COLUMN ${name} ${type}`);
+      } catch (err) {
+        if (!isDuplicateColumn(err)) throw err;
+      }
+    }
+  });
+
+  migrate.immediate();
 }
 
 /**
- * Record (or refresh) the registration row a faucet drip creates.
+ * Record the registration row a faucet drip creates.
  *
  * `label` is always 'faucet-attestor' — a self-chosen name lands in
  * `operator_label` instead, so the funnel query that counts faucet
  * registrations and every reader of `label` are unaffected.
  *
- * Identity is merged with COALESCE(?, column): a supplied value wins, an
- * omitted one leaves whatever is stored alone. A repeat drip therefore can
- * never blank an identity the operator declared earlier, and an operator who
- * first dripped anonymously can still declare one later.
+ * IDENTITY IS WRITTEN ON INSERT ONLY. There is deliberately no UPDATE path:
+ * POST /faucet/drip is unauthenticated and proves nothing about who controls
+ * the address it funds, so any write against an existing row would let a
+ * caller stamp chosen identity onto someone else's registration. INSERT OR
+ * IGNORE means an address that already has a row keeps every field it has,
+ * and the drip's identity is discarded. The consequence is accepted: an
+ * operator who first dripped anonymously stays anonymous.
  */
 export function recordFaucetRegistration(
   database: Database.Database,
@@ -144,24 +173,19 @@ export function recordFaucetRegistration(
   database
     .prepare(
       `INSERT OR IGNORE INTO registrations
-         (ss58_address, public_key, label, api_key_hash, invite_token_hash, registered_at, approved_at, status)
-       VALUES (?, '', 'faucet-attestor', ?, '', datetime('now'), datetime('now'), 'approved')`,
+         (ss58_address, public_key, label, api_key_hash, invite_token_hash,
+          registered_at, approved_at, status,
+          operator_label, contact, cardano_pool_id)
+       VALUES (?, '', 'faucet-attestor', ?, '', datetime('now'), datetime('now'), 'approved',
+               ?, ?, ?)`,
     )
-    .run(ss58Address, apiKeyHash);
-
-  // The anonymous drip stops here, leaving exactly the row the pre-identity
-  // faucet wrote.
-  if (isAnonymous(identity)) return;
-
-  database
-    .prepare(
-      `UPDATE registrations
-          SET operator_label  = COALESCE(?, operator_label),
-              contact         = COALESCE(?, contact),
-              cardano_pool_id = COALESCE(?, cardano_pool_id)
-        WHERE ss58_address = ?`,
-    )
-    .run(identity.operatorLabel, identity.contact, identity.cardanoPoolId, ss58Address);
+    .run(
+      ss58Address,
+      apiKeyHash,
+      identity.operatorLabel,
+      identity.contact,
+      identity.cardanoPoolId,
+    );
 }
 
 function hashToken(plaintext: string): string {

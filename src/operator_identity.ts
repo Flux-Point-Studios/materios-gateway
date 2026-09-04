@@ -34,7 +34,36 @@ export const CONTACT_MAX = 128;
  * does with it — `src/routes/explorer-operator.ts` already renders a
  * `cardano_pool_id` field into HTML from static data.
  */
-export const CARDANO_POOL_ID_RE = /^pool1[02-9ac-hj-np-z]{51}$/;
+export const CARDANO_POOL_ID_BECH32_RE = /^pool1[02-9ac-hj-np-z]{51}$/;
+
+/**
+ * The other form an SPO has to hand: the raw 28-byte pool hash as 56 hex
+ * characters, which is what `cardano-cli stake-pool id --output-format hex`
+ * prints. Also markup-incapable. It cannot be confused with the bech32 form —
+ * `pool1` contains three non-hex characters.
+ */
+export const CARDANO_POOL_ID_HEX_RE = /^[0-9a-fA-F]{56}$/;
+
+/**
+ * Canonical stored form of `registrations.cardano_pool_id`:
+ *
+ *   - a bech32 id is stored lowercase, exactly as bech32 defines it;
+ *   - a hex pool hash is stored as 56 lowercase hex characters.
+ *
+ * Both are stored verbatim rather than converted into a single encoding: a
+ * bech32 encoder here would be hand-rolled checksum arithmetic, and the two
+ * forms are distinguishable by shape alone. Readers must handle both.
+ *
+ * Returns null when the value is neither form.
+ */
+export function normalizeCardanoPoolId(raw: string): string | null {
+  if (CARDANO_POOL_ID_HEX_RE.test(raw)) return raw.toLowerCase();
+  // BIP-173: bech32 is all-lowercase or all-uppercase, never mixed. An
+  // all-uppercase id (what several pool explorers display) folds down; a
+  // mixed-case one is malformed and falls through to the reject.
+  const folded = raw === raw.toUpperCase() ? raw.toLowerCase() : raw;
+  return CARDANO_POOL_ID_BECH32_RE.test(folded) ? folded : null;
+}
 
 /** DEL and the C1 block; LABEL_FORBIDDEN already covers C0 (U+0000–U+001F). */
 const HIGH_CONTROL = /[\u007f-\u009f]/;
@@ -91,15 +120,20 @@ export function parseOperatorIdentity(body: unknown): IdentityParseResult {
   const contact = textField(src.contact, "contact", CONTACT_MAX);
   if ("error" in contact) return { ok: false, error: contact.error };
 
-  // Bounded by the pool-id length itself; the regex below is the real gate.
+  // Bounded by the pool-id length itself; normalizeCardanoPoolId is the real gate.
   const pool = textField(src.cardano_pool_id, "cardano_pool_id", 64);
   if ("error" in pool) return { ok: false, error: pool.error };
-  if (pool.value !== null && !CARDANO_POOL_ID_RE.test(pool.value)) {
-    return {
-      ok: false,
-      error:
-        "cardano_pool_id must be a bech32 Cardano pool id: lowercase 'pool1' followed by 51 bech32 characters",
-    };
+
+  let cardanoPoolId: string | null = null;
+  if (pool.value !== null) {
+    cardanoPoolId = normalizeCardanoPoolId(pool.value);
+    if (cardanoPoolId === null) {
+      return {
+        ok: false,
+        error:
+          "cardano_pool_id must be a Cardano pool id: bech32 'pool1' + 51 characters, or the 56-character hex pool hash",
+      };
+    }
   }
 
   return {
@@ -107,7 +141,7 @@ export function parseOperatorIdentity(body: unknown): IdentityParseResult {
     identity: {
       operatorLabel: label.value,
       contact: contact.value,
-      cardanoPoolId: pool.value,
+      cardanoPoolId,
     },
   };
 }

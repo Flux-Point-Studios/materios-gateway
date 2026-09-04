@@ -10,13 +10,17 @@
 import { describe, it, expect } from "vitest";
 import {
   parseOperatorIdentity,
-  CARDANO_POOL_ID_RE,
+  CARDANO_POOL_ID_BECH32_RE,
+  CARDANO_POOL_ID_HEX_RE,
   OPERATOR_LABEL_MAX,
   CONTACT_MAX,
 } from "../operator_identity.js";
 
 // Live Hetzner block-producer pool (task #369). Real bech32: `pool1` + 51 chars.
 const REAL_POOL_ID = "pool15ff3v8y3m3c0rj3dksaqjy4qaj6j89s97qdnayugcjp6cp5z6ug";
+// The same pool as the 28-byte Blake2b hash `cardano-cli stake-pool id --output-format hex`
+// prints — the other form an SPO has sitting in their terminal.
+const REAL_POOL_ID_HEX = "0f292fcaa02b8b2f9b3c8f9fd8e0bb21abedb692a6d5058df3ef2735";
 
 function expectOk(body: unknown) {
   const r = parseOperatorIdentity(body);
@@ -178,40 +182,95 @@ describe("parseOperatorIdentity — injection and control characters", () => {
   });
 });
 
-describe("CARDANO_POOL_ID_RE — exact bech32 shape", () => {
+describe("CARDANO_POOL_ID_BECH32_RE — exact bech32 shape", () => {
   it("matches a real 56-char pool id", () => {
     expect(REAL_POOL_ID).toHaveLength(56);
     expect(REAL_POOL_ID.slice(5)).toHaveLength(51);
-    expect(CARDANO_POOL_ID_RE.test(REAL_POOL_ID)).toBe(true);
+    expect(CARDANO_POOL_ID_BECH32_RE.test(REAL_POOL_ID)).toBe(true);
   });
 
   it("is anchored at both ends so nothing can be appended or prepended", () => {
-    expect(CARDANO_POOL_ID_RE.test(`x${REAL_POOL_ID}`)).toBe(false);
-    expect(CARDANO_POOL_ID_RE.test(`${REAL_POOL_ID}x`)).toBe(false);
-    expect(CARDANO_POOL_ID_RE.test(`${REAL_POOL_ID}<script>`)).toBe(false);
+    expect(CARDANO_POOL_ID_BECH32_RE.test(`x${REAL_POOL_ID}`)).toBe(false);
+    expect(CARDANO_POOL_ID_BECH32_RE.test(`${REAL_POOL_ID}x`)).toBe(false);
+    expect(CARDANO_POOL_ID_BECH32_RE.test(`${REAL_POOL_ID}<script>`)).toBe(false);
   });
 
   it("rejects the wrong data-part length", () => {
     const body = REAL_POOL_ID.slice(5);
-    expect(CARDANO_POOL_ID_RE.test(`pool1${body.slice(0, 50)}`)).toBe(false);
-    expect(CARDANO_POOL_ID_RE.test(`pool1${body}z`)).toBe(false);
+    expect(CARDANO_POOL_ID_BECH32_RE.test(`pool1${body.slice(0, 50)}`)).toBe(false);
+    expect(CARDANO_POOL_ID_BECH32_RE.test(`pool1${body}z`)).toBe(false);
   });
 
   it("rejects the bech32-excluded characters 1, b, i and o", () => {
     const body = REAL_POOL_ID.slice(5);
     for (const bad of ["1", "b", "i", "o"]) {
-      expect(CARDANO_POOL_ID_RE.test(`pool1${bad}${body.slice(1)}`)).toBe(false);
+      expect(CARDANO_POOL_ID_BECH32_RE.test(`pool1${bad}${body.slice(1)}`)).toBe(false);
     }
   });
 
   it("rejects a wrong human-readable part", () => {
     const body = REAL_POOL_ID.slice(5);
-    expect(CARDANO_POOL_ID_RE.test(`addr1${body}`)).toBe(false);
-    expect(CARDANO_POOL_ID_RE.test(`stake${body}`)).toBe(false);
+    expect(CARDANO_POOL_ID_BECH32_RE.test(`addr1${body}`)).toBe(false);
+    expect(CARDANO_POOL_ID_BECH32_RE.test(`stake${body}`)).toBe(false);
   });
 
-  it("rejects uppercase (mixed-case bech32 is invalid; we require lowercase)", () => {
-    expect(CARDANO_POOL_ID_RE.test(REAL_POOL_ID.toUpperCase())).toBe(false);
+  it("is the lowercase-only form — case folding happens before the test", () => {
+    expect(CARDANO_POOL_ID_BECH32_RE.test(REAL_POOL_ID.toUpperCase())).toBe(false);
+  });
+});
+
+describe("CARDANO_POOL_ID_HEX_RE — the 28-byte pool hash", () => {
+  it("matches the 56 hex characters of a pool hash, in either case", () => {
+    expect(REAL_POOL_ID_HEX).toHaveLength(56);
+    expect(CARDANO_POOL_ID_HEX_RE.test(REAL_POOL_ID_HEX)).toBe(true);
+    expect(CARDANO_POOL_ID_HEX_RE.test(REAL_POOL_ID_HEX.toUpperCase())).toBe(true);
+  });
+
+  it("is anchored and rejects a wrong length or a non-hex character", () => {
+    expect(CARDANO_POOL_ID_HEX_RE.test(REAL_POOL_ID_HEX.slice(0, 55))).toBe(false);
+    expect(CARDANO_POOL_ID_HEX_RE.test(`${REAL_POOL_ID_HEX}0`)).toBe(false);
+    expect(CARDANO_POOL_ID_HEX_RE.test(`${REAL_POOL_ID_HEX.slice(0, 55)}z`)).toBe(false);
+    expect(CARDANO_POOL_ID_HEX_RE.test(`${REAL_POOL_ID_HEX}<b>`)).toBe(false);
+  });
+
+  it("cannot collide with a bech32 pool id — 'pool1' is not hex", () => {
+    expect(CARDANO_POOL_ID_HEX_RE.test(REAL_POOL_ID)).toBe(false);
+  });
+});
+
+/**
+ * The three forms an SPO actually has to hand. Rejecting two of them 400s the
+ * whole drip, which is hostile to exactly the operator we want to recruit.
+ */
+describe("parseOperatorIdentity — cardano_pool_id accepts all three copied forms", () => {
+  it("accepts lowercase bech32 unchanged", () => {
+    expect(expectOk({ cardano_pool_id: REAL_POOL_ID }).cardanoPoolId).toBe(REAL_POOL_ID);
+  });
+
+  it("accepts uppercase bech32 and stores the lowercase form", () => {
+    expect(expectOk({ cardano_pool_id: REAL_POOL_ID.toUpperCase() }).cardanoPoolId).toBe(
+      REAL_POOL_ID,
+    );
+  });
+
+  it("accepts the 56-char hex pool hash and stores it lowercase", () => {
+    expect(expectOk({ cardano_pool_id: REAL_POOL_ID_HEX }).cardanoPoolId).toBe(REAL_POOL_ID_HEX);
+    expect(expectOk({ cardano_pool_id: REAL_POOL_ID_HEX.toUpperCase() }).cardanoPoolId).toBe(
+      REAL_POOL_ID_HEX,
+    );
+  });
+
+  it("normalises surrounding whitespace from a paste", () => {
+    expect(expectOk({ cardano_pool_id: `  ${REAL_POOL_ID.toUpperCase()}  ` }).cardanoPoolId).toBe(
+      REAL_POOL_ID,
+    );
+  });
+
+  it("stores one canonical form per input — normalisation is idempotent", () => {
+    for (const input of [REAL_POOL_ID, REAL_POOL_ID.toUpperCase(), REAL_POOL_ID_HEX]) {
+      const once = expectOk({ cardano_pool_id: input }).cardanoPoolId!;
+      expect(expectOk({ cardano_pool_id: once }).cardanoPoolId).toBe(once);
+    }
   });
 });
 
@@ -219,9 +278,10 @@ describe("parseOperatorIdentity — cardano_pool_id rejections", () => {
   it.each([
     ["too short", "pool1abc"],
     ["wrong hrp", `addr1${REAL_POOL_ID.slice(5)}`],
-    ["hex pool hash", "0f292fcaa02b8b2f9b3c8f9fd8e0bb21abedb692a6d5058df3ef2735"],
     ["markup suffix", `${REAL_POOL_ID}<script>`],
-    ["uppercase", REAL_POOL_ID.toUpperCase()],
+    ["55 hex chars", REAL_POOL_ID_HEX.slice(0, 55)],
+    ["57 hex chars", `${REAL_POOL_ID_HEX}0`],
+    ["mixed-case bech32 (invalid per BIP-173)", `POOL1${REAL_POOL_ID.slice(5)}`],
   ])("rejects %s", (_name, value) => {
     expect(expectErr({ cardano_pool_id: value })).toMatch(/cardano_pool_id/);
   });
@@ -229,6 +289,12 @@ describe("parseOperatorIdentity — cardano_pool_id rejections", () => {
   it("a rejected pool id cannot carry markup into storage", () => {
     const r = parseOperatorIdentity({ cardano_pool_id: `${REAL_POOL_ID}"><img src=x>` });
     expect(r.ok).toBe(false);
+  });
+
+  it("no accepted form can carry an HTML metacharacter", () => {
+    for (const input of [REAL_POOL_ID, REAL_POOL_ID.toUpperCase(), REAL_POOL_ID_HEX]) {
+      expect(expectOk({ cardano_pool_id: input }).cardanoPoolId).toMatch(/^[0-9a-z]+$/);
+    }
   });
 });
 

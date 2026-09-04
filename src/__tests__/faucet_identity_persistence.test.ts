@@ -10,6 +10,9 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import Database from "better-sqlite3";
 import { createHash } from "crypto";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   migrateRegistrationsSchema,
   recordFaucetRegistration,
@@ -73,6 +76,30 @@ function rowFor(db: Database.Database, address: string) {
   return db
     .prepare("SELECT * FROM registrations WHERE ss58_address = ?")
     .get(address) as Record<string, unknown> | undefined;
+}
+
+/**
+ * A handle whose PRAGMA table_info answer is frozen at `staleCols` while the
+ * underlying table has moved on. That is exactly the state a second process
+ * is in when it reads the column list before a first process commits its
+ * ALTER and issues its own ALTER after — the check-then-ALTER TOCTOU.
+ */
+function withStalePragma(
+  db: Database.Database,
+  staleCols: Array<{ name: string }>,
+): Database.Database {
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop === "prepare") {
+        return (sql: string) =>
+          /PRAGMA\s+table_info/i.test(sql)
+            ? ({ all: () => staleCols } as unknown as Database.Statement)
+            : target.prepare(sql);
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as Database.Database;
 }
 
 describe("migrateRegistrationsSchema — additive and safe against the 132 live rows", () => {
@@ -185,6 +212,88 @@ describe("migrateRegistrationsSchema — additive and safe against the 132 live 
   });
 });
 
+/**
+ * Two failure modes reviewers found in the check-then-ALTER shape:
+ *
+ *  1. On a database with no `registrations` table, PRAGMA returns zero rows,
+ *     so every column reads as absent and the loop ALTERs a table that isn't
+ *     there.
+ *  2. PRAGMA-then-ALTER is a TOCTOU. Two gateway processes starting at once
+ *     both see the column absent; the loser's ALTER hits "duplicate column
+ *     name" and takes down startup.
+ */
+describe("migrateRegistrationsSchema — safe against an absent table and a startup race", () => {
+  it("creates registrations when the database has no such table", () => {
+    const empty = new Database(":memory:");
+
+    expect(() => migrateRegistrationsSchema(empty)).not.toThrow();
+
+    const cols = columnNames(empty);
+    for (const c of [
+      "ss58_address",
+      "public_key",
+      "label",
+      "api_key_hash",
+      "invite_token_hash",
+      "registered_at",
+      "approved_at",
+      "status",
+      "session_keys",
+      "peer_id",
+      "operator_label",
+      "contact",
+      "cardano_pool_id",
+    ]) {
+      expect(cols.has(c)).toBe(true);
+    }
+  });
+
+  it("tolerates a racing process that added the column after our PRAGMA read", () => {
+    const db = preIdentityDbWith132Rows();
+    const staleCols = [...columnNames(db)].map((name) => ({ name }));
+
+    // The racing process wins and commits its ALTERs.
+    migrateRegistrationsSchema(db);
+
+    // We proceed on the column list we read before it committed.
+    expect(() => migrateRegistrationsSchema(withStalePragma(db, staleCols))).not.toThrow();
+
+    const names = (
+      db.prepare("PRAGMA table_info(registrations)").all() as Array<{ name: string }>
+    ).map((c) => c.name);
+    expect(new Set(names).size).toBe(names.length);
+    expect(names.filter((c) => c === "contact")).toHaveLength(1);
+
+    const { n } = db.prepare("SELECT COUNT(*) AS n FROM registrations").get() as { n: number };
+    expect(n).toBe(132);
+  });
+
+  it("two connections on the same file both migrate cleanly", () => {
+    const dir = mkdtempSync(join(tmpdir(), "materios-migrate-race-"));
+    const path = join(dir, "operators.db");
+    const a = new Database(path);
+    const b = new Database(path);
+    try {
+      a.pragma("journal_mode = WAL");
+      a.pragma("busy_timeout = 5000");
+      b.pragma("busy_timeout = 5000");
+
+      expect(() => migrateRegistrationsSchema(a)).not.toThrow();
+      expect(() => migrateRegistrationsSchema(b)).not.toThrow();
+
+      const names = (
+        b.prepare("PRAGMA table_info(registrations)").all() as Array<{ name: string }>
+      ).map((c) => c.name);
+      expect(new Set(names).size).toBe(names.length);
+      expect(names).toContain("cardano_pool_id");
+    } finally {
+      a.close();
+      b.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("recordFaucetRegistration — anonymous drip is unchanged", () => {
   let db: Database.Database;
   const NEW_ADDR = "5NewAnonymousOperatorAddressaaaaaaaaaaaaaaaaaaa";
@@ -286,7 +395,20 @@ describe("recordFaucetRegistration — each field persists", () => {
   });
 });
 
-describe("recordFaucetRegistration — a repeat drip never clobbers a declared identity", () => {
+/**
+ * Identity is recorded ON INSERT ONLY.
+ *
+ * A drip proves nothing about who controls the address it funds, so writing
+ * identity onto a row that already exists would let an unauthenticated POST
+ * /faucet/drip stamp attacker-chosen fields onto ANY registration — including
+ * OnlyBlocks, our one live external validator, and the FPS cores. The bound
+ * previously claimed for that UPDATE ("one drip per address, first come wins")
+ * does not hold: an operator who registered through the invite flow has no
+ * drip-ledger entry, so the 409 never fires for them.
+ *
+ * The fix is structural rather than a guard: there is no UPDATE path at all.
+ */
+describe("recordFaucetRegistration — identity is written on INSERT only", () => {
   let db: Database.Database;
   const ADDR = "5RepeatDripOperatoraaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -317,17 +439,21 @@ describe("recordFaucetRegistration — a repeat drip never clobbers a declared i
     expect(row.cardano_pool_id).toBe(REAL_POOL_ID);
   });
 
-  it("a partial repeat drip only nulls nothing — unsupplied fields survive", () => {
+  it("a repeat drip cannot overwrite a declared identity", () => {
     recordFaucetRegistration(db, {
       ss58Address: ADDR,
       apiKeyHash: keyHashFor(ADDR),
-      identity: { operatorLabel: null, contact: "new-ops@example.org", cardanoPoolId: null },
+      identity: {
+        operatorLabel: "Attacker",
+        contact: "attacker@example.org",
+        cardanoPoolId: `pool1${"q".repeat(51)}`,
+      },
     });
 
     const row = rowFor(db, ADDR)!;
     expect(row.operator_label).toBe("OnlyBlocks");
+    expect(row.contact).toBe("ops@example.org");
     expect(row.cardano_pool_id).toBe(REAL_POOL_ID);
-    expect(row.contact).toBe("new-ops@example.org");
   });
 
   it("does not create a duplicate row or change the immutable registration fields", () => {
@@ -350,14 +476,13 @@ describe("recordFaucetRegistration — a repeat drip never clobbers a declared i
     expect(after.status).toBe(before.status);
   });
 
-  it("lets a previously-anonymous operator declare an identity on a later drip", () => {
+  it("leaves a previously-anonymous row anonymous — identity is never added later", () => {
     const anon = "5LateDeclarerOperatoraaaaaaaaaaaaaaaaaaaaaaaaaa";
     recordFaucetRegistration(db, {
       ss58Address: anon,
       apiKeyHash: keyHashFor(anon),
       identity: ANONYMOUS,
     });
-    expect(rowFor(db, anon)?.contact).toBeNull();
 
     recordFaucetRegistration(db, {
       ss58Address: anon,
@@ -366,7 +491,96 @@ describe("recordFaucetRegistration — a repeat drip never clobbers a declared i
     });
 
     const row = rowFor(db, anon)!;
-    expect(row.operator_label).toBe("LateComer");
-    expect(row.contact).toBe("late@example.org");
+    expect(row.operator_label).toBeNull();
+    expect(row.contact).toBeNull();
+    expect(row.cardano_pool_id).toBeNull();
+  });
+
+  it("cannot stamp identity onto one of the 132 pre-existing anonymous rows", () => {
+    const victim = addressFor(42);
+
+    recordFaucetRegistration(db, {
+      ss58Address: victim,
+      apiKeyHash: keyHashFor(victim),
+      identity: {
+        operatorLabel: "Attacker",
+        contact: "attacker@example.org",
+        cardanoPoolId: REAL_POOL_ID,
+      },
+    });
+
+    const row = rowFor(db, victim)!;
+    expect(row.operator_label).toBeNull();
+    expect(row.contact).toBeNull();
+    expect(row.cardano_pool_id).toBeNull();
+  });
+
+  /**
+   * The exact case the old "one drip per address" bound missed: an invite-flow
+   * row has a real api_key_hash and a real invite_token_hash, and its operator
+   * never used the faucet, so no drip-ledger entry exists to 409 the request.
+   */
+  it("cannot touch an invite-flow registration, which has no drip-ledger entry to 409 on", () => {
+    const onlyBlocks = "5OnlyBlocksInviteFlowOperatoraaaaaaaaaaaaaaaaa";
+    db.prepare(
+      `INSERT INTO registrations
+         (ss58_address, public_key, label, api_key_hash, invite_token_hash,
+          registered_at, approved_at, status, session_keys, peer_id,
+          operator_label, contact, cardano_pool_id)
+       VALUES (?, '0xpub', 'OnlyBlocks', ?, ?, '2026-06-24 10:00:00', '2026-06-24 10:05:00',
+               'approved', ?, '12D3KooWOnlyBlocks', 'OnlyBlocks', 'onlyblocks@example.org', ?)`,
+    ).run(onlyBlocks, "c".repeat(64), "d".repeat(64), `0x${"ab".repeat(64)}`, REAL_POOL_ID);
+
+    const before = rowFor(db, onlyBlocks)!;
+
+    recordFaucetRegistration(db, {
+      ss58Address: onlyBlocks,
+      apiKeyHash: keyHashFor(onlyBlocks),
+      identity: {
+        operatorLabel: "Attacker",
+        contact: "attacker@example.org",
+        cardanoPoolId: `pool1${"q".repeat(51)}`,
+      },
+    });
+
+    expect(rowFor(db, onlyBlocks)).toEqual(before);
+  });
+
+  /**
+   * Structural proof, not a value check: a BEFORE UPDATE trigger that aborts
+   * means any UPDATE statement issued against `registrations` throws. The drip
+   * completing without throwing is evidence the write path contains no UPDATE
+   * that could be reached with different inputs.
+   */
+  it("issues no UPDATE against registrations at all", () => {
+    db.exec(`
+      CREATE TRIGGER registrations_are_insert_only
+      BEFORE UPDATE ON registrations
+      BEGIN SELECT RAISE(ABORT, 'UPDATE against registrations'); END;
+    `);
+
+    expect(() =>
+      recordFaucetRegistration(db, {
+        ss58Address: ADDR,
+        apiKeyHash: keyHashFor(ADDR),
+        identity: {
+          operatorLabel: "Attacker",
+          contact: "attacker@example.org",
+          cardanoPoolId: REAL_POOL_ID,
+        },
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      recordFaucetRegistration(db, {
+        ss58Address: "5BrandNewOperatorAddressaaaaaaaaaaaaaaaaaaaaaa",
+        apiKeyHash: "e".repeat(64),
+        identity: { operatorLabel: "Newcomer", contact: null, cardanoPoolId: null },
+      }),
+    ).not.toThrow();
+
+    expect(rowFor(db, "5BrandNewOperatorAddressaaaaaaaaaaaaaaaaaaaaaa")?.operator_label).toBe(
+      "Newcomer",
+    );
   });
 });

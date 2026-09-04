@@ -355,21 +355,23 @@ faucetRouter.post("/faucet/drip", async (req: Request, res: Response) => {
   const ua = String(req.headers["user-agent"] || "").slice(0, 60);
   const body = (req.body || {}) as Record<string, unknown>;
 
-  // JSON.stringify rather than raw interpolation: the address is unvalidated
-  // at this point and a newline in it would otherwise split the log line.
-  console.log(
-    `[faucet:drip] request received: address=${JSON.stringify(String(body.address ?? ""))} ip=${ip} ua=${JSON.stringify(ua)}`,
-  );
-
+  // The address is logged only after normalizeSs58 has produced a canonical
+  // SS58. decodeAddress's failure message quotes the caller's input verbatim,
+  // newlines included, so neither the log line nor the response may carry it:
+  // one is log forging, the other a reflection sink. The reason a caller's
+  // address failed is theirs to work out from the address they sent.
   let address: string;
   try {
     address = normalizeSs58(body.address);
-  } catch (e) {
-    const reason = e instanceof Error ? e.message : String(e);
-    console.warn(`[faucet:drip] rejected: invalid SS58 address (ip=${ip}): ${reason}`);
-    res.status(400).json({ error: `Invalid SS58 address: ${reason}` });
+  } catch {
+    console.warn(`[faucet:drip] 400 rejected: address is not a valid SS58 address (ip=${ip})`);
+    res.status(400).json({ error: "Invalid SS58 address" });
     return;
   }
+
+  console.log(
+    `[faucet:drip] request received: address=${address} ip=${ip} ua=${JSON.stringify(ua)}`,
+  );
 
   // Optional self-declared identity. Validated BEFORE any ledger read or chain
   // call so a malformed field costs the operator nothing — they fix it and
