@@ -15,18 +15,20 @@ import { ApiPromise, WsProvider, Keyring } from "@polkadot/api";
 import type { SubmittableExtrinsic } from "@polkadot/api/types";
 import type { ISubmittableResult } from "@polkadot/types/types";
 import type { KeyringPair } from "@polkadot/keyring/types";
-import { decodeAddress, encodeAddress } from "@polkadot/util-crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 
 import { config } from "../config.js";
+import { normalizeSs58 } from "../ss58.js";
 import {
   parseOperatorIdentity,
   isAnonymous,
   identityLogFields,
+  describeIdentityOutcome,
   type OperatorIdentity,
+  type IdentityOutcome,
 } from "../operator_identity.js";
 import { getOperatorsDb, recordFaucetRegistration } from "./operators.js";
 
@@ -152,22 +154,6 @@ function pickClientIp(req: Request): string {
     if (first) return first;
   }
   return req.socket.remoteAddress || "unknown";
-}
-
-/**
- * decodeAddress throws on any malformed input (wrong length, bad checksum,
- * non-base58 chars, 0x-prefixed hex). Re-encoding with prefix 42 normalizes
- * display and gives us the canonical ledger + DB key.
- */
-function normalizeSs58(address: unknown): string {
-  if (!address || typeof address !== "string") {
-    throw new Error("address must be a string");
-  }
-  const raw = decodeAddress(address);
-  if (raw.length !== 32) {
-    throw new Error(`unexpected AccountId byte length: ${raw.length}`);
-  }
-  return encodeAddress(raw, 42);
 }
 
 /**
@@ -323,8 +309,8 @@ function registerOperator(
   address: string,
   keyHash: string,
   identity: OperatorIdentity,
-): void {
-  recordFaucetRegistration(getOperatorsDb(), {
+): { created: boolean } {
+  const { created } = recordFaucetRegistration(getOperatorsDb(), {
     ss58Address: address,
     apiKeyHash: keyHash,
     identity,
@@ -343,6 +329,8 @@ function registerOperator(
   } finally {
     quotaDb.close();
   }
+
+  return { created };
 }
 
 /**
@@ -464,11 +452,23 @@ faucetRouter.post("/faucet/drip", async (req: Request, res: Response) => {
     // heartbeats would 403 with no recourse. Roll the ledger back so a retry
     // can re-attempt.
     const keyHash = createHash("sha256").update(address).digest("hex");
+    let identityStatus: IdentityOutcome = "not_declared";
     try {
-      registerOperator(address, keyHash, identity);
+      const { created } = registerOperator(address, keyHash, identity);
+      identityStatus = describeIdentityOutcome(identity, created);
       console.log(
-        `[faucet] Registered ${address} in operators.db::registrations + quota.db::api_keys`,
+        created
+          ? `[faucet] Registered ${address} in operators.db::registrations + quota.db::api_keys`
+          : `[faucet] ${address} already had a registration; api_keys ensured, registration left as-is`,
       );
+      // The declaration this drip carried was dropped on the floor. Nothing
+      // else says so — the response is still a 200 — and an operator who is
+      // never told believes they declared.
+      if (identityStatus === "discarded") {
+        console.warn(
+          `[faucet] identity DISCARDED for ${address}: registration already exists and identity is recorded on INSERT only (${identityLogFields(identity)})`,
+        );
+      }
     } catch (dbErr) {
       const msg = dbErr instanceof Error ? dbErr.message : String(dbErr);
       const ledgerRollback = loadLedger(currentGenesis);
@@ -513,12 +513,20 @@ faucetRouter.post("/faucet/drip", async (req: Request, res: Response) => {
     console.log(
       `[faucet:drip] 200 success address=${address} tx=${txHash} amount=${DRIP_AMOUNT} elapsed_ms=${Date.now() - requestStartMs} ip=${ip}`,
     );
+    const DRIP_MESSAGE =
+      "MATRA sent. It will generate MOTRA over the next few blocks, enabling fee payment.";
     res.json({
       success: true,
       amount: DRIP_AMOUNT,
       tx_hash: txHash,
+      // What became of the optional operator details. "discarded" is the case
+      // that used to be invisible: this address already had a registration, so
+      // the declaration was not stored and never will be by this route.
+      identity_status: identityStatus,
       message:
-        "MATRA sent. It will generate MOTRA over the next few blocks, enabling fee payment.",
+        identityStatus === "discarded"
+          ? `${DRIP_MESSAGE} The operator details were NOT recorded: this address is already registered, and they are stored only on the registration that first created it.`
+          : DRIP_MESSAGE,
     });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);

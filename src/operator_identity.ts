@@ -156,6 +156,25 @@ export function isAnonymous(identity: OperatorIdentity): boolean {
 }
 
 /**
+ * What actually happened to a declaration.
+ *
+ * Identity is written on INSERT only, so a drip against an address that
+ * already has a registration drops whatever it declared. The route must be
+ * able to say which of the three cases it was — a 200 that reads the same
+ * whether the declaration was kept or thrown away is how four months of
+ * anonymous signups went unnoticed.
+ */
+export type IdentityOutcome = "recorded" | "discarded" | "not_declared";
+
+export function describeIdentityOutcome(
+  identity: OperatorIdentity,
+  registrationCreated: boolean,
+): IdentityOutcome {
+  if (isAnonymous(identity)) return "not_declared";
+  return registrationCreated ? "recorded" : "discarded";
+}
+
+/**
  * Log-safe projection. The contact VALUE is PII and never appears in a log
  * line or a webhook; that a contact was supplied is what makes the recruitment
  * funnel measurable, so the boolean is fine.

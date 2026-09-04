@@ -20,6 +20,7 @@ import Database from "better-sqlite3";
 import { join } from "path";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { config } from "../config.js";
+import { normalizeSs58, lookupSs58 } from "../ss58.js";
 import type { OperatorIdentity } from "../operator_identity.js";
 
 export const operatorsRouter = Router();
@@ -161,16 +162,20 @@ export function migrateRegistrationsSchema(database: Database.Database): void {
  * IGNORE means an address that already has a row keeps every field it has,
  * and the drip's identity is discarded. The consequence is accepted: an
  * operator who first dripped anonymously stays anonymous.
+ *
+ * `created` is that discard, reported. The caller needs it to tell the
+ * operator and the logs what became of a declaration; without it a drip that
+ * threw the declaration away is indistinguishable from one that kept it.
  */
 export function recordFaucetRegistration(
   database: Database.Database,
   args: { ss58Address: string; apiKeyHash: string; identity: OperatorIdentity },
-): void {
+): { created: boolean } {
   const { ss58Address, apiKeyHash, identity } = args;
 
   // invite_token_hash, label and api_key_hash are all NOT NULL; a faucet
   // registration has no invite, so the token hash is stored as an empty string.
-  database
+  const result = database
     .prepare(
       `INSERT OR IGNORE INTO registrations
          (ss58_address, public_key, label, api_key_hash, invite_token_hash,
@@ -186,6 +191,8 @@ export function recordFaucetRegistration(
       identity.contact,
       identity.cardanoPoolId,
     );
+
+  return { created: result.changes === 1 };
 }
 
 function hashToken(plaintext: string): string {
@@ -245,9 +252,15 @@ operatorsRouter.post("/operators/register", (req: Request, res: Response) => {
       res.status(400).json({ error: "Missing or invalid ss58_address" });
       return;
     }
-    // Basic SS58 format check (starts with 5 or 1, 46-48 chars)
-    if (!/^[15][a-zA-Z0-9]{45,47}$/.test(ss58_address)) {
-      res.status(400).json({ error: "Invalid SS58 address format" });
+    // The stored key is the canonical prefix-42 spelling, the same one the
+    // faucet writes — otherwise the prefix-0 and prefix-42 forms of one
+    // account each get their own row. Decoding also replaces the old shape
+    // check, which accepted any 46-48 character string starting 1 or 5.
+    let address: string;
+    try {
+      address = normalizeSs58(ss58_address);
+    } catch {
+      res.status(400).json({ error: "Invalid SS58 address" });
       return;
     }
 
@@ -271,7 +284,7 @@ operatorsRouter.post("/operators/register", (req: Request, res: Response) => {
     // Check if SS58 already registered
     const existing = db.prepare(
       "SELECT ss58_address, status FROM registrations WHERE ss58_address = ?",
-    ).get(ss58_address) as { ss58_address: string; status: string } | undefined;
+    ).get(address) as { ss58_address: string; status: string } | undefined;
 
     if (existing) {
       res.status(409).json({ error: "Address already registered", status: existing.status });
@@ -287,14 +300,14 @@ operatorsRouter.post("/operators/register", (req: Request, res: Response) => {
       // Mark invite as redeemed
       db.prepare(
         "UPDATE invites SET redeemed_at = ?, redeemed_by = ? WHERE token_hash = ?",
-      ).run(new Date().toISOString(), ss58_address, tokenHash);
+      ).run(new Date().toISOString(), address, tokenHash);
 
       // Create registration record
       db.prepare(`
         INSERT INTO registrations (ss58_address, public_key, label, api_key_hash, invite_token_hash, registered_at, status)
         VALUES (?, ?, ?, ?, ?, ?, 'registered')
       `).run(
-        ss58_address,
+        address,
         public_key || null,
         operatorLabel,
         apiKeyHash,
@@ -305,19 +318,19 @@ operatorsRouter.post("/operators/register", (req: Request, res: Response) => {
     register();
 
     // Append to keys.json on disk (gateway reloads on restart, but also update SQLite quota db)
-    appendToKeysFile(apiKeyHash, operatorLabel, ss58_address, invite);
+    appendToKeysFile(apiKeyHash, operatorLabel, address, invite);
 
     // Upsert into the in-memory quota DB so the key works immediately
-    upsertApiKey(apiKeyHash, operatorLabel, ss58_address, invite);
+    upsertApiKey(apiKeyHash, operatorLabel, address, invite);
 
-    console.log(`[blob-gateway] Operator registered: ${operatorLabel} (${ss58_address})`);
+    console.log(`[blob-gateway] Operator registered: ${operatorLabel} (${address})`);
 
     // Send Discord notification (fire-and-forget)
-    notifyDiscord(operatorLabel, ss58_address).catch(() => {});
+    notifyDiscord(operatorLabel, address).catch(() => {});
 
     res.status(200).json({
       status: "registered",
-      ss58_address,
+      ss58_address: address,
       label: operatorLabel,
       api_key: apiKeyPlaintext,
       message: "Registration successful. The Materios team will activate your committee seat shortly.",
@@ -331,7 +344,8 @@ operatorsRouter.post("/operators/register", (req: Request, res: Response) => {
 
 operatorsRouter.get("/operators/status/:ss58", (req: Request, res: Response) => {
   try {
-    const { ss58 } = req.params;
+    // Either spelling of an account resolves to the one canonical row.
+    const ss58 = lookupSs58(req.params.ss58);
     const reg = db.prepare(
       "SELECT ss58_address, label, registered_at, approved_at, status, session_keys, peer_id, operator_label, cardano_pool_id, contact FROM registrations WHERE ss58_address = ?",
     ).get(ss58) as { ss58_address: string; label: string; registered_at: string; approved_at: string | null; status: string; session_keys: string | null; peer_id: string | null; operator_label: string | null; cardano_pool_id: string | null; contact: string | null } | undefined;
@@ -368,7 +382,7 @@ operatorsRouter.get("/operators/status/:ss58", (req: Request, res: Response) => 
 
 operatorsRouter.patch("/operators/:ss58/session-keys", (req: Request, res: Response) => {
   try {
-    const { ss58 } = req.params;
+    const ss58 = lookupSs58(req.params.ss58);
     const { session_keys, peer_id, api_key } = req.body as {
       session_keys?: string;
       peer_id?: string;
@@ -433,7 +447,7 @@ operatorsRouter.get("/operators/:ss58/session-keys", (req: Request, res: Respons
       return;
     }
 
-    const { ss58 } = req.params;
+    const ss58 = lookupSs58(req.params.ss58);
     const reg = db.prepare(
       "SELECT ss58_address, label, session_keys, peer_id, status, operator_label, contact, cardano_pool_id FROM registrations WHERE ss58_address = ?",
     ).get(ss58) as { ss58_address: string; label: string; session_keys: string | null; peer_id: string | null; status: string; operator_label: string | null; contact: string | null; cardano_pool_id: string | null } | undefined;

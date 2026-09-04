@@ -14,6 +14,7 @@ import {
   CARDANO_POOL_ID_HEX_RE,
   OPERATOR_LABEL_MAX,
   CONTACT_MAX,
+  describeIdentityOutcome,
 } from "../operator_identity.js";
 
 // Live Hetzner block-producer pool (task #369). Real bech32: `pool1` + 51 chars.
@@ -320,5 +321,42 @@ describe("parseOperatorIdentity — the error string is safe to echo back", () =
   it("does not reflect a rejected contact value (PII) into the error message", () => {
     const err = expectErr({ contact: `secret@example.org${"x".repeat(CONTACT_MAX)}` });
     expect(err).not.toContain("secret@example.org");
+  });
+});
+
+/**
+ * The drip's answer about what happened to a declaration.
+ *
+ * Identity is recorded on INSERT only, so a drip against an address that
+ * already has a registration silently drops whatever it declared. Silently is
+ * the bug: the route returned 200 {success:true} and logged "Registered …"
+ * either way, so neither the operator nor ops could tell a captured
+ * declaration from a discarded one, and the funnel could not be measured.
+ */
+describe("describeIdentityOutcome — captured, discarded, or never declared", () => {
+  const ANON = { operatorLabel: null, contact: null, cardanoPoolId: null };
+  const DECLARED = {
+    operatorLabel: "OnlyBlocks",
+    contact: "ops@example.org",
+    cardanoPoolId: REAL_POOL_ID,
+  };
+
+  it("records the declaration when the drip created the registration", () => {
+    expect(describeIdentityOutcome(DECLARED, true)).toBe("recorded");
+  });
+
+  it("reports a discard when the registration already existed", () => {
+    expect(describeIdentityOutcome(DECLARED, false)).toBe("discarded");
+  });
+
+  it("declaring nothing is not a discard, whether or not a row was created", () => {
+    expect(describeIdentityOutcome(ANON, true)).toBe("not_declared");
+    expect(describeIdentityOutcome(ANON, false)).toBe("not_declared");
+  });
+
+  it("a single declared field is enough to be recorded or discarded", () => {
+    const onlyContact = { operatorLabel: null, contact: "ops@example.org", cardanoPoolId: null };
+    expect(describeIdentityOutcome(onlyContact, true)).toBe("recorded");
+    expect(describeIdentityOutcome(onlyContact, false)).toBe("discarded");
   });
 });

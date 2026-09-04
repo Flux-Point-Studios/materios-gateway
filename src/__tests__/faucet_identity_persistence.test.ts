@@ -10,9 +10,11 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import Database from "better-sqlite3";
 import { createHash } from "crypto";
+import { execFile } from "node:child_process";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
+import { fileURLToPath } from "node:url";
 import {
   migrateRegistrationsSchema,
   recordFaucetRegistration,
@@ -65,6 +67,34 @@ function preIdentityDbWith132Rows(): Database.Database {
     insert.run(a, keyHashFor(a));
   }
   return db;
+}
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(HERE, "..", "..");
+
+/** Launch one migrate_worker.ts under tsx and collect its exit. */
+function runMigrateWorker(
+  dbPath: string,
+  startAt: number,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      join(REPO_ROOT, "node_modules", ".bin", "tsx"),
+      [join(HERE, "fixtures", "migrate_worker.ts"), dbPath, String(startAt)],
+      { cwd: REPO_ROOT, timeout: 60_000 },
+      (err, stdout, stderr) => {
+        if (err && typeof (err as { code?: unknown }).code !== "number") {
+          reject(err);
+          return;
+        }
+        resolve({
+          code: err ? ((err as { code?: number }).code ?? 1) : 0,
+          stdout: String(stdout),
+          stderr: String(stderr),
+        });
+      },
+    );
+  });
 }
 
 function columnNames(db: Database.Database): Set<string> {
@@ -268,29 +298,126 @@ describe("migrateRegistrationsSchema — safe against an absent table and a star
     expect(n).toBe(132);
   });
 
-  it("two connections on the same file both migrate cleanly", () => {
+  /**
+   * The real shape of the hazard: two gateway PROCESSES starting at once.
+   * better-sqlite3 is synchronous, so two handles in one process can only ever
+   * run one after the other — a sequential call proves nothing about a race.
+   * These are two OS processes spinning until a shared wall-clock instant, so
+   * their BEGIN IMMEDIATE transactions genuinely contend for the write lock.
+   *
+   * What that contention proves is lock survival, not duplicate-column
+   * tolerance: BEGIN IMMEDIATE is exactly what makes the cross-process
+   * PRAGMA-then-ALTER window unreachable, so the loser cannot see a stale
+   * column list. The duplicate-column path is covered above, by driving the
+   * migration with a handle whose PRAGMA answer is frozen.
+   */
+  it("two processes migrating the same file at the same instant both succeed", async () => {
     const dir = mkdtempSync(join(tmpdir(), "materios-migrate-race-"));
     const path = join(dir, "operators.db");
-    const a = new Database(path);
-    const b = new Database(path);
     try {
-      a.pragma("journal_mode = WAL");
-      a.pragma("busy_timeout = 5000");
-      b.pragma("busy_timeout = 5000");
+      const seed = new Database(path);
+      seed.pragma("journal_mode = WAL");
+      seed.exec(PRE_IDENTITY_DDL);
+      const insert = seed.prepare(
+        `INSERT INTO registrations
+           (ss58_address, public_key, label, api_key_hash, invite_token_hash, registered_at, status)
+         VALUES (?, '', 'faucet-attestor', ?, '', '2026-08-21 21:45:37', 'approved')`,
+      );
+      for (let i = 0; i < 132; i++) {
+        const a = addressFor(i);
+        insert.run(a, keyHashFor(a));
+      }
+      seed.close();
 
-      expect(() => migrateRegistrationsSchema(a)).not.toThrow();
-      expect(() => migrateRegistrationsSchema(b)).not.toThrow();
+      const startAt = Date.now() + 1000;
+      const results = await Promise.all([runMigrateWorker(path, startAt), runMigrateWorker(path, startAt)]);
 
-      const names = (
-        b.prepare("PRAGMA table_info(registrations)").all() as Array<{ name: string }>
-      ).map((c) => c.name);
-      expect(new Set(names).size).toBe(names.length);
-      expect(names).toContain("cardano_pool_id");
+      for (const r of results) {
+        expect(r.stderr).toBe("");
+        expect(r.code).toBe(0);
+        expect(r.stdout.trim()).toBe("OK");
+      }
+
+      const after = new Database(path);
+      try {
+        const names = (
+          after.prepare("PRAGMA table_info(registrations)").all() as Array<{ name: string }>
+        ).map((c) => c.name);
+        expect(new Set(names).size).toBe(names.length);
+        expect(names).toContain("cardano_pool_id");
+
+        const { n } = after.prepare("SELECT COUNT(*) AS n FROM registrations").get() as {
+          n: number;
+        };
+        expect(n).toBe(132);
+      } finally {
+        after.close();
+      }
     } finally {
-      a.close();
-      b.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * INSERT OR IGNORE reports whether it inserted, and the drip route needs that
+ * answer: identity supplied against an address that already has a row is
+ * dropped on the floor, and until the route can see the difference it cannot
+ * tell the operator, log it truthfully, or count the funnel.
+ */
+describe("recordFaucetRegistration — reports whether it created the row", () => {
+  let db: Database.Database;
+  const ADDR = "5CreatedFlagOperatoraaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+  beforeEach(() => {
+    db = preIdentityDbWith132Rows();
+    migrateRegistrationsSchema(db);
+  });
+
+  it("created is true for a brand-new registration", () => {
+    const r = recordFaucetRegistration(db, {
+      ss58Address: ADDR,
+      apiKeyHash: keyHashFor(ADDR),
+      identity: { operatorLabel: "OnlyBlocks", contact: null, cardanoPoolId: null },
+    });
+    expect(r.created).toBe(true);
+  });
+
+  it("created is false on a repeat drip — the identity was discarded", () => {
+    recordFaucetRegistration(db, {
+      ss58Address: ADDR,
+      apiKeyHash: keyHashFor(ADDR),
+      identity: ANONYMOUS,
+    });
+
+    const r = recordFaucetRegistration(db, {
+      ss58Address: ADDR,
+      apiKeyHash: keyHashFor(ADDR),
+      identity: { operatorLabel: "LateComer", contact: "late@example.org", cardanoPoolId: null },
+    });
+
+    expect(r.created).toBe(false);
+    expect(rowFor(db, ADDR)?.operator_label).toBeNull();
+  });
+
+  it("created is false against one of the 132 pre-existing anonymous rows", () => {
+    const victim = addressFor(42);
+    const r = recordFaucetRegistration(db, {
+      ss58Address: victim,
+      apiKeyHash: keyHashFor(victim),
+      identity: { operatorLabel: "Attacker", contact: null, cardanoPoolId: null },
+    });
+    expect(r.created).toBe(false);
+  });
+
+  it("created is true for an anonymous first drip — it did create the row", () => {
+    const fresh = "5AnonymousFirstDripaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const r = recordFaucetRegistration(db, {
+      ss58Address: fresh,
+      apiKeyHash: keyHashFor(fresh),
+      identity: ANONYMOUS,
+    });
+    expect(r.created).toBe(true);
   });
 });
 
