@@ -14,10 +14,14 @@
  * already-registered operator. Normalising both writers to the same canonical
  * string is what makes the primary key mean what it claims.
  *
- * Live preprod holds 131 registrations, every one of which already
- * round-trips to itself under encodeAddress(decodeAddress(a), 42) — verified
- * before this change — so canonicalising new writes needs no rewrite of
- * existing rows and cannot orphan one.
+ * Live preprod holds 132 registrations, every one of which already round-trips
+ * to itself under encodeAddress(decodeAddress(a), 42) — so canonicalising new
+ * writes needs no rewrite of existing rows and cannot orphan one.
+ *
+ * That count is 132 and not the 131 first reported here: operators.db runs in
+ * WAL mode, and a count taken from the .db file alone misses every row still
+ * in operators.db-wal. Measure against a copy of the db, the -wal AND the -shm
+ * together, or the number is quietly stale.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
