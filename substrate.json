@@ -1,0 +1,171 @@
+{
+  "repo": "materios-gateway",
+  "primitives": [
+    {
+      "id": "blob-gateway-api",
+      "name": "Blob gateway API",
+      "desc": "Content-addressed blob gateway: manifest and chunk upload, receipt locators served to attestors, Merkle helpers and batch metadata for multi-leaf anchors.",
+      "kind": "api",
+      "paths": [
+        "src/routes/blobs.ts",
+        "src/routes/chunks.ts",
+        "src/routes/locators.ts",
+        "src/routes/batches.ts",
+        "src/storage.ts",
+        "src/merkle.ts"
+      ],
+      "consumes": [
+        "orinq-receipts-pallet"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "gateway-api-tokens",
+      "name": "Gateway auth and tokens",
+      "desc": "Three-tier upload auth \u2014 tenant-scoped bearer tokens, legacy api-keys, sr25519 upload signatures with balance gating \u2014 plus the admin token lifecycle.",
+      "kind": "api",
+      "paths": [
+        "src/api-tokens.ts",
+        "src/routes/tokens.ts",
+        "src/auth.ts",
+        "src/bearer-auth.ts",
+        "src/upload-auth.ts"
+      ],
+      "consumes": [],
+      "status": "live"
+    },
+    {
+      "id": "gateway-faucet",
+      "name": "Gateway faucet",
+      "desc": "Public one-drip-per-address MATRA faucet with IP cooldown, genesis-namespaced ledger and optional operator identity capture.",
+      "kind": "api",
+      "paths": [
+        "src/routes/faucet.ts"
+      ],
+      "consumes": [],
+      "status": "live"
+    },
+    {
+      "id": "receipt-indexer",
+      "name": "Receipt indexer",
+      "desc": "Polls the chain for submitted receipts and writes the authoritative receipt-id to content-hash index the locator route serves.",
+      "kind": "pipeline",
+      "paths": [
+        "src/receipt-indexer.ts"
+      ],
+      "consumes": [
+        "orinq-receipts-pallet"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "sponsored-receipts",
+      "name": "Sponsored receipts",
+      "desc": "Upload-completion callback that lets a bearer-authenticated client obtain an on-chain receipt without holding a Materios key; a sponsor signs on their behalf.",
+      "kind": "pipeline",
+      "paths": [
+        "src/sponsored-receipts.ts"
+      ],
+      "consumes": [
+        "orinq-receipts-pallet",
+        "blob-gateway-api"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "gateway-billing-metering",
+      "name": "Billing and metering",
+      "desc": "Pay-per-use admission control and usage accounting with measurement and live phases, plus compute-metering ingestion.",
+      "kind": "api",
+      "paths": [
+        "src/routes/billing.ts",
+        "src/routes/metering.ts",
+        "src/routes/metering_v2.ts",
+        "src/billing"
+      ],
+      "consumes": [
+        "billing-pallet"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "gateway-observations",
+      "name": "Witness observations",
+      "desc": "Witness Network observation intake and registry: attested AI-model behaviour observations, witness targets and topology.",
+      "kind": "api",
+      "paths": [
+        "src/routes/observations.ts",
+        "src/routes/observations_submit.ts",
+        "src/routes/witness_targets.ts",
+        "src/routes/witness_topology.ts",
+        "src/witness_observations.ts",
+        "src/witness_targets.ts"
+      ],
+      "consumes": [],
+      "status": "live"
+    },
+    {
+      "id": "gateway-attestation-evidence",
+      "name": "Attestation evidence",
+      "desc": "TEE attestation-evidence intake, attestor registry and lift to the tee-attestation pallet.",
+      "kind": "api",
+      "paths": [
+        "src/routes/attestation_evidence.ts",
+        "src/routes/attestation_evidence_submission.ts",
+        "src/routes/attestation_evidence_attestors.ts",
+        "src/attestation_evidence_attestors.ts",
+        "src/receipt_attestation_evidence.ts"
+      ],
+      "consumes": [
+        "tee-attestation-pallet"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "gateway-explorer",
+      "name": "Explorer and status",
+      "desc": "Chain, validator and operator explorer plus status endpoints: producing-liveness, SPO journey and rewards.",
+      "kind": "api",
+      "paths": [
+        "src/routes/explorer-chain.ts",
+        "src/routes/explorer-validators.ts",
+        "src/routes/explorer-operator.ts",
+        "src/routes/explorer-rpc.ts",
+        "src/routes/explorer-spo-journey.ts",
+        "src/routes/explorer-spo-rewards.ts",
+        "src/routes/chain-info.ts",
+        "src/routes/status.ts"
+      ],
+      "consumes": [],
+      "status": "live"
+    },
+    {
+      "id": "gateway-operators",
+      "name": "Operator registry and heartbeats",
+      "desc": "Operator registration, heartbeat intake and fleet-operator registry consumed by probation and liveness tooling.",
+      "kind": "api",
+      "paths": [
+        "src/routes/operators.ts",
+        "src/routes/heartbeats.ts",
+        "src/heartbeat-store.ts",
+        "src/routes/fleet_operators.ts",
+        "src/fleet_operators.ts",
+        "src/operator_identity.ts"
+      ],
+      "consumes": [],
+      "status": "live"
+    },
+    {
+      "id": "gateway-firehose",
+      "name": "Event firehose",
+      "desc": "Streaming feed of gateway events for downstream consumers.",
+      "kind": "api",
+      "paths": [
+        "src/routes/firehose.ts",
+        "src/firehose"
+      ],
+      "consumes": [],
+      "status": "live"
+    }
+  ]
+}
