@@ -104,4 +104,10 @@ describe("file-backed ids must be 32-byte hex", () => {
     writeFileSync(join(tmpDir, "secret.json"), JSON.stringify({ leafHashes: [leaf] }));
     expect(await getBatchByLeaf(leaf)).toBeNull();
   });
+  test("a non-hex leaf index entry cannot make indexing a new batch throw", async () => {
+    const leaf = "cd".repeat(32);
+    mkdirSync(join(tmpDir, "index", "leaf-to-anchor"), { recursive: true });
+    writeFileSync(join(tmpDir, "index", "leaf-to-anchor", leaf), "../planted");
+    await expect(saveBatch("ef".repeat(32), { leafHashes: [leaf] })).resolves.toBeUndefined();
+  });
 });

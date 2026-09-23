@@ -6,18 +6,28 @@
 
 import { Router, type Request, type Response } from "express";
 import { saveBatch, getBatch } from "../storage.js";
-import { resolveAuth } from "../auth.js";
+import { resolveAuth, type AuthResult } from "../auth.js";
 import { config } from "../config.js";
 import { requireHexId } from "./id-param.js";
 
 export const batchesRouter = Router();
+
+function mayWriteBatches(auth: AuthResult): boolean {
+  if (auth.tier === "registered-validator" || auth.tier === "sig-only") {
+    return config.batchWriterAddresses.includes(auth.identity ?? "");
+  }
+  if (auth.tier === "api-key") {
+    return config.batchWriterKeyHashes.includes(auth.keyInfo?.keyHash.toLowerCase() ?? "");
+  }
+  return false;
+}
 batchesRouter.param("anchorId", requireHexId("anchorId"));
 
 /**
  * PUT /batches/:anchorId (also accepts POST for backwards compat)
  * Idempotent upsert of batch metadata JSON.
- * Requires auth (API key or sr25519 signature) from an identity listed in
- * BATCH_WRITERS.
+ * Requires an sr25519 signature from an address in BATCH_WRITER_ADDRESSES, or
+ * an API key whose sha256 is in BATCH_WRITER_KEY_HASHES.
  */
 async function upsertBatch(req: Request, res: Response): Promise<void> {
   try {
@@ -31,7 +41,7 @@ async function upsertBatch(req: Request, res: Response): Promise<void> {
     }
     // A batch record carries the Cardano tx that trace lineage shows as a
     // receipt's L1 anchor; any other writer could fake one.
-    if (!config.batchWriters.includes(auth.identity ?? "")) {
+    if (!mayWriteBatches(auth)) {
       res.status(403).json({ error: "Only the anchoring pipeline may write batch records" });
       return;
     }

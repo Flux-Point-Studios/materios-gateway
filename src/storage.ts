@@ -299,7 +299,7 @@ async function indexedBatchIsAnchored(entry: string): Promise<boolean> {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw err;
   }
-  return hasCardanoTx(await getBatch(current));
+  return isHexId(current) && hasCardanoTx(await getBatch(current));
 }
 
 /**

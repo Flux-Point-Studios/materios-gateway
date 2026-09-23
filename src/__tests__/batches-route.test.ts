@@ -36,6 +36,9 @@ import {
   migrateBindingColumn,
 } from "../quota.js";
 import { createHash } from "crypto";
+import { cryptoWaitReady } from "@polkadot/util-crypto";
+import { Keyring } from "@polkadot/api";
+import { stringToU8a, u8aToHex } from "@polkadot/util";
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -79,6 +82,27 @@ function makeQuotaDb(): Database.Database {
 
 const TEST_API_KEY = "test-batches-key";
 const CUSTOMER_API_KEY = "test-customer-key";
+const sha256hex = (s: string) => createHash("sha256").update(s).digest("hex");
+
+/** Headers for an sr25519 upload signature over a batch write. */
+async function signedHeaders(uri: string, anchorId: string): Promise<{ address: string; headers: Record<string, string> }> {
+  await cryptoWaitReady();
+  const pair = new Keyring({ type: "sr25519" }).addFromUri(uri);
+  const ts = Math.floor(Date.now() / 1000);
+  const sig = u8aToHex(pair.sign(stringToU8a(`materios-upload-v1|${anchorId}|${pair.address}|${ts}`)));
+  return {
+    address: pair.address,
+    headers: { "x-upload-sig": sig, "x-uploader-address": pair.address, "x-upload-ts": String(ts) },
+  };
+}
+
+/** An api_keys row bound to an address, as operator registration and the faucet create. */
+function bindAddress(address: string, keyHash: string, name: string): void {
+  currentQuotaDb
+    .prepare(`INSERT INTO api_keys (key_hash, name, enabled, validator_id) VALUES (?, ?, 1, ?)`)
+    .run(keyHash, name, address);
+}
+let currentQuotaDb: Database.Database;
 
 /** Build an Express app that mounts only the batches router. */
 function makeApp(): express.Express {
@@ -145,13 +169,16 @@ describe("/batches/:anchorId route", () => {
     tmpDir = mkdtempSync(join(tmpdir(), "batches-route-test-"));
     originalStoragePath = config.storagePath;
     (config as { storagePath: string }).storagePath = tmpDir;
-    config.batchWriters.splice(0, config.batchWriters.length, "batches-route-test");
-    setQuotaDbForTests(makeQuotaDb());
+    config.batchWriterKeyHashes.splice(0, config.batchWriterKeyHashes.length, sha256hex(TEST_API_KEY));
+    config.batchWriterAddresses.splice(0, config.batchWriterAddresses.length);
+    currentQuotaDb = makeQuotaDb();
+    setQuotaDbForTests(currentQuotaDb);
   });
 
   afterEach(() => {
     (config as { storagePath: string }).storagePath = originalStoragePath;
-    config.batchWriters.splice(0, config.batchWriters.length);
+    config.batchWriterKeyHashes.splice(0, config.batchWriterKeyHashes.length);
+    config.batchWriterAddresses.splice(0, config.batchWriterAddresses.length);
     try {
       rmSync(tmpDir, { recursive: true, force: true });
     } catch {
@@ -298,5 +325,47 @@ describe("/batches/:anchorId route", () => {
     });
     expect(resp.status).toBe(400);
     expect(existsSync(join(tmpDir, "escaped.json"))).toBe(false);
+  });
+  test("a signed write from an allowlisted, registered address is accepted", async () => {
+    const app = makeApp();
+    const anchorId = "44".repeat(32);
+    const { address, headers } = await signedHeaders("//CertDaemon", anchorId);
+    bindAddress(address, sha256hex(`registered-${address}`), "cert-daemon");
+    config.batchWriterAddresses.push(address);
+    const resp = await request(app, "PUT", `/batches/${anchorId}`, { rootHash: "ab".repeat(32) }, headers);
+    expect(resp.status).toBe(200);
+  });
+
+  test("a signed write from an address not on the list is refused", async () => {
+    const app = makeApp();
+    const anchorId = "45".repeat(32);
+    const { address, headers } = await signedHeaders("//SomeOperator", anchorId);
+    bindAddress(address, sha256hex(`registered-${address}`), "operator");
+    const resp = await request(app, "PUT", `/batches/${anchorId}`, { rootHash: "ab".repeat(32) }, headers);
+    expect(resp.status).toBe(403);
+  });
+
+  test("an allowlisted address used as an API key is refused: an address is public", async () => {
+    const app = makeApp();
+    const anchorId = "46".repeat(32);
+    const { address } = await signedHeaders("//CertDaemon", anchorId);
+    // The faucet and legacy registration store sha256(address) as the key.
+    bindAddress(address, sha256hex(address), "faucet-attestor");
+    config.batchWriterAddresses.push(address);
+    const resp = await request(app, "PUT", `/batches/${anchorId}`, { rootHash: "ab".repeat(32) }, {
+      "x-api-key": address,
+    });
+    expect(resp.status).toBe(403);
+  });
+
+  test("a key named like the writer's key is refused: only the key's hash counts", async () => {
+    const app = makeApp();
+    currentQuotaDb
+      .prepare(`INSERT INTO api_keys (key_hash, name, enabled) VALUES (?, ?, 1)`)
+      .run(sha256hex("impostor-key"), "batches-route-test");
+    const resp = await request(app, "PUT", `/batches/${"47".repeat(32)}`, { rootHash: "ab".repeat(32) }, {
+      "x-api-key": "impostor-key",
+    });
+    expect(resp.status).toBe(403);
   });
 });
