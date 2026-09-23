@@ -110,14 +110,6 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
       res.status(400).json({ error: "Invalid manifest: expected JSON object" });
       return;
     }
-    if (nestingExceeds(manifest, MAX_MANIFEST_DEPTH)) {
-      res.status(400).json({ error: `Invalid manifest: nested deeper than ${MAX_MANIFEST_DEPTH} levels` });
-      return;
-    }
-    if (manifest.chunks !== undefined && manifest.chunks !== null && !Array.isArray(manifest.chunks)) {
-      res.status(400).json({ error: "Invalid manifest: chunks must be an array" });
-      return;
-    }
 
     const auth = await resolveAuth(req, contentHash);
     if (!auth.authenticated) {
@@ -129,6 +121,15 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
         return;
       }
       res.status(401).json({ error: auth.error ?? "authentication required" });
+      return;
+    }
+
+    if (nestingExceeds(manifest, MAX_MANIFEST_DEPTH)) {
+      res.status(400).json({ error: `Invalid manifest: nested deeper than ${MAX_MANIFEST_DEPTH} levels` });
+      return;
+    }
+    if (manifest.chunks !== undefined && manifest.chunks !== null && !Array.isArray(manifest.chunks)) {
+      res.status(400).json({ error: "Invalid manifest: chunks must be an array" });
       return;
     }
 

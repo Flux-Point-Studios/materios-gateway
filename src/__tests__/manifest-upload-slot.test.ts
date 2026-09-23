@@ -249,6 +249,12 @@ describe("manifest shape", () => {
     expect(existsSync(join(tmpStorage, "receipts", contentHash, "manifest.json"))).toBe(false);
   });
 
+  test("is only walked for depth after authentication", async () => {
+    let deep: unknown = 0;
+    for (let i = 0; i < 40; i++) deep = [deep];
+    expect(await postManifest(contentHashFor(0), {}, [], { deep })).toBe(401);
+  });
+
   test("with a non-array chunks field is refused", async () => {
     const contentHash = contentHashFor(0);
     expect(await postManifest(contentHash, { "x-api-key": API_KEY }, { 0: "x" })).toBe(400);
