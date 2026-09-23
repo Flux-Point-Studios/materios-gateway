@@ -7,8 +7,8 @@ import { createHash, timingSafeEqual } from "crypto";
 import { saveManifest, getManifest, saveChunk, getChunk, getStatus, markCertified, updateReceiptMeta } from "../storage.js";
 import { config } from "../config.js";
 import {
-  startUpload, recordChunkBytes, finalizeUpload,
-  startAccountUpload, recordAccountChunkBytes, finalizeAccountUpload,
+  startUpload, recordChunkBytes, finalizeUpload, chargeManifestBytes,
+  startAccountUpload, recordAccountChunkBytes, finalizeAccountUpload, chargeAccountManifestBytes,
   recordUsage,
 } from "../quota.js";
 import { resolveAuth } from "../auth.js";
@@ -19,6 +19,24 @@ import {
   stripHexPrefix as stripHexPrefixUtil,
 } from "../merkle.js";
 import { requireHexId } from "./id-param.js";
+
+
+/**
+ * A deeply nested body makes every later JSON.stringify of it quadratic, so the
+ * depth is bounded before any work is done. Iterative, so it cannot overflow.
+ */
+const MAX_MANIFEST_DEPTH = 32;
+
+function nestingExceeds(root: unknown, max: number): boolean {
+  const stack: Array<[unknown, number]> = [[root, 1]];
+  while (stack.length > 0) {
+    const [value, depth] = stack.pop()!;
+    if (value === null || typeof value !== "object") continue;
+    if (depth > max) return true;
+    for (const child of Object.values(value)) stack.push([child, depth + 1]);
+  }
+  return false;
+}
 
 export const blobsRouter = Router();
 blobsRouter.param("contentHash", requireHexId("contentHash"));
@@ -106,56 +124,17 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
       return;
     }
 
-    // Dispatch quota tracking by tier. Bearer/api-key tiers use per-operator
-    // keyed quotas if the account is a registered operator; otherwise (bearer
-    // tied to an unregistered account) we fall back to per-account quotas.
-    // Sig-only + registered-validator always use per-account quotas.
-    let uploaderAddress: string | undefined;
-    const useKeyedQuotas =
-      (auth.tier === "bearer" || auth.tier === "api-key" || auth.tier === "api-key-legacy-ss58") &&
-      auth.keyInfo !== undefined;
-
-    if (useKeyedQuotas && auth.keyInfo) {
-      const quotaCheck = startUpload(auth.keyInfo, contentHash);
-      if (!quotaCheck.allowed) {
-        res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
-        return;
-      }
-      // Phase 1 billing: count one receipt per admitted manifest POST.
-      // Bytes are attributed in the chunk leg. Not gated on saveManifest
-      // success — startUpload() already recorded the intent in the inflight
-      // table, and in practice saveManifest() failure is a disk error that
-      // the error handler converts to 500; we accept minor drift in the
-      // pathological crash-between-these-two-calls case.
-      try {
-        recordUsage(auth.keyInfo.keyHash, 0, 1);
-      } catch (err) {
-        console.warn(
-          `[blob-gateway] recordUsage(manifest) failed for ${auth.keyInfo.name}:`,
-          err,
-        );
-      }
-    } else {
-      // Account-based quota — covers sig-only, registered-validator, and
-      // Bearer tokens for operators not yet present in quota.db api_keys.
-      const accountId = auth.identity;
-      if (!accountId) {
-        res.status(401).json({ error: "resolved auth has no identity" });
-        return;
-      }
-      const quotaCheck = startAccountUpload(accountId, contentHash);
-      if (!quotaCheck.allowed) {
-        res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
-        return;
-      }
-      // Record uploader address only for actual sig-based uploads, mirroring
-      // previous behaviour (Bearer/api-key don't set uploaderAddress in meta).
-      if (auth.tier === "sig-only" || auth.tier === "registered-validator") {
-        uploaderAddress = accountId;
-      }
+    if (nestingExceeds(manifest, MAX_MANIFEST_DEPTH)) {
+      res.status(400).json({ error: `Invalid manifest: nested deeper than ${MAX_MANIFEST_DEPTH} levels` });
+      return;
+    }
+    if (manifest.chunks !== undefined && manifest.chunks !== null && !Array.isArray(manifest.chunks)) {
+      res.status(400).json({ error: "Invalid manifest: chunks must be an array" });
+      return;
     }
 
-    // Content limits validation
+    // Content limits are checked before a quota slot is taken, so a rejected
+    // manifest never holds one.
     const manifestBody = req.body as { chunks?: Array<{ size?: number; sha256?: string; index?: number }>; rootHash?: unknown };
     if (manifestBody.chunks) {
       if (manifestBody.chunks.length > config.maxChunksPerManifest) {
@@ -172,6 +151,62 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
           res.status(400).json({ error: `Chunk size ${chunk.size} exceeds limit ${config.maxChunkBytes}` });
           return;
         }
+      }
+    }
+
+    // Dispatch quota tracking by tier. Bearer/api-key tiers use per-operator
+    // keyed quotas if the account is a registered operator; otherwise (bearer
+    // tied to an unregistered account) we fall back to per-account quotas.
+    // Sig-only + registered-validator always use per-account quotas.
+    let uploaderAddress: string | undefined;
+    const useKeyedQuotas =
+      (auth.tier === "bearer" || auth.tier === "api-key" || auth.tier === "api-key-legacy-ss58") &&
+      auth.keyInfo !== undefined;
+
+    // A chunkless (self-rooted) manifest is complete on arrival: it takes no
+    // concurrency slot, and its stored bytes count against the daily byte quota.
+    const chunkless = !manifestBody.chunks?.length;
+    const manifestBytes = chunkless ? Buffer.byteLength(JSON.stringify(manifest)) : 0;
+
+    if (useKeyedQuotas && auth.keyInfo) {
+      const quotaCheck = chunkless
+        ? chargeManifestBytes(auth.keyInfo, manifestBytes)
+        : startUpload(auth.keyInfo, contentHash);
+      if (!quotaCheck.allowed) {
+        res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
+        return;
+      }
+      // Phase 1 billing: count one receipt per admitted manifest POST. Chunk
+      // bytes are metered in the chunk leg; a chunkless manifest's own bytes
+      // here. Not gated on saveManifest success: a failure there is a disk
+      // error the handler turns into a 500, and the drift is accepted.
+      try {
+        recordUsage(auth.keyInfo.keyHash, manifestBytes, 1);
+      } catch (err) {
+        console.warn(
+          `[blob-gateway] recordUsage(manifest) failed for ${auth.keyInfo.name}:`,
+          err,
+        );
+      }
+    } else {
+      // Account-based quota — covers sig-only, registered-validator, and
+      // Bearer tokens for operators not yet present in quota.db api_keys.
+      const accountId = auth.identity;
+      if (!accountId) {
+        res.status(401).json({ error: "resolved auth has no identity" });
+        return;
+      }
+      const quotaCheck = chunkless
+        ? chargeAccountManifestBytes(accountId, manifestBytes)
+        : startAccountUpload(accountId, contentHash);
+      if (!quotaCheck.allowed) {
+        res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
+        return;
+      }
+      // Record uploader address only for actual sig-based uploads, mirroring
+      // previous behaviour (Bearer/api-key don't set uploaderAddress in meta).
+      if (auth.tier === "sig-only" || auth.tier === "registered-validator") {
+        uploaderAddress = accountId;
       }
     }
 

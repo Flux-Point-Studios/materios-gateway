@@ -340,49 +340,62 @@ export function startUpload(keyInfo: KeyInfo, contentHash: string): QuotaCheckRe
   return txn();
 }
 
+/** Charges bytes to the key's daily byte quota. Call inside a transaction. */
+function chargeKeyDailyBytes(keyInfo: KeyInfo, bytes: number): QuotaCheckResult {
+  const d = today();
+  db.prepare(
+    "INSERT OR IGNORE INTO quota_daily (key_hash, day, receipts, bytes) VALUES (?, ?, 0, 0)",
+  ).run(keyInfo.keyHash, d);
+
+  const daily = db.prepare(
+    "SELECT bytes FROM quota_daily WHERE key_hash = ? AND day = ?",
+  ).get(keyInfo.keyHash, d) as { bytes: number };
+
+  if (daily.bytes + bytes > keyInfo.maxBytesPerDay) {
+    return {
+      allowed: false,
+      error: "Daily byte quota exceeded",
+      limit: keyInfo.maxBytesPerDay,
+      current: daily.bytes,
+    } as QuotaCheckResult;
+  }
+
+  db.prepare(
+    "UPDATE quota_daily SET bytes = bytes + ? WHERE key_hash = ? AND day = ?",
+  ).run(bytes, keyInfo.keyHash, d);
+  return { allowed: true, keyInfo } as QuotaCheckResult;
+}
+
 /**
  * Check and record chunk bytes (PUT chunk).
  * Returns 429 info if daily byte limit exceeded.
  */
 export function recordChunkBytes(keyInfo: KeyInfo, contentHash: string, chunkBytes: number): QuotaCheckResult {
-  const d = today();
   const txn = db.transaction(() => {
-    // Ensure daily row exists
-    db.prepare(
-      "INSERT OR IGNORE INTO quota_daily (key_hash, day, receipts, bytes) VALUES (?, ?, 0, 0)",
-    ).run(keyInfo.keyHash, d);
+    const charged = chargeKeyDailyBytes(keyInfo, chunkBytes);
+    if (!charged.allowed) return charged;
 
-    const daily = db.prepare(
-      "SELECT bytes FROM quota_daily WHERE key_hash = ? AND day = ?",
-    ).get(keyInfo.keyHash, d) as { bytes: number };
-
-    if (daily.bytes + chunkBytes > keyInfo.maxBytesPerDay) {
-      return {
-        allowed: false,
-        error: "Daily byte quota exceeded",
-        limit: keyInfo.maxBytesPerDay,
-        current: daily.bytes,
-      } as QuotaCheckResult;
-    }
-
-    db.prepare(
-      "UPDATE quota_daily SET bytes = bytes + ? WHERE key_hash = ? AND day = ?",
-    ).run(chunkBytes, keyInfo.keyHash, d);
-
-    // Update inflight tracking
     db.prepare(
       "UPDATE uploads_inflight SET bytes = bytes + ?, started_at = ? WHERE upload_id = ? AND key_hash = ?",
     ).run(chunkBytes, new Date().toISOString(), contentHash, keyInfo.keyHash);
 
-    return { allowed: true, keyInfo } as QuotaCheckResult;
+    return charged;
   });
 
   return txn();
 }
 
 /**
- * Finalize upload (all chunks uploaded). Increments daily receipt count.
- * Returns 429 info if daily receipt limit exceeded.
+ * Charge a chunkless manifest's stored bytes. It never touches the inflight
+ * table: a chunked upload of the same hash keeps its slot.
+ */
+export function chargeManifestBytes(keyInfo: KeyInfo, bytes: number): QuotaCheckResult {
+  return db.transaction(() => chargeKeyDailyBytes(keyInfo, bytes))();
+}
+
+/**
+ * Finalize upload (all chunks uploaded): frees the concurrency slot, then
+ * counts the receipt. Returns 429 info if the daily receipt limit is reached.
  */
 /**
  * Look up a validator by SS58 address in the registry.
@@ -605,6 +618,10 @@ export function finalizeUpload(keyInfo: KeyInfo, contentHash: string): QuotaChec
       "INSERT OR IGNORE INTO quota_daily (key_hash, day, receipts, bytes) VALUES (?, ?, 0, 0)",
     ).run(keyInfo.keyHash, d);
 
+    db.prepare(
+      "UPDATE uploads_inflight SET status = 'complete' WHERE upload_id = ? AND key_hash = ?",
+    ).run(contentHash, keyInfo.keyHash);
+
     const daily = db.prepare(
       "SELECT receipts FROM quota_daily WHERE key_hash = ? AND day = ?",
     ).get(keyInfo.keyHash, d) as { receipts: number };
@@ -621,10 +638,6 @@ export function finalizeUpload(keyInfo: KeyInfo, contentHash: string): QuotaChec
     db.prepare(
       "UPDATE quota_daily SET receipts = receipts + 1 WHERE key_hash = ? AND day = ?",
     ).run(keyInfo.keyHash, d);
-
-    db.prepare(
-      "UPDATE uploads_inflight SET status = 'complete' WHERE upload_id = ? AND key_hash = ?",
-    ).run(contentHash, keyInfo.keyHash);
 
     return { allowed: true, keyInfo } as QuotaCheckResult;
   });
@@ -673,41 +686,56 @@ export function startAccountUpload(address: string, contentHash: string): QuotaC
   return txn();
 }
 
+/** Charges bytes to the account's daily byte quota. Call inside a transaction. */
+function chargeAccountDailyBytes(address: string, bytes: number): QuotaCheckResult {
+  const d = today();
+  db.prepare(
+    "INSERT OR IGNORE INTO account_quotas_daily (address, day, receipts, bytes) VALUES (?, ?, 0, 0)",
+  ).run(address, d);
+
+  const daily = db.prepare(
+    "SELECT bytes FROM account_quotas_daily WHERE address = ? AND day = ?",
+  ).get(address, d) as { bytes: number };
+
+  if (daily.bytes + bytes > config.sigOnlyMaxBytesPerDay) {
+    return {
+      allowed: false,
+      error: "Daily byte quota exceeded",
+      limit: config.sigOnlyMaxBytesPerDay,
+      current: daily.bytes,
+    } as QuotaCheckResult;
+  }
+
+  db.prepare(
+    "UPDATE account_quotas_daily SET bytes = bytes + ? WHERE address = ? AND day = ?",
+  ).run(bytes, address, d);
+  return { allowed: true } as QuotaCheckResult;
+}
+
 /**
  * Record chunk bytes for sig-only uploader.
  */
 export function recordAccountChunkBytes(address: string, contentHash: string, chunkBytes: number): QuotaCheckResult {
-  const d = today();
   const txn = db.transaction(() => {
-    db.prepare(
-      "INSERT OR IGNORE INTO account_quotas_daily (address, day, receipts, bytes) VALUES (?, ?, 0, 0)",
-    ).run(address, d);
-
-    const daily = db.prepare(
-      "SELECT bytes FROM account_quotas_daily WHERE address = ? AND day = ?",
-    ).get(address, d) as { bytes: number };
-
-    if (daily.bytes + chunkBytes > config.sigOnlyMaxBytesPerDay) {
-      return {
-        allowed: false,
-        error: "Daily byte quota exceeded",
-        limit: config.sigOnlyMaxBytesPerDay,
-        current: daily.bytes,
-      } as QuotaCheckResult;
-    }
-
-    db.prepare(
-      "UPDATE account_quotas_daily SET bytes = bytes + ? WHERE address = ? AND day = ?",
-    ).run(chunkBytes, address, d);
+    const charged = chargeAccountDailyBytes(address, chunkBytes);
+    if (!charged.allowed) return charged;
 
     db.prepare(
       "UPDATE account_uploads_inflight SET bytes = bytes + ?, started_at = ? WHERE upload_id = ? AND address = ?",
     ).run(chunkBytes, new Date().toISOString(), contentHash, address);
 
-    return { allowed: true } as QuotaCheckResult;
+    return charged;
   });
 
   return txn();
+}
+
+/**
+ * Charge a sig-only account for a chunkless manifest's stored bytes. It never
+ * touches the inflight table: a chunked upload of the same hash keeps its slot.
+ */
+export function chargeAccountManifestBytes(address: string, bytes: number): QuotaCheckResult {
+  return db.transaction(() => chargeAccountDailyBytes(address, bytes))();
 }
 
 // ---------------------------------------------------------------------------
@@ -831,7 +859,8 @@ export function getDailyUsage(
 }
 
 /**
- * Finalize upload for sig-only uploader. Increments daily receipt count.
+ * Finalize upload for sig-only uploader: frees the concurrency slot, then
+ * counts the receipt unless the daily cap is already reached.
  */
 export function finalizeAccountUpload(address: string, contentHash: string): QuotaCheckResult {
   const d = today();
@@ -839,6 +868,10 @@ export function finalizeAccountUpload(address: string, contentHash: string): Quo
     db.prepare(
       "INSERT OR IGNORE INTO account_quotas_daily (address, day, receipts, bytes) VALUES (?, ?, 0, 0)",
     ).run(address, d);
+
+    db.prepare(
+      "UPDATE account_uploads_inflight SET status = 'complete' WHERE upload_id = ? AND address = ?",
+    ).run(contentHash, address);
 
     const daily = db.prepare(
       "SELECT receipts FROM account_quotas_daily WHERE address = ? AND day = ?",
@@ -856,10 +889,6 @@ export function finalizeAccountUpload(address: string, contentHash: string): Quo
     db.prepare(
       "UPDATE account_quotas_daily SET receipts = receipts + 1 WHERE address = ? AND day = ?",
     ).run(address, d);
-
-    db.prepare(
-      "UPDATE account_uploads_inflight SET status = 'complete' WHERE upload_id = ? AND address = ?",
-    ).run(contentHash, address);
 
     return { allowed: true } as QuotaCheckResult;
   });
