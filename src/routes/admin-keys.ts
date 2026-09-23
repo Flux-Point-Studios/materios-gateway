@@ -22,7 +22,7 @@
  */
 
 import type { Express, Request, Response } from "express";
-import { checkAddress } from "@polkadot/util-crypto";
+import { checkAccountAddress } from "../ss58.js";
 import { config } from "../config.js";
 import {
   bindValidatorAura,
@@ -33,8 +33,8 @@ import { adminGuard } from "../bearer-auth.js";
 
 /**
  * Materios uses substrate prefix 42 (the generic substrate prefix), but
- * @polkadot/util-crypto's `checkAddress(addr, prefix)` rejects with
- * "Prefix mismatch" if you pass anything that doesn't equal `prefix`. The
+ * `checkAccountAddress` rejects any address whose prefix is not the one it is
+ * given. The
  * explorer reverse-decodes by raw public key anyway, so we accept any
  * valid SS58 by trying a small allow-list of substrate prefixes. Adding
  * a new chain just means adding its prefix here.
@@ -52,8 +52,7 @@ function isValidSs58(addr: unknown): addr is string {
   if (typeof addr !== "string" || addr.length === 0) return false;
   for (const prefix of ALLOWED_SS58_PREFIXES) {
     try {
-      const [ok] = checkAddress(addr, prefix);
-      if (ok) return true;
+      if (checkAccountAddress(addr, prefix)) return true;
     } catch {
       // try next prefix
     }
@@ -118,7 +117,7 @@ export function registerAdminKeysRoutes(
 
   /* ------------------------------------------------------------------------
    * POST /admin/api-keys/:keyHash/binding   { validatorAura }
-   * Sets bound_validator_aura. Validates SS58 shape via checkAddress(any).
+   * Sets bound_validator_aura. Validates SS58 shape via checkAccountAddress.
    * Idempotent (re-setting the same value is a no-op for the explorer).
    * ---------------------------------------------------------------------- */
   app.post("/admin/api-keys/:keyHash/binding", guard, (req: Request, res: Response) => {
