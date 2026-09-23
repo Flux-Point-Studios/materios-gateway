@@ -158,6 +158,13 @@ async function start(): Promise<void> {
 
   // Trace lineage finds a receipt's anchor through its checkpoint leaf; index
   // the leaves of batches stored before the index existed.
+  if (config.batchWriterAddresses.length === 0 && config.batchWriterKeyHashes.length === 0) {
+    console.warn(
+      "[blob-gateway] No batch writers configured (BATCH_WRITER_ADDRESSES, BATCH_WRITER_KEY_HASHES): " +
+        "every batch write will be refused and trace lineage will gain no new L1 anchors",
+    );
+  }
+
   const indexed = await indexExistingBatches();
   console.log(
     `[blob-gateway] Leaf index: ${indexed.leaves} leaves across ${indexed.batches} batches` +
