@@ -159,7 +159,10 @@ async function start(): Promise<void> {
   // Trace lineage finds a receipt's anchor through its checkpoint leaf; index
   // the leaves of batches stored before the index existed.
   const indexed = await indexExistingBatches();
-  console.log(`[blob-gateway] Leaf index: ${indexed.leaves} leaves across ${indexed.batches} batches`);
+  console.log(
+    `[blob-gateway] Leaf index: ${indexed.leaves} leaves across ${indexed.batches} batches` +
+      (indexed.skipped ? `, ${indexed.skipped} unreadable batch file(s) skipped` : ""),
+  );
 
   // Initialize SQLite databases
   initQuotaDb();

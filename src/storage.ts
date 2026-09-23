@@ -65,6 +65,7 @@ function leafIndexDir(): string {
 }
 
 const LEAF_RE = /^[0-9a-f]{64}$/;
+const BATCH_FILE_RE = /^[0-9a-fA-F]{64}\.json$/;
 
 /**
  * Save manifest.json for a content hash.
@@ -252,51 +253,93 @@ async function indexBatchLeaves(anchorId: string, metadata: object): Promise<num
   if (!Array.isArray(leaves)) return 0;
   const dir = leafIndexDir();
   await ensureDir(dir);
+  const anchored = hasCardanoTx(metadata);
   let indexed = 0;
   for (const leaf of leaves) {
     const clean = typeof leaf === "string" ? stripHexPrefix(leaf).toLowerCase() : "";
     if (!LEAF_RE.test(clean)) continue;
-    await writeFile(join(dir, clean), stripHexPrefix(anchorId).toLowerCase());
+    const entry = join(dir, clean);
+    // A receipt re-checkpointed after a failed flush sits in two batches; keep
+    // the mapping that already reaches Cardano.
+    if (!anchored && (await indexedBatchIsAnchored(entry))) continue;
+    await writeFile(entry, stripHexPrefix(anchorId));
     indexed++;
   }
   return indexed;
+}
+
+function hasCardanoTx(record: object | null): boolean {
+  const tx = (record as { cardanoTxHash?: unknown } | null)?.cardanoTxHash;
+  return typeof tx === "string" && tx.length > 0;
+}
+
+async function indexedBatchIsAnchored(entry: string): Promise<boolean> {
+  let current: string;
+  try {
+    current = (await readFile(entry, "utf-8")).trim();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+  return hasCardanoTx(await getBatch(current));
 }
 
 /**
  * Index the leaves of every stored batch. Idempotent; run at startup so
  * batches written before the index existed are reachable.
  */
-export async function indexExistingBatches(): Promise<{ batches: number; leaves: number }> {
+export async function indexExistingBatches(): Promise<{
+  batches: number;
+  leaves: number;
+  skipped: number;
+}> {
   let files: string[];
   try {
     files = await readdir(batchesDir());
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { batches: 0, leaves: 0 };
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { batches: 0, leaves: 0, skipped: 0 };
     throw err;
   }
   let batches = 0;
   let leaves = 0;
+  let skipped = 0;
   for (const file of files) {
-    if (!file.endsWith(".json")) continue;
-    const record = JSON.parse(await readFile(join(batchesDir(), file), "utf-8")) as object;
+    if (!BATCH_FILE_RE.test(file)) continue;
+    let record: object;
+    try {
+      record = JSON.parse(await readFile(join(batchesDir(), file), "utf-8")) as object;
+    } catch (err) {
+      // One corrupt record must not keep the gateway from booting.
+      console.error(`[storage] leaf index: skipped ${file}: ${err instanceof Error ? err.message : err}`);
+      skipped++;
+      continue;
+    }
     leaves += await indexBatchLeaves(file.slice(0, -".json".length), record);
     batches++;
   }
-  return { batches, leaves };
+  return { batches, leaves, skipped };
 }
 
 /**
  * The batch whose checkpoint leaves include this leaf, or null.
  */
 export async function getBatchByLeaf(leafHash: string): Promise<object | null> {
+  const leaf = stripHexPrefix(leafHash).toLowerCase();
   let anchorId: string;
   try {
-    anchorId = (await readFile(join(leafIndexDir(), stripHexPrefix(leafHash).toLowerCase()), "utf-8")).trim();
+    anchorId = (await readFile(join(leafIndexDir(), leaf), "utf-8")).trim();
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
   }
-  return getBatch(anchorId);
+  const batch = await getBatch(anchorId);
+  // A batch record can be rewritten after it was indexed; only trust it while
+  // it still lists this leaf.
+  const leaves = (batch as { leafHashes?: unknown } | null)?.leafHashes;
+  const listed =
+    Array.isArray(leaves) &&
+    leaves.some((l) => typeof l === "string" && stripHexPrefix(l).toLowerCase() === leaf);
+  return listed ? batch : null;
 }
 
 /**

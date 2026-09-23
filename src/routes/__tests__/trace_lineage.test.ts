@@ -458,9 +458,56 @@ describe("GET /trace/api/lineage/:contentHash", () => {
     const before = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
     expect(findNode(before, "l1")).toBeUndefined();
 
-    expect(await indexExistingBatches()).toEqual({ batches: 1, leaves: 1 });
+    expect(await indexExistingBatches()).toEqual({ batches: 1, leaves: 1, skipped: 0 });
     const after = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
     expect(findNode(after, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
+  });
+
+  test("a leaf in two batches resolves to the one anchored on Cardano, whichever is saved last", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    const reflush = "0x" + "d3".repeat(32);
+    const { cardanoTxHash: _tx, cardanoNetwork: _net, ...unanchored } = batchFor(reflush, [PROD.leaf]);
+    await saveBatch(reflush, unanchored);
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(body, "batch")?.hashes.anchorId).toBe(PROD.anchorId);
+    expect(findNode(body, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
+  });
+
+  test("unreadable batch files are skipped when rebuilding the index, not fatal", async () => {
+    mkdirSync(join(tmpDir, "batches", `${"e2".repeat(32)}.json`), { recursive: true });
+    writeFileSync(join(tmpDir, "batches", `${"e1".repeat(32)}.json`), "{not json");
+    writeFileSync(join(tmpDir, "batches", "notes.json"), "{}");
+    writeFileSync(
+      join(tmpDir, "batches", `${PROD.anchorId.slice(2)}.json`),
+      JSON.stringify(batchFor(PROD.anchorId, [PROD.leaf])),
+    );
+    expect(await indexExistingBatches()).toEqual({ batches: 1, leaves: 1, skipped: 2 });
+  });
+
+  test("an index entry whose batch no longer lists the leaf is not trusted", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    writeFileSync(
+      join(tmpDir, "batches", `${PROD.anchorId.slice(2)}.json`),
+      JSON.stringify(batchFor(PROD.anchorId, ["ab".repeat(32)])),
+    );
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(body, "l1")).toBeUndefined();
+  });
+
+  test("an anchorId stored with upper-case hex still resolves", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    const upper = "0x" + PROD.anchorId.slice(2).toUpperCase();
+    await saveBatch(upper, batchFor(upper, [PROD.leaf]));
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(body, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
   });
 
   test("a batch that does not contain the receipt's leaf is not claimed as its anchor", async () => {
