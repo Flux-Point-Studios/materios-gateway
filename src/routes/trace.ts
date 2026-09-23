@@ -607,7 +607,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
       meta: {
         minAttestationThreshold: threshold,
         finalized: false,
-        note: "Receipt certified. L1 anchor pending — anchor-worker rolls up certs every ~5 minutes.",
+        note: "Receipt certified. L1 anchor pending — certified receipts are checkpointed to Cardano about once an hour.",
       },
     };
   }
@@ -1084,7 +1084,7 @@ function renderAnchorCard(rootHash: string | null, anchor: AnchorInfo): string {
   </div>
   <div class="small">No Cardano anchor record found yet for ${
     rootHash ? `root <span class="val mono">${escapeHtml(rootHash)}</span>` : "this trace"
-  }. The Materios → Cardano anchor batch rolls up multiple certified receipts and posts a single L1 transaction every ~5 minutes.</div>
+  }. The Materios → Cardano anchor batch rolls up multiple certified receipts and posts a single L1 transaction about once an hour.</div>
 </div>`;
   }
   const explorer = cexplorerTxUrl(anchor.cardanoTxHash, anchor.cardanoNetwork);
