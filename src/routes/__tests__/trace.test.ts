@@ -25,6 +25,7 @@ import { join } from "path";
 import { config } from "../../config.js";
 import { saveManifest, saveBatch } from "../../storage.js";
 import { traceRouter, __test__setFetchImpl, __test__resetFetchImpl } from "../trace.js";
+import { koiosResponder } from "../../__tests__/fixtures/l1_anchor.js";
 
 interface RpcResponse {
   result?: unknown;
@@ -76,8 +77,14 @@ async function get(
 }
 
 /** Build an installed JSON-RPC mock that answers `orinq_*` calls. */
-function buildRpcFetch(answers: Record<string, RpcResponse>): FakeFetch {
+function buildRpcFetch(
+  answers: Record<string, RpcResponse>,
+  koios: Parameters<typeof koiosResponder>[0] = {},
+): FakeFetch {
+  const cardano = koiosResponder(koios);
   return async (url, init) => {
+    const fromKoios = await cardano(url, init);
+    if (fromKoios) return fromKoios;
     if (init && init.method === "POST" && typeof init.body === "string") {
       const body = JSON.parse(init.body) as { method: string };
       const ans = answers[body.method] ?? { result: null };
@@ -277,7 +284,7 @@ describe("GET /trace/:contentHash", () => {
             total_reward_base: "3000000",
           },
         },
-      }),
+      }, { txInfo: { [cardanoTx]: { status: 503 } } }),
     );
 
     const app = makeApp();
@@ -306,10 +313,13 @@ describe("GET /trace/:contentHash", () => {
     // M-of-N threshold rendered (e.g. "3 / N").
     expect(html).toMatch(/3\s*\/\s*\d+/);
 
-    // Anchor card: Cardano tx hash + cexplorer link + label + network.
+    // Anchor card: the recorded Cardano tx + cexplorer link + network, marked
+    // unverified while Cardano cannot be asked; the record's own label and
+    // block height are not shown as facts.
     expect(html).toContain(cardanoTx);
     expect(html).toContain("preprod.cexplorer.io/tx/" + cardanoTx);
-    expect(html).toContain("2222");
+    expect(html).toContain("UNVERIFIED");
+    expect(html).not.toContain("12345678");
     expect(html).toContain("preprod");
 
     // Event timeline: at least one entry referencing the cert.

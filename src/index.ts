@@ -170,6 +170,13 @@ async function start(): Promise<void> {
     );
   }
 
+  if (config.cardanoAnchorWallets.length === 0) {
+    console.warn(
+      "[blob-gateway] No Cardano anchor wallets configured (CARDANO_ANCHOR_WALLETS): " +
+        "trace lineage will show every L1 anchor as unverified",
+    );
+  }
+
   const indexed = await indexExistingBatches();
   console.log(
     `[blob-gateway] Leaf index: ${indexed.leaves} leaves across ${indexed.batches} batches` +

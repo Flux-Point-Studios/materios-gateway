@@ -15,6 +15,11 @@ export const config = {
   // comma-separated; empty lists refuse every write.
   batchWriterAddresses: csv(process.env.BATCH_WRITER_ADDRESSES),
   batchWriterKeyHashes: csv(process.env.BATCH_WRITER_KEY_HASHES).map((h) => h.toLowerCase()),
+  // Bech32 addresses of the wallets that fund the anchor workers' label-8746
+  // txs. Anyone can post label-8746 metadata naming our root, so trace lineage
+  // counts a Cardano anchor only when every input of its tx spends from one of
+  // these. Empty leaves every anchor unverified.
+  cardanoAnchorWallets: csv(process.env.CARDANO_ANCHOR_WALLETS),
   apiKey: process.env.BLOB_GATEWAY_API_KEY || "",
   maxChunkSize: parseInt(process.env.MAX_CHUNK_SIZE || String(64 * 1024 * 1024)),
   gatewayBaseUrl: process.env.GATEWAY_BASE_URL || "http://materios-blob-gateway.materios.svc.cluster.local:3000",
