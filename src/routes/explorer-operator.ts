@@ -17,7 +17,7 @@
  */
 
 import { Router, type Request, type Response } from "express";
-import { decodeAddress } from "@polkadot/util-crypto";
+import { decodeAccountId } from "../ss58.js";
 import { u8aToHex } from "@polkadot/util";
 import spoPoolsData from "../data/spo-pools.json" with { type: "json" };
 import { createExplorerApiFactory, type ExplorerApiFactory } from "./explorer-rpc.js";
@@ -127,7 +127,7 @@ const SS58_RE = /^[1-9A-HJ-NP-Za-km-z]{40,60}$/;
 
 function ss58ToAuraHex(ss58: string): string | null {
   try {
-    const bytes = decodeAddress(ss58);
+    const bytes = decodeAccountId(ss58);
     return u8aToHex(bytes).toLowerCase();
   } catch {
     return null;

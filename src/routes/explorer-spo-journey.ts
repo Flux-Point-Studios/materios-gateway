@@ -27,7 +27,8 @@
  */
 
 import { Router, type Request, type Response } from "express";
-import { decodeAddress, encodeAddress } from "@polkadot/util-crypto";
+import { encodeAddress } from "@polkadot/util-crypto";
+import { decodeAccountId } from "../ss58.js";
 import { hexToU8a, u8aToHex } from "@polkadot/util";
 import pg from "pg";
 import operatorsData from "../data/operators.json" with { type: "json" };
@@ -220,7 +221,7 @@ function parseKey(key: string): ParsedKey | null {
   }
   if (SS58_RE.test(key)) {
     try {
-      const bytes = decodeAddress(key);
+      const bytes = decodeAccountId(key);
       if (bytes.length !== 32) return null;
       return { auraPubkey: u8aToHex(bytes).toLowerCase(), sidechainPubkey: null };
     } catch {
