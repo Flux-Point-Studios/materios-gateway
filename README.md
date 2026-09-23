@@ -68,7 +68,6 @@ Four-tier auth model resolved by `resolveAuth()` in `src/auth.ts`:
 | **bearer** | `Authorization: Bearer matra_<token>` (preferred, revocable, hashed) | Same as api-key |
 | **sig-only** | sr25519 signature + funded on-chain account | 10 receipts/day, 256 MB/day, 3 concurrent |
 | **api-key** | `x-api-key` header (legacy random-hex key) | Per-key (default 100/day, 1 GB/day, 5 concurrent) |
-| **api-key-legacy-ss58** | `x-api-key` header containing the operator's SS58 address (**deprecated**; each call is warn-logged) | Per-key quotas |
 | **registered-validator** | Signature + committee registry membership | API-key-level quotas |
 
 ### Bearer Tokens (Preferred)
@@ -124,24 +123,19 @@ your own fetch call that sends `Authorization: Bearer ...`.
 3. Restart the client, confirm it works.
 4. Revoke the old token: `curl -X DELETE .../auth/token/<old-hash> -H "x-admin-token: ..."`.
 
-### Legacy SS58-as-API-key (Deprecated)
+### An address is not an API key
 
-Historically operators sent their SS58 address as the API key (`x-api-key: <ss58>`).
-This is still accepted for backwards compatibility but:
+An account address is public, so `x-api-key: <address>` authenticates nothing.
+When the request also carries upload-signature headers the address is ignored
+and the signature decides; otherwise the request is refused with 401. On
+`POST /heartbeats` the address is ignored and the heartbeat signature decides.
 
-- Every such call emits a structured warn log — grep for `deprecated-ss58-auth`
-  in blob-gateway logs to track clients that haven't migrated.
-- The secret is an operator's public on-chain identity — anyone watching the
-  explorer can guess it. It will be removed in a future PR after all clients
-  have migrated.
-
-Sample migration-tracking grep:
-
-```bash
-docker logs materios-node-blob-gateway-preprod-1 2>&1 \
-  | grep deprecated-ss58-auth \
-  | awk '{print $4}' | sort | uniq -c | sort -rn
-```
+The faucet registers an operator without issuing a key: its registry rows carry
+a random `key_hash` that no key hashes to, and the operator authenticates by
+signing. At startup the gateway replaces any `key_hash` equal to
+`sha256(validator_id)` in `quota.db:api_keys`, and any `api_key_hash` equal to
+`sha256(ss58_address)` in `operators.db:registrations`, with a random value,
+and logs each row it changed.
 
 ### Upload Signing Protocol
 
@@ -169,7 +163,7 @@ Clock skew tolerance: 120 seconds (configurable via `UPLOAD_SIG_MAX_AGE_SEC`).
 
 Some clients can upload blobs but cannot sign the on-chain `orinqReceipts.submitReceipt` extrinsic — e.g. OpenHome community abilities, whose Python sandbox has no sr25519 primitives. Without a receipt the blob is an orphan the cert-daemon never sees, and it gets reaped after `RECEIPT_GRACE_HOURS`.
 
-When `SPONSORED_RECEIPT_SUBMITTER_URL` is configured, the gateway fires a fire-and-forget POST to that URL the moment a sponsored-tier upload (Bearer, api-key, or api-key-legacy-ss58) completes. Contract:
+When `SPONSORED_RECEIPT_SUBMITTER_URL` is configured, the gateway fires a fire-and-forget POST to that URL the moment a sponsored-tier upload (Bearer or api-key) completes. Contract:
 
 ```
 POST <SPONSORED_RECEIPT_SUBMITTER_URL>
@@ -180,7 +174,7 @@ Body:
   {
     "contentHash":  "<64 hex, no 0x>",
     "operator":     "<SS58 the upload was authed against>",
-    "authTier":     "bearer" | "api-key" | "api-key-legacy-ss58",
+    "authTier":     "bearer" | "api-key",
     "rootHash":     "<optional 64 hex from the manifest>",
     "manifestHash": "<sha256 of the canonical manifest JSON>",
     "source":       "blob-gateway"

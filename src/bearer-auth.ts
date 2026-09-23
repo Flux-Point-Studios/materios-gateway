@@ -5,23 +5,22 @@
  *   1. Authorization: Bearer matra_<token>     (new, preferred)
  *   2. x-api-key: <random-hex>                 (legacy per-operator key
  *                                              minted at registration time)
- *   3. x-api-key: <ss58-address>               (legacy "SS58-as-API-key"
- *                                              — deprecated, warn-logged,
- *                                              will be removed once all
- *                                              clients migrate)
+ *
+ * An account address in x-api-key is refused: it is public.
  *
  * On success, sets the following request properties for downstream handlers:
  *   - req.account  — SS58 address (whichever auth path resolved)
- *   - req.authTier — "bearer" | "api-key" | "api-key-legacy-ss58"
- *   - req.keyInfo  — KeyInfo from quota.ts if path 2/3
+ *   - req.authTier — "bearer" | "api-key"
+ *   - req.keyInfo  — KeyInfo from quota.ts if path 2
  */
 
 import { timingSafeEqual } from "node:crypto";
 import type { Request, Response, NextFunction, RequestHandler } from "express";
 import { verifyToken, getApiTokensDb, TOKEN_PREFIX } from "./api-tokens.js";
 import { resolveKey, type KeyInfo } from "./quota.js";
+import { isAccountAddress } from "./ss58.js";
 
-export type AuthTier = "bearer" | "api-key" | "api-key-legacy-ss58";
+export type AuthTier = "bearer" | "api-key";
 
 export interface AuthedRequest extends Request {
   account?: string;
@@ -33,9 +32,6 @@ export interface BearerAuthOptions {
   /** If false, middleware passes through even when no auth is found. Default true. */
   required?: boolean;
 }
-
-/** Quick-and-dirty SS58 shape check — matches the one in routes/operators.ts */
-const SS58_SHAPE = /^[15][a-zA-Z0-9]{45,47}$/;
 
 export function bearerAuth(opts: BearerAuthOptions = {}): RequestHandler {
   const required = opts.required !== false;
@@ -66,31 +62,17 @@ export function bearerAuth(opts: BearerAuthOptions = {}): RequestHandler {
       return;
     }
 
-    // Path 2 & 3: x-api-key
+    // Path 2: x-api-key
     const apiKey = req.headers["x-api-key"] as string | undefined;
     if (typeof apiKey === "string" && apiKey.length > 0) {
+      if (isAccountAddress(apiKey)) {
+        res.status(401).json({
+          error: "x-api-key holds an account address, which is public and authenticates nothing: use a Bearer token",
+        });
+        return;
+      }
       const keyInfo = resolveKey(apiKey);
       if (keyInfo) {
-        // Determine if this was the legacy "SS58-as-API-key" path: the header
-        // value itself is an SS58 address AND the key row is bound to that
-        // same address via validator_id. That's the pattern we want to track
-        // so we know when all clients have moved off.
-        const isLegacySs58 = SS58_SHAPE.test(apiKey) && keyInfo.validatorId === apiKey;
-        if (isLegacySs58) {
-          // Structured warn-log for easy grep / log-scan:
-          //   deprecated-ss58-auth account=<ss58> route=<path>
-          // Fields are space-separated so `| grep deprecated-ss58-auth` gives
-          // a clean migration tracker.
-          console.warn(
-            `[blob-gateway] deprecated-ss58-auth account=${apiKey} route=${req.path} method=${req.method}`,
-          );
-          r.account = keyInfo.validatorId ?? apiKey;
-          r.authTier = "api-key-legacy-ss58";
-          r.keyInfo = keyInfo;
-          next();
-          return;
-        }
-        // Regular API key path (random hex, bound to operator SS58 via validator_id)
         r.account = keyInfo.validatorId ?? keyInfo.name;
         r.authTier = "api-key";
         r.keyInfo = keyInfo;

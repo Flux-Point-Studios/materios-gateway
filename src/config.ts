@@ -61,7 +61,7 @@ export const config = {
   // receipt the blob is an orphan the cert-daemon never touches.
   //
   // When this URL is set, on a COMPLETE upload whose auth tier is
-  // sponsored (bearer | api-key | api-key-legacy-ss58), the gateway
+  // sponsored (bearer | api-key), the gateway
   // fires a fire-and-forget POST to the submitter with
   //   { contentHash, operator, rootHash, manifestHash, source: "blob-gateway" }
   // and the submitter is expected to build + sign + send the receipt

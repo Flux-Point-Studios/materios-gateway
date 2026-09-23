@@ -19,6 +19,7 @@ import { stringToU8a } from "@polkadot/util";
 import { lookupValidatorInfo, listAllAuraBindings } from "../quota.js";
 import { isActiveChainValidator } from "../chain-validators.js";
 import { resolveAuth } from "../auth.js";
+import { isAccountAddress } from "../ss58.js";
 import {
   upsertHeartbeat,
   getLastSeq,
@@ -177,17 +178,17 @@ heartbeatsRouter.post("/heartbeats", async (req: Request, res: Response) => {
     // heartbeats use `x-heartbeat-sig` with a completely different signing
     // payload, which we handle as a parallel fallback below.
     //
-    // If neither a Bearer nor an x-api-key header is present, resolveAuth
-    // returns `authenticated: false` with error "No authentication
-    // provided" — that's our signal to fall through to the sig path.
     // An INVALID api-key or Bearer short-circuits with 401 here so the
-    // cert-daemon's `401 Invalid or disabled API key` contract survives.
+    // cert-daemon's `401 Invalid or disabled API key` contract survives. An
+    // address in x-api-key is public, so it is ignored and the heartbeat
+    // signature, which every heartbeat carries, decides.
+    const apiKey = req.headers["x-api-key"];
     const hasAccountAuthHeader =
       typeof req.headers.authorization === "string" ||
-      typeof req.headers["x-api-key"] === "string";
+      (typeof apiKey === "string" && !isAccountAddress(apiKey));
 
     let label: string | undefined;
-    let authTier: "bearer" | "api-key" | "api-key-legacy-ss58" | "sig-only" | undefined;
+    let authTier: "bearer" | "api-key" | "sig-only" | undefined;
 
     if (hasAccountAuthHeader) {
       const auth = await resolveAuth(req);
@@ -198,7 +199,7 @@ heartbeatsRouter.post("/heartbeats", async (req: Request, res: Response) => {
         return;
       }
 
-      // Bearer / api-key / api-key-legacy-ss58 tiers carry an identity.
+      // Bearer / api-key tiers carry an identity.
       // Enforce the validator_id binding: if the auth maps to a specific
       // SS58 (either via keyInfo.validatorId or the bearer's accountSs58),
       // the body's validator_id must match. Same 403 as the old code.

@@ -12,6 +12,7 @@ import type { Request } from "express";
 import { resolveKey, resolveKeyByAccount, lookupUploadEligibleValidator, type KeyInfo } from "./quota.js";
 import { verifyUploadSig } from "./upload-auth.js";
 import { checkFunded } from "./rpc-client.js";
+import { isAccountAddress } from "./ss58.js";
 import {
   getApiTokensDb,
   verifyToken,
@@ -22,7 +23,6 @@ export type AuthTier =
   | "bearer"
   | "sig-only"
   | "api-key"
-  | "api-key-legacy-ss58"
   | "registered-validator";
 
 export interface AuthResult {
@@ -33,8 +33,9 @@ export interface AuthResult {
   error?: string;
 }
 
-/** SS58 address shape check — mirrors the one in routes/operators.ts. */
-const SS58_SHAPE = /^[15][a-zA-Z0-9]{45,47}$/;
+const ADDRESS_AS_KEY_ERROR =
+  "x-api-key holds an account address, which is public and authenticates nothing: " +
+  "sign the request (x-upload-sig, x-uploader-address, x-upload-ts) or use a Bearer token";
 
 /**
  * Resolve auth for any request.
@@ -78,27 +79,16 @@ export async function resolveAuth(req: Request, contentHash?: string): Promise<A
     }
   }
 
-  // Priority 1: API key (highest trust, backwards compatible)
+  // Priority 1: API key (highest trust, backwards compatible). An address in
+  // this header is ignored when the request is signed, refused otherwise.
   const apiKey = req.headers["x-api-key"] as string | undefined;
-  if (apiKey) {
+  if (apiKey && isAccountAddress(apiKey)) {
+    if (!contentHash || !req.headers["x-upload-sig"]) {
+      return { authenticated: false, error: ADDRESS_AS_KEY_ERROR };
+    }
+  } else if (apiKey) {
     const keyInfo = resolveKey(apiKey);
     if (!keyInfo) return { authenticated: false, error: "Invalid or disabled API key" };
-
-    // Emit a warn-log whenever the header is an SS58 address bound to the
-    // same address (the deprecated "SS58-as-API-key" pattern). This lets
-    // us grep `deprecated-ss58-auth` to track migration progress.
-    if (SS58_SHAPE.test(apiKey) && keyInfo.validatorId === apiKey) {
-      console.warn(
-        `[blob-gateway] deprecated-ss58-auth account=${apiKey} route=${req.path} method=${req.method}`,
-      );
-      return {
-        authenticated: true,
-        tier: "api-key-legacy-ss58",
-        identity: keyInfo.validatorId ?? keyInfo.name,
-        keyInfo,
-      };
-    }
-
     return { authenticated: true, tier: "api-key", identity: keyInfo.name, keyInfo };
   }
 

@@ -349,13 +349,15 @@ describe("/batches/:anchorId route", () => {
     const app = makeApp();
     const anchorId = "46".repeat(32);
     const { address } = await signedHeaders("//CertDaemon", anchorId);
-    // The faucet and legacy registration store sha256(address) as the key.
+    // A row keyed on sha256(address), as the faucet wrote before its keys
+    // were made unguessable.
     bindAddress(address, sha256hex(address), "faucet-attestor");
     config.batchWriterAddresses.push(address);
     const resp = await request(app, "PUT", `/batches/${anchorId}`, { rootHash: "ab".repeat(32) }, {
       "x-api-key": address,
     });
-    expect(resp.status).toBe(403);
+    expect(resp.status).toBe(401);
+    expect((await request(app, "GET", `/batches/${anchorId}`, null)).status).toBe(404);
   });
 
   test("a key named like the writer's key is refused: only the key's hash counts", async () => {

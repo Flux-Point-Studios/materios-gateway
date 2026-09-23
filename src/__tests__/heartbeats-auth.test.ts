@@ -59,7 +59,7 @@ interface HarnessCtx {
   app: express.Express;
   pair: KeyringPair;
   ss58: string;
-  legacyApiKey: string;
+  addressAsKey: string;
   randomApiKey: string;
   bearerToken: string;
   tokensDb: Database.Database;
@@ -157,16 +157,16 @@ async function setupApp(opts: { registerValidator?: boolean } = {}): Promise<Har
       )
       .run(randomKeyHash, ss58);
 
-    // Legacy SS58-as-API-key row: hash(ss58) → validator_id = ss58. This
-    // is the path the cert-daemon has been using in prod since v5.
-    const legacyKeyHash = createHash("sha256").update(ss58).digest("hex");
+    // A row keyed on sha256(address), as the faucet wrote before its keys
+    // were made unguessable: the address must not select it.
+    const addressKeyHash = createHash("sha256").update(ss58).digest("hex");
     quotaDb
       .prepare(
         `INSERT INTO api_keys
          (key_hash, name, enabled, max_receipts_per_day, max_bytes_per_day, max_concurrent_uploads, validator_id)
-         VALUES (?, 'operator-heartbeat-test-legacy', 1, 100, 1073741824, 5, ?)`,
+         VALUES (?, 'operator-heartbeat-test-address-key', 1, 100, 1073741824, 5, ?)`,
       )
-      .run(legacyKeyHash, ss58);
+      .run(addressKeyHash, ss58);
   }
 
   // --- api_tokens db (in-memory) ---
@@ -189,7 +189,7 @@ async function setupApp(opts: { registerValidator?: boolean } = {}): Promise<Har
     app,
     pair,
     ss58,
-    legacyApiKey: ss58, // legacy pattern = send the SS58 itself as the key
+    addressAsKey: ss58,
     randomApiKey,
     bearerToken,
     tokensDb,
@@ -366,33 +366,51 @@ describe("POST /heartbeats: unified auth (Bearer / x-api-key / x-heartbeat-sig)"
   });
 
   // ------------------------------------------------------------------------
-  // 2b. Legacy SS58-as-x-api-key — PROD cert-daemon's current flow.
-  //     Regression guard: breaking this would take every attestor's
-  //     heartbeat offline until they rotate to a Bearer token.
+  // 2b. A cert-daemon configured with its own address as
+  //     BLOB_GATEWAY_API_KEY keeps heartbeating: the address authenticates
+  //     nothing, so the header is ignored and the heartbeat signature —
+  //     which every heartbeat carries — decides.
   // ------------------------------------------------------------------------
-  test("test_heartbeat_accepts_legacy_x_api_key_ss58", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation((() => {}) as (...args: unknown[]) => void);
-    try {
-      const seq = nextSeq++;
-      const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq);
-      const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
-        headers: {
-          "x-api-key": ctx.legacyApiKey,
-          "x-heartbeat-sig": sig,
-        },
-        jsonBody: body,
-      });
-      expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({ status: "ok", seq });
-      expect((res.body as { auth_tier?: string }).auth_tier).toBe("api-key-legacy-ss58");
+  test("test_heartbeat_with_address_as_x_api_key_authenticates_by_signature", async () => {
+    const seq = nextSeq++;
+    const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq);
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: {
+        "x-api-key": ctx.addressAsKey,
+        "x-heartbeat-sig": sig,
+      },
+      jsonBody: body,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: "ok", seq });
+    expect((res.body as { auth_tier?: string }).auth_tier).toBe("sig-only");
+  });
 
-      // The deprecated-ss58-auth warn-log must fire so we can track
-      // migration progress via `kubectl logs | grep deprecated-ss58-auth`.
-      const calls = (warn.mock.calls as unknown[][]).map((c) => c.join(" "));
-      expect(calls.some((m) => m.includes("deprecated-ss58-auth"))).toBe(true);
-    } finally {
-      warn.mockRestore();
-    }
+  test("test_heartbeat_with_address_as_x_api_key_still_needs_a_registered_signer", async () => {
+    config.storagePath = ctx.prevStoragePath;
+    rmSync(ctx.tmpStorage, { recursive: true, force: true });
+    ctx = await setupApp({ registerValidator: false });
+
+    const seq = nextSeq++;
+    const { body, sig } = buildHeartbeat(ctx.pair, ctx.ss58, seq);
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: { "x-api-key": ctx.addressAsKey, "x-heartbeat-sig": sig },
+      jsonBody: body,
+    });
+    expect(res.status).toBe(403);
+  });
+
+  test("test_heartbeat_with_address_as_x_api_key_and_a_forged_signature_is_rejected", async () => {
+    const seq = nextSeq++;
+    const { body } = buildHeartbeat(ctx.pair, ctx.ss58, seq);
+    const forger = new Keyring({ type: "sr25519" }).addFromUri("//HeartbeatForger");
+    const { sig: forged } = buildHeartbeat(forger, ctx.ss58, seq);
+    const res = await fetchJson(ctx.app, "POST", "/heartbeats", {
+      headers: { "x-api-key": ctx.addressAsKey, "x-heartbeat-sig": forged },
+      jsonBody: body,
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("Invalid signature");
   });
 
   // ------------------------------------------------------------------------

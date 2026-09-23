@@ -260,7 +260,6 @@ describe("sponsored-receipts notify hook", () => {
     const { isSponsoredTier } = await import("../sponsored-receipts.js");
     expect(isSponsoredTier("bearer")).toBe(true);
     expect(isSponsoredTier("api-key")).toBe(true);
-    expect(isSponsoredTier("api-key-legacy-ss58")).toBe(true);
     expect(isSponsoredTier("sig-only")).toBe(false);
     expect(isSponsoredTier("registered-validator")).toBe(false);
     expect(isSponsoredTier(undefined)).toBe(false);

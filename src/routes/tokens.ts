@@ -25,8 +25,7 @@ import {
 } from "../api-tokens.js";
 import { adminGuard } from "../bearer-auth.js";
 import { resolveKeyByAccount, getUsage, getDailyUsage } from "../quota.js";
-
-const SS58_SHAPE = /^[15][a-zA-Z0-9]{45,47}$/;
+import { SS58_SHAPE } from "../ss58.js";
 
 /**
  * Test hook — kept for symmetry with other modules' test hooks. Tests that

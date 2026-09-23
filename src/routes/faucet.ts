@@ -17,8 +17,6 @@ import type { ISubmittableResult } from "@polkadot/types/types";
 import type { KeyringPair } from "@polkadot/keyring/types";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
-import Database from "better-sqlite3";
-import { createHash } from "node:crypto";
 
 import { config } from "../config.js";
 import { normalizeSs58 } from "../ss58.js";
@@ -31,6 +29,7 @@ import {
   type IdentityOutcome,
 } from "../operator_identity.js";
 import { getOperatorsDb, recordFaucetRegistration } from "./operators.js";
+import { ensureFaucetApiKey, unguessableKeyHash } from "../quota.js";
 
 export const faucetRouter = Router();
 
@@ -297,39 +296,19 @@ async function notifyDripFailure(kind: string, address: string, reason: string):
 /**
  * Persist the operator registration a successful drip earns.
  *
- * `registrations` uses the shared handle so the row lands in the same
- * connection that ran the schema migration; `quota.db::api_keys` is what
- * actually unblocks the operator's heartbeats.
- *
- * INSERT OR IGNORE on api_keys so a re-drip does NOT clobber an existing
- * `name` — an INSERT OR REPLACE here once reset every re-dripped operator's
- * label back to "faucet-attestor" during the v5 cutover.
+ * `quota.db::api_keys` is what actually unblocks the operator's heartbeats.
+ * Neither registry gets a key anyone can present: the drip is unauthenticated
+ * and never hands the operator a key, so the stored hash is random and the
+ * operator authenticates by signing. A re-drip leaves both rows as they are.
  */
-function registerOperator(
-  address: string,
-  keyHash: string,
-  identity: OperatorIdentity,
-): { created: boolean } {
+function registerOperator(address: string, identity: OperatorIdentity): { created: boolean } {
+  const keyHash = unguessableKeyHash();
   const { created } = recordFaucetRegistration(getOperatorsDb(), {
     ss58Address: address,
     apiKeyHash: keyHash,
     identity,
   });
-
-  const quotaDb = new Database(join(config.storagePath, "quota.db"));
-  try {
-    quotaDb.pragma("busy_timeout = 5000");
-    quotaDb
-      .prepare(
-        `INSERT OR IGNORE INTO api_keys
-           (key_hash, name, enabled, max_receipts_per_day, max_bytes_per_day, max_concurrent_uploads, validator_id)
-         VALUES (?, 'faucet-attestor', 1, 100, 1073741824, 5, ?)`,
-      )
-      .run(keyHash, address);
-  } finally {
-    quotaDb.close();
-  }
-
+  ensureFaucetApiKey(address, keyHash);
   return { created };
 }
 
@@ -451,10 +430,9 @@ faucetRouter.post("/faucet/drip", async (req: Request, res: Response) => {
     // Registration failure IS fatal: the drip landed but the operator's
     // heartbeats would 403 with no recourse. Roll the ledger back so a retry
     // can re-attempt.
-    const keyHash = createHash("sha256").update(address).digest("hex");
     let identityStatus: IdentityOutcome = "not_declared";
     try {
-      const { created } = registerOperator(address, keyHash, identity);
+      const { created } = registerOperator(address, identity);
       identityStatus = describeIdentityOutcome(identity, created);
       console.log(
         created
