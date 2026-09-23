@@ -139,19 +139,49 @@ and logs each row it changed.
 
 ### Upload Signing Protocol
 
-Signing string format:
+v2 signs the whole request:
+
+```
+materios-upload-v2|{METHOD}|{path}|{bodySha256}|{id}|{uploaderAddress}|{timestamp}
+```
+
+- `METHOD` -- upper-case HTTP method (`PUT`, `POST`, `GET`, ...)
+- `path` -- the request path without the query string, as the gateway sees it:
+  the path appended to the gateway base URL (`/batches/<anchorId>`,
+  `/blobs/<contentHash>/manifest`, `/blobs/<contentHash>/chunks/<i>`)
+- `bodySha256` -- lower-case hex sha256 of the exact body bytes sent (of zero
+  bytes when there is no body)
+- `id` -- the anchor id or content hash in the path, without `0x`
+
+v1 signs only the id and is still accepted everywhere except batch writes:
 
 ```
 materios-upload-v1|{contentHash}|{uploaderAddress}|{timestamp}
 ```
 
-Required headers:
+Headers:
 
-- `x-upload-sig` -- hex-encoded sr25519 signature
-- `x-uploader-address` -- SS58 address
-- `x-upload-ts` -- Unix timestamp (seconds)
+- `x-upload-sig-v2` -- hex-encoded sr25519 signature over the v2 string
+- `x-upload-sig` -- hex-encoded sr25519 signature over the v1 string
+- `x-uploader-address` -- SS58 address (shared by both)
+- `x-upload-ts` -- Unix timestamp in seconds (shared by both)
+
+A client may send both signatures; the gateway then verifies v2 and burns v1
+with it. Batch writes (`PUT`/`POST /batches/:anchorId`) authenticated by
+signature require v2. Each accepted v1 signature logs one
+`{"log":"upload_sig_v1","address":...,"method":...,"route":...}` line so its
+retirement can be tracked.
+
+Every signature is accepted once: reuse is refused with 401, and used
+signatures are kept in `quota.db:used_upload_sigs` until their timestamp leaves
+the window, so a restart does not make them usable again. A signature
+timestamped before the gateway process started is refused too. Sign each
+request afresh.
 
 Clock skew tolerance: 120 seconds (configurable via `UPLOAD_SIG_MAX_AGE_SEC`).
+
+`src/__tests__/fixtures/upload-sig-v2-golden.json` is a signed v2 test vector
+(`//Alice`) shared with the cert-daemon and the SDK.
 
 ### Anti-Spam (Three Layers)
 

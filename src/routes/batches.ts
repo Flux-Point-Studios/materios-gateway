@@ -12,8 +12,10 @@ import { requireHexId } from "./id-param.js";
 
 export const batchesRouter = Router();
 
+const SIGNATURE_TIERS: Array<AuthResult["tier"]> = ["registered-validator", "sig-only"];
+
 function mayWriteBatches(auth: AuthResult): boolean {
-  if (auth.tier === "registered-validator" || auth.tier === "sig-only") {
+  if (SIGNATURE_TIERS.includes(auth.tier)) {
     return config.batchWriterAddresses.includes(auth.identity ?? "");
   }
   if (auth.tier === "api-key") {
@@ -26,8 +28,9 @@ batchesRouter.param("anchorId", requireHexId("anchorId"));
 /**
  * PUT /batches/:anchorId (also accepts POST for backwards compat)
  * Idempotent upsert of batch metadata JSON.
- * Requires an sr25519 signature from an address in BATCH_WRITER_ADDRESSES, or
- * an API key whose sha256 is in BATCH_WRITER_KEY_HASHES.
+ * Requires a v2 upload signature (bound to this request's body) from an
+ * address in BATCH_WRITER_ADDRESSES, or an API key whose sha256 is in
+ * BATCH_WRITER_KEY_HASHES.
  */
 async function upsertBatch(req: Request, res: Response): Promise<void> {
   try {
@@ -37,6 +40,10 @@ async function upsertBatch(req: Request, res: Response): Promise<void> {
     const auth = await resolveAuth(req, anchorId);
     if (!auth.authenticated) {
       res.status(401).json({ error: auth.error });
+      return;
+    }
+    if (SIGNATURE_TIERS.includes(auth.tier) && auth.sigVersion !== 2) {
+      res.status(401).json({ error: "Batch writes signed by an address require x-upload-sig-v2, which covers the body" });
       return;
     }
     // A batch record carries the Cardano tx that trace lineage shows as a

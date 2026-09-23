@@ -119,6 +119,8 @@ export function initQuotaDb(): void {
   // transparently. See bindValidatorAura() / getBindingForAura() below.
   migrateBindingColumn(db);
 
+  migrateUsedUploadSigs(db);
+
   loadKeys();
 
   const retired = retireAddressDerivedApiKeys(db);
@@ -167,6 +169,36 @@ export function retireAddressDerivedApiKeys(
     return guessable.map((r) => ({ validatorId: r.validator_id, name: r.name }));
   });
   return retire.immediate();
+}
+
+/**
+ * Upload signatures already accepted, each kept until its timestamp leaves the
+ * acceptance window. On disk so a restart does not make them usable again.
+ */
+export function migrateUsedUploadSigs(database: Database.Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS used_upload_sigs (
+      sig TEXT PRIMARY KEY,
+      expires_at INTEGER NOT NULL
+    )
+  `);
+}
+
+/**
+ * Record `sigs` as used until `expiresAt` (unix seconds). Returns false, and
+ * records none of them, when any was recorded before.
+ */
+export function claimUploadSignatures(sigs: string[], expiresAt: number, now: number): boolean {
+  const unique = [...new Set(sigs)];
+  const claim = db.transaction(() => {
+    db.prepare("DELETE FROM used_upload_sigs WHERE expires_at < ?").run(now);
+    const seen = db.prepare("SELECT 1 FROM used_upload_sigs WHERE sig = ?");
+    if (unique.some((sig) => seen.get(sig) !== undefined)) return false;
+    const insert = db.prepare("INSERT INTO used_upload_sigs (sig, expires_at) VALUES (?, ?)");
+    for (const sig of unique) insert.run(sig, expiresAt);
+    return true;
+  });
+  return claim.immediate();
 }
 
 /**

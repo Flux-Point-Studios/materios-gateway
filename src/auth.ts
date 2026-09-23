@@ -10,7 +10,7 @@
 
 import type { Request } from "express";
 import { resolveKey, resolveKeyByAccount, lookupUploadEligibleValidator, type KeyInfo } from "./quota.js";
-import { verifyUploadSig } from "./upload-auth.js";
+import { verifyUploadSig, hasUploadSignature } from "./upload-auth.js";
 import { checkFunded } from "./rpc-client.js";
 import { isAccountAddress } from "./ss58.js";
 import {
@@ -30,12 +30,14 @@ export interface AuthResult {
   tier?: AuthTier;
   identity?: string; // SS58 address or key name
   keyInfo?: KeyInfo;
+  /** The upload-signature scheme that authenticated a signature tier. */
+  sigVersion?: 1 | 2;
   error?: string;
 }
 
 const ADDRESS_AS_KEY_ERROR =
   "x-api-key holds an account address, which is public and authenticates nothing: " +
-  "sign the request (x-upload-sig, x-uploader-address, x-upload-ts) or use a Bearer token";
+  "sign the request (x-upload-sig-v2, x-uploader-address, x-upload-ts) or use a Bearer token";
 
 /**
  * Resolve auth for any request.
@@ -83,7 +85,7 @@ export async function resolveAuth(req: Request, contentHash?: string): Promise<A
   // this header is ignored when the request is signed, refused otherwise.
   const apiKey = req.headers["x-api-key"] as string | undefined;
   if (apiKey && isAccountAddress(apiKey)) {
-    if (!contentHash || !req.headers["x-upload-sig"]) {
+    if (!contentHash || !hasUploadSignature(req)) {
       return { authenticated: false, error: ADDRESS_AS_KEY_ERROR };
     }
   } else if (apiKey) {
@@ -96,15 +98,16 @@ export async function resolveAuth(req: Request, contentHash?: string): Promise<A
   if (contentHash) {
     const sigResult = verifyUploadSig(req, contentHash);
     if (sigResult.valid && sigResult.address) {
+      const signer = { identity: sigResult.address, sigVersion: sigResult.version };
       // Is this a registered validator (excluding heartbeat-only rows)? → highest quota tier
       const info = lookupUploadEligibleValidator(sigResult.address);
       if (info) {
-        return { authenticated: true, tier: "registered-validator", identity: sigResult.address };
+        return { authenticated: true, tier: "registered-validator", ...signer };
       }
       // Is this a funded account? → sig-only tier
       const funded = await checkFunded(sigResult.address);
       if (funded) {
-        return { authenticated: true, tier: "sig-only", identity: sigResult.address };
+        return { authenticated: true, tier: "sig-only", ...signer };
       }
       return { authenticated: false, error: "Account below minimum balance" };
     }

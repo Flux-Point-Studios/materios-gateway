@@ -44,7 +44,8 @@ import { u8aToHex, stringToU8a } from "@polkadot/util";
 import { config } from "../config.js";
 import { checkFunded } from "../rpc-client.js"; // mocked above — overridable per test
 import { blobsRouter } from "../routes/blobs.js";
-import { setQuotaDbForTests, migrateUsageColumns, migrateBindingColumn } from "../quota.js";
+import { setQuotaDbForTests, migrateUsageColumns, migrateBindingColumn, migrateUsedUploadSigs } from "../quota.js";
+import { captureRawBody } from "../raw-body.js";
 import {
   initApiTokensDb,
   issueToken,
@@ -121,6 +122,7 @@ async function setupApp(opts: { registerOperator?: boolean } = {}): Promise<{
   migrateUsageColumns(quotaDb);
   // Task #94: add bound_validator_aura column so resolveKey() doesn't 500.
   migrateBindingColumn(quotaDb);
+  migrateUsedUploadSigs(quotaDb);
   setQuotaDbForTests(quotaDb);
 
   // SS58-shaped account used by the Bearer tests and as a would-be API key.
@@ -167,9 +169,9 @@ async function setupApp(opts: { registerOperator?: boolean } = {}): Promise<{
   // Raw body parser for chunk uploads (mirrors production index.ts ordering).
   app.put(
     "/blobs/:contentHash/chunks/:i",
-    express.raw({ type: "*/*", limit: `${config.maxChunkBytes}` }),
+    express.raw({ type: "*/*", limit: `${config.maxChunkBytes}`, verify: captureRawBody }),
   );
-  app.use(express.json({ limit: "2mb" }));
+  app.use(express.json({ limit: "2mb", verify: captureRawBody }));
   app.use(blobsRouter);
 
   return {
@@ -387,30 +389,43 @@ describe("upload endpoints: unified auth (Bearer / x-api-key / sig)", () => {
     const addr = pair.address;
 
     const { manifest, chunk, contentHash } = buildSingleChunkManifest(Buffer.from("sig-only-hello"));
-    const ts = Math.floor(Date.now() / 1000);
-    const signingString = `materios-upload-v1|${contentHash}|${addr}|${ts}`;
-    const sig = u8aToHex(pair.sign(stringToU8a(signingString)));
-
-    // Sanity: the gateway's signatureVerify should accept this pair too.
-    expect(signatureVerify(stringToU8a(signingString), sig, addr).isValid).toBe(true);
-
-    const sigHeaders: Record<string, string> = {
-      "x-upload-sig": sig,
-      "x-uploader-address": addr,
-      "x-upload-ts": String(ts),
+    // A signature authorises one request, so each leg is signed afresh.
+    const sigHeaders = (): Record<string, string> => {
+      const ts = Math.floor(Date.now() / 1000);
+      const signingString = `materios-upload-v1|${contentHash}|${addr}|${ts}`;
+      const sig = u8aToHex(pair.sign(stringToU8a(signingString)));
+      expect(signatureVerify(stringToU8a(signingString), sig, addr).isValid).toBe(true);
+      return { "x-upload-sig": sig, "x-uploader-address": addr, "x-upload-ts": String(ts) };
     };
 
     const mres = await fetchJson(ctx.app, "POST", `/blobs/${contentHash}/manifest`, {
-      headers: sigHeaders,
+      headers: sigHeaders(),
       jsonBody: manifest,
     });
     expect(mres.status).toBe(201);
 
     const cres = await fetchJson(ctx.app, "PUT", `/blobs/${contentHash}/chunks/0`, {
-      headers: sigHeaders,
+      headers: sigHeaders(),
       rawBody: chunk,
     });
     expect(cres.status).toBe(200);
+  });
+
+  test("one_signature_cannot_authorise_two_uploads", async () => {
+    await cryptoWaitReady();
+    const pair = new Keyring({ type: "sr25519" }).addFromUri("//SigReuser");
+    const { manifest, chunk, contentHash } = buildSingleChunkManifest(Buffer.from("sig-reuse"));
+    const ts = Math.floor(Date.now() / 1000);
+    const headers = {
+      "x-upload-sig": u8aToHex(pair.sign(stringToU8a(`materios-upload-v1|${contentHash}|${pair.address}|${ts}`))),
+      "x-uploader-address": pair.address,
+      "x-upload-ts": String(ts),
+    };
+    const mres = await fetchJson(ctx.app, "POST", `/blobs/${contentHash}/manifest`, { headers, jsonBody: manifest });
+    expect(mres.status).toBe(201);
+    const cres = await fetchJson(ctx.app, "PUT", `/blobs/${contentHash}/chunks/0`, { headers, rawBody: chunk });
+    expect(cres.status).toBe(401);
+    expect((cres.body as { error: string }).error).toMatch(/already used/);
   });
 
   // ------------------------------------------------------------------------

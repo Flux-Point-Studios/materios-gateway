@@ -12,6 +12,7 @@ import {
   recordUsage,
 } from "../quota.js";
 import { resolveAuth } from "../auth.js";
+import { hasUploadSignature } from "../upload-auth.js";
 import { notifySponsoredReceiptSubmitter, isSponsoredTier } from "../sponsored-receipts.js";
 import {
   computeRootHashFromChunks,
@@ -410,7 +411,7 @@ blobsRouter.put("/blobs/:contentHash/chunks/:i", async (req: Request, res: Respo
     const hasAuthHeader =
       typeof req.headers.authorization === "string" ||
       typeof req.headers["x-api-key"] === "string" ||
-      typeof req.headers["x-upload-sig"] === "string";
+      hasUploadSignature(req);
     const auth = hasAuthHeader ? await resolveAuth(req, contentHash) : null;
 
     if (auth && !auth.authenticated) {
