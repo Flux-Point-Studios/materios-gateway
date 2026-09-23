@@ -20,7 +20,7 @@ import {
 } from "../merkle.js";
 import { requireHexId } from "./id-param.js";
 
-/** Frees the upload's concurrency slot and counts its receipt against the daily quota. */
+/** Marks the upload complete: frees any concurrency slot and counts the receipt. */
 function finalizeQuota(auth: AuthResult, keyed: boolean, contentHash: string): void {
   if (keyed && auth.keyInfo) {
     if (!finalizeUpload(auth.keyInfo, contentHash).allowed) {
@@ -149,8 +149,15 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
       (auth.tier === "bearer" || auth.tier === "api-key" || auth.tier === "api-key-legacy-ss58") &&
       auth.keyInfo !== undefined;
 
+    // A chunkless (self-rooted) manifest is complete on arrival: it takes no
+    // concurrency slot, and its stored bytes count against the daily byte quota.
+    const chunkless = !manifestBody.chunks?.length;
+    const manifestBytes = Buffer.byteLength(JSON.stringify(manifest, null, 2));
+
     if (useKeyedQuotas && auth.keyInfo) {
-      const quotaCheck = startUpload(auth.keyInfo, contentHash);
+      const quotaCheck = chunkless
+        ? recordChunkBytes(auth.keyInfo, contentHash, manifestBytes)
+        : startUpload(auth.keyInfo, contentHash);
       if (!quotaCheck.allowed) {
         res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
         return;
@@ -177,7 +184,9 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
         res.status(401).json({ error: "resolved auth has no identity" });
         return;
       }
-      const quotaCheck = startAccountUpload(accountId, contentHash);
+      const quotaCheck = chunkless
+        ? recordAccountChunkBytes(accountId, contentHash, manifestBytes)
+        : startAccountUpload(accountId, contentHash);
       if (!quotaCheck.allowed) {
         res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
         return;
@@ -258,9 +267,7 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
       await updateReceiptMeta(contentHash, { uploaderAddress });
     }
 
-    // A chunkless (self-rooted) manifest is already a complete upload; no chunk
-    // PUT will ever arrive to free its concurrency slot.
-    if (!manifestBody.chunks?.length) finalizeQuota(auth, useKeyedQuotas, contentHash);
+    if (chunkless) finalizeQuota(auth, useKeyedQuotas, contentHash);
 
     res.status(201).json({ status: "ok", contentHash });
   } catch (error) {

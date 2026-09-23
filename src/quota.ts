@@ -381,8 +381,8 @@ export function recordChunkBytes(keyInfo: KeyInfo, contentHash: string, chunkByt
 }
 
 /**
- * Finalize upload (all chunks uploaded). Increments daily receipt count.
- * Returns 429 info if daily receipt limit exceeded.
+ * Finalize upload (all chunks uploaded): frees the concurrency slot, then
+ * counts the receipt. Returns 429 info if the daily receipt limit is reached.
  */
 /**
  * Look up a validator by SS58 address in the registry.

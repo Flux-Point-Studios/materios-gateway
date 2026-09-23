@@ -1,7 +1,8 @@
 /**
- * A chunkless (self-rooted) manifest is a complete upload in one request, so it
- * must not keep a concurrent-upload slot. Finalizing must also release the slot
- * when the daily receipt count is already over its cap.
+ * A chunkless (self-rooted) manifest is a complete upload in one request: it
+ * must not keep a concurrent-upload slot, and its bytes count against the daily
+ * byte quota. Finalizing releases the slot even over the daily receipt cap, and
+ * a manifest rejected by content limits never takes one.
  */
 import { describe, test, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 
@@ -18,7 +19,7 @@ vi.mock("../notify.js", () => ({
 import express from "express";
 import Database from "better-sqlite3";
 import { createHash, randomBytes } from "crypto";
-import { mkdtempSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
@@ -164,6 +165,33 @@ describe("chunkless manifest upload slot", () => {
       .prepare("SELECT COUNT(*) AS n FROM uploads_inflight WHERE status = 'active'")
       .get() as { n: number };
     expect(active.n).toBe(0);
+  });
+});
+
+describe("chunkless manifest bytes", () => {
+  test("count against the account's daily byte quota", async () => {
+    const pair = new Keyring({ type: "sr25519" }).addFromUri("//ByteCapUploader");
+    const day = new Date().toISOString().slice(0, 10);
+    quotaDb
+      .prepare("INSERT INTO account_quotas_daily (address, day, receipts, bytes) VALUES (?, ?, 0, ?)")
+      .run(pair.address, day, config.sigOnlyMaxBytesPerDay - 10);
+    const contentHash = contentHashFor(0);
+
+    const status = await postManifest(contentHash, sigHeaders("//ByteCapUploader", contentHash));
+
+    expect(status).toBe(429);
+    expect(existsSync(join(tmpStorage, "receipts", contentHash, "manifest.json"))).toBe(false);
+  });
+
+  test("are recorded for the API key", async () => {
+    const contentHash = contentHashFor(0);
+    expect(await postManifest(contentHash, { "x-api-key": API_KEY })).toBe(201);
+    expect(existsSync(join(tmpStorage, "receipts", contentHash, "manifest.json"))).toBe(true);
+    const row = quotaDb
+      .prepare("SELECT receipts, bytes FROM quota_daily WHERE key_hash = ?")
+      .get(KEY_HASH) as { receipts: number; bytes: number };
+    expect(row.receipts).toBe(1);
+    expect(row.bytes).toBeGreaterThan(0);
   });
 });
 
