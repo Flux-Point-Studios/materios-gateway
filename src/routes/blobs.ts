@@ -7,11 +7,11 @@ import { createHash, timingSafeEqual } from "crypto";
 import { saveManifest, getManifest, saveChunk, getChunk, getStatus, markCertified, updateReceiptMeta } from "../storage.js";
 import { config } from "../config.js";
 import {
-  startUpload, recordChunkBytes, finalizeUpload,
-  startAccountUpload, recordAccountChunkBytes, finalizeAccountUpload,
+  startUpload, recordChunkBytes, finalizeUpload, chargeManifestBytes,
+  startAccountUpload, recordAccountChunkBytes, finalizeAccountUpload, chargeAccountManifestBytes,
   recordUsage,
 } from "../quota.js";
-import { resolveAuth, type AuthResult } from "../auth.js";
+import { resolveAuth } from "../auth.js";
 import { notifySponsoredReceiptSubmitter, isSponsoredTier } from "../sponsored-receipts.js";
 import {
   computeRootHashFromChunks,
@@ -20,17 +20,22 @@ import {
 } from "../merkle.js";
 import { requireHexId } from "./id-param.js";
 
-/** Marks the upload complete: frees any concurrency slot and counts the receipt. */
-function finalizeQuota(auth: AuthResult, keyed: boolean, contentHash: string): void {
-  if (keyed && auth.keyInfo) {
-    if (!finalizeUpload(auth.keyInfo, contentHash).allowed) {
-      console.warn(`[blob-gateway] Receipt quota exceeded for key ${auth.keyInfo.name} but upload already complete`);
-    }
-  } else if (auth.identity) {
-    if (!finalizeAccountUpload(auth.identity, contentHash).allowed) {
-      console.warn(`[blob-gateway] Receipt quota exceeded for ${auth.identity} but upload already complete`);
-    }
+
+/**
+ * A deeply nested body makes every later JSON.stringify of it quadratic, so the
+ * depth is bounded before any work is done. Iterative, so it cannot overflow.
+ */
+const MAX_MANIFEST_DEPTH = 32;
+
+function nestingExceeds(root: unknown, max: number): boolean {
+  const stack: Array<[unknown, number]> = [[root, 1]];
+  while (stack.length > 0) {
+    const [value, depth] = stack.pop()!;
+    if (value === null || typeof value !== "object") continue;
+    if (depth > max) return true;
+    for (const child of Object.values(value)) stack.push([child, depth + 1]);
   }
+  return false;
 }
 
 export const blobsRouter = Router();
@@ -105,6 +110,14 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
       res.status(400).json({ error: "Invalid manifest: expected JSON object" });
       return;
     }
+    if (nestingExceeds(manifest, MAX_MANIFEST_DEPTH)) {
+      res.status(400).json({ error: `Invalid manifest: nested deeper than ${MAX_MANIFEST_DEPTH} levels` });
+      return;
+    }
+    if (manifest.chunks !== undefined && manifest.chunks !== null && !Array.isArray(manifest.chunks)) {
+      res.status(400).json({ error: "Invalid manifest: chunks must be an array" });
+      return;
+    }
 
     const auth = await resolveAuth(req, contentHash);
     if (!auth.authenticated) {
@@ -152,24 +165,22 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
     // A chunkless (self-rooted) manifest is complete on arrival: it takes no
     // concurrency slot, and its stored bytes count against the daily byte quota.
     const chunkless = !manifestBody.chunks?.length;
-    const manifestBytes = Buffer.byteLength(JSON.stringify(manifest, null, 2));
+    const manifestBytes = chunkless ? Buffer.byteLength(JSON.stringify(manifest)) : 0;
 
     if (useKeyedQuotas && auth.keyInfo) {
       const quotaCheck = chunkless
-        ? recordChunkBytes(auth.keyInfo, contentHash, manifestBytes)
+        ? chargeManifestBytes(auth.keyInfo, manifestBytes)
         : startUpload(auth.keyInfo, contentHash);
       if (!quotaCheck.allowed) {
         res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
         return;
       }
-      // Phase 1 billing: count one receipt per admitted manifest POST.
-      // Bytes are attributed in the chunk leg. Not gated on saveManifest
-      // success — startUpload() already recorded the intent in the inflight
-      // table, and in practice saveManifest() failure is a disk error that
-      // the error handler converts to 500; we accept minor drift in the
-      // pathological crash-between-these-two-calls case.
+      // Phase 1 billing: count one receipt per admitted manifest POST. Chunk
+      // bytes are metered in the chunk leg; a chunkless manifest's own bytes
+      // here. Not gated on saveManifest success: a failure there is a disk
+      // error the handler turns into a 500, and the drift is accepted.
       try {
-        recordUsage(auth.keyInfo.keyHash, 0, 1);
+        recordUsage(auth.keyInfo.keyHash, manifestBytes, 1);
       } catch (err) {
         console.warn(
           `[blob-gateway] recordUsage(manifest) failed for ${auth.keyInfo.name}:`,
@@ -185,7 +196,7 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
         return;
       }
       const quotaCheck = chunkless
-        ? recordAccountChunkBytes(accountId, contentHash, manifestBytes)
+        ? chargeAccountManifestBytes(accountId, manifestBytes)
         : startAccountUpload(accountId, contentHash);
       if (!quotaCheck.allowed) {
         res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
@@ -266,8 +277,6 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
     if (uploaderAddress) {
       await updateReceiptMeta(contentHash, { uploaderAddress });
     }
-
-    if (chunkless) finalizeQuota(auth, useKeyedQuotas, contentHash);
 
     res.status(201).json({ status: "ok", contentHash });
   } catch (error) {
@@ -470,7 +479,17 @@ blobsRouter.put("/blobs/:contentHash/chunks/:i", async (req: Request, res: Respo
     // Check if upload is now complete and finalize quota
     const statusAfter = await getStatus(contentHash);
     if (statusAfter.complete) {
-      if (auth) finalizeQuota(auth, useKeyedQuotas, contentHash);
+      if (useKeyedQuotas && auth && auth.keyInfo) {
+        const finalCheck = finalizeUpload(auth.keyInfo, contentHash);
+        if (!finalCheck.allowed) {
+          console.warn(`[blob-gateway] Receipt quota exceeded for key ${auth.keyInfo.name} but upload already complete`);
+        }
+      } else if (auth && auth.identity) {
+        const finalCheck = finalizeAccountUpload(auth.identity, contentHash);
+        if (!finalCheck.allowed) {
+          console.warn(`[blob-gateway] Receipt quota exceeded for ${auth.identity} but upload already complete`);
+        }
+      }
 
       // Sponsored-receipt hand-off: if this upload was sponsored (Bearer
       // or api-key tier) and an external submitter is configured, fire

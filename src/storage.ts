@@ -92,7 +92,7 @@ export async function saveManifest(contentHash: string, manifest: object): Promi
   const dir = receiptsDir(contentHash);
   await ensureDir(dir);
   await ensureDir(chunksDir(contentHash));
-  await writeFile(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2));
+  await writeFile(join(dir, "manifest.json"), JSON.stringify(manifest));
 
   // Compute receiptId and write index
   const receiptId = computeReceiptId(contentHash);

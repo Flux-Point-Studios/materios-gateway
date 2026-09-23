@@ -1,8 +1,8 @@
 /**
  * A chunkless (self-rooted) manifest is a complete upload in one request: it
- * must not keep a concurrent-upload slot, and its bytes count against the daily
- * byte quota. Finalizing releases the slot even over the daily receipt cap, and
- * a manifest rejected by content limits never takes one.
+ * takes no concurrent-upload slot, never touches another upload's slot, and its
+ * stored bytes count against the daily byte quota. Finalizing releases the slot
+ * even over the daily receipt cap, and a rejected manifest never takes one.
  */
 import { describe, test, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 
@@ -19,7 +19,7 @@ vi.mock("../notify.js", () => ({
 import express from "express";
 import Database from "better-sqlite3";
 import { createHash, randomBytes } from "crypto";
-import { existsSync, mkdtempSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
@@ -123,7 +123,8 @@ function sigHeaders(uri: string, contentHash: string): Record<string, string> {
 async function postManifest(
   contentHash: string,
   headers: Record<string, string>,
-  chunks: Array<{ index: number; size: number; sha256: string }> = [],
+  chunks: unknown = [],
+  extra: Record<string, unknown> = {},
 ): Promise<number> {
   const server = app.listen(0);
   try {
@@ -132,7 +133,7 @@ async function postManifest(
     const res = await fetch(`http://127.0.0.1:${addr.port}/blobs/${contentHash}/manifest`, {
       method: "POST",
       headers: { ...headers, "content-type": "application/json" },
-      body: JSON.stringify({ rootHash: contentHash, chunks }),
+      body: JSON.stringify({ rootHash: contentHash, chunks, ...extra }),
     });
     await res.text();
     return res.status;
@@ -168,6 +169,10 @@ describe("chunkless manifest upload slot", () => {
   });
 });
 
+function storedManifest(contentHash: string): string {
+  return readFileSync(join(tmpStorage, "receipts", contentHash, "manifest.json"), "utf-8");
+}
+
 describe("chunkless manifest bytes", () => {
   test("count against the account's daily byte quota", async () => {
     const pair = new Keyring({ type: "sr25519" }).addFromUri("//ByteCapUploader");
@@ -183,15 +188,70 @@ describe("chunkless manifest bytes", () => {
     expect(existsSync(join(tmpStorage, "receipts", contentHash, "manifest.json"))).toBe(false);
   });
 
-  test("are recorded for the API key", async () => {
+  test("are charged as stored for an account, and count no receipt", async () => {
+    const pair = new Keyring({ type: "sr25519" }).addFromUri("//ChunklessMeter");
+    const contentHash = contentHashFor(0);
+    expect(await postManifest(contentHash, sigHeaders("//ChunklessMeter", contentHash))).toBe(201);
+
+    const row = quotaDb
+      .prepare("SELECT receipts, bytes FROM account_quotas_daily WHERE address = ?")
+      .get(pair.address) as { receipts: number; bytes: number };
+    expect(row).toEqual({ receipts: 0, bytes: Buffer.byteLength(storedManifest(contentHash)) });
+  });
+
+  test("are charged and metered for an API key, and count no daily receipt", async () => {
     const contentHash = contentHashFor(0);
     expect(await postManifest(contentHash, { "x-api-key": API_KEY })).toBe(201);
-    expect(existsSync(join(tmpStorage, "receipts", contentHash, "manifest.json"))).toBe(true);
-    const row = quotaDb
+    const stored = Buffer.byteLength(storedManifest(contentHash));
+
+    const daily = quotaDb
       .prepare("SELECT receipts, bytes FROM quota_daily WHERE key_hash = ?")
       .get(KEY_HASH) as { receipts: number; bytes: number };
-    expect(row.receipts).toBe(1);
-    expect(row.bytes).toBeGreaterThan(0);
+    expect(daily).toEqual({ receipts: 0, bytes: stored });
+    const lifetime = quotaDb
+      .prepare("SELECT lifetime_receipts, lifetime_bytes FROM api_keys WHERE key_hash = ?")
+      .get(KEY_HASH) as { lifetime_receipts: number; lifetime_bytes: number };
+    expect(lifetime).toEqual({ lifetime_receipts: 1, lifetime_bytes: stored });
+  });
+
+  test("leave a chunked upload's slot for the same hash alone", async () => {
+    const pair = new Keyring({ type: "sr25519" }).addFromUri("//SlotRacer");
+    const contentHash = contentHashFor(0);
+    expect(startAccountUpload(pair.address, contentHash).allowed).toBe(true);
+
+    expect(await postManifest(contentHash, sigHeaders("//SlotRacer", contentHash))).toBe(201);
+
+    const row = quotaDb
+      .prepare("SELECT status FROM account_uploads_inflight WHERE upload_id = ?")
+      .get(contentHash) as { status: string };
+    expect(row.status).toBe("active");
+  });
+});
+
+describe("manifest shape", () => {
+  test("is stored compactly", async () => {
+    const contentHash = contentHashFor(0);
+    expect(await postManifest(contentHash, { "x-api-key": API_KEY }, [], { note: { nested: [1, 2, 3] } })).toBe(201);
+    expect(storedManifest(contentHash)).toBe(
+      JSON.stringify({ rootHash: contentHash, chunks: [], note: { nested: [1, 2, 3] } }),
+    );
+  });
+
+  test("nested deeper than the limit is refused before any quota is touched", async () => {
+    let deep: unknown = 0;
+    for (let i = 0; i < 40; i++) deep = [deep];
+    const contentHash = contentHashFor(0);
+
+    expect(await postManifest(contentHash, { "x-api-key": API_KEY }, [], { deep })).toBe(400);
+
+    const charged = quotaDb.prepare("SELECT COUNT(*) AS n FROM quota_daily").get() as { n: number };
+    expect(charged.n).toBe(0);
+    expect(existsSync(join(tmpStorage, "receipts", contentHash, "manifest.json"))).toBe(false);
+  });
+
+  test("with a non-array chunks field is refused", async () => {
+    const contentHash = contentHashFor(0);
+    expect(await postManifest(contentHash, { "x-api-key": API_KEY }, { 0: "x" })).toBe(400);
   });
 });
 
