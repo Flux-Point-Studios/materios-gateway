@@ -15,6 +15,7 @@ import { heartbeatsRouter } from "./routes/heartbeats.js";
 import { operatorsRouter, initOperatorsDb, getOperatorsDb } from "./routes/operators.js";
 import { ensureDir, indexExistingBatches } from "./storage.js";
 import { initQuotaDb } from "./quota.js";
+import { captureRawBody } from "./raw-body.js";
 import { initHeartbeatDb, startHeartbeatCleanup } from "./heartbeat-store.js";
 import { startCleanupTimer } from "./cleanup.js";
 import { startReceiptIndexer } from "./receipt-indexer.js";
@@ -84,11 +85,15 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Raw body parser for chunk uploads - MUST come before JSON parser for chunk routes
-app.put("/blobs/:contentHash/chunks/:i", express.raw({ type: "*/*", limit: `${config.maxChunkBytes}` }));
+// Raw body parser for chunk uploads - MUST come before JSON parser for chunk routes.
+// Both parsers keep the received bytes: a v2 upload signature covers them.
+app.put(
+  "/blobs/:contentHash/chunks/:i",
+  express.raw({ type: "*/*", limit: `${config.maxChunkBytes}`, verify: captureRawBody }),
+);
 
 // JSON parser for everything else
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "2mb", verify: captureRawBody }));
 
 // Phase 2.A — pay-per-use billing admission control. No-op when
 // BILLING_ENFORCEMENT_PHASE=off (default). Always runs AFTER body parsers

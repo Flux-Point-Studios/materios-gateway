@@ -52,6 +52,22 @@ export function normalizeSs58(address: unknown): string {
   return encodeAddress(raw, 42);
 }
 
+export const SS58_SHAPE = /^[15][a-zA-Z0-9]{45,47}$/;
+
+/**
+ * True for an account address, or anything shaped like one. An address is
+ * public, so a credential header carrying one proves nothing about its sender.
+ */
+export function isAccountAddress(value: string): boolean {
+  if (SS58_SHAPE.test(value)) return true;
+  try {
+    normalizeSs58(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Lookup key for a caller-supplied address. Reads must not 400 on a string
  * that is not a decodable SS58: rows predating canonicalisation could be keyed

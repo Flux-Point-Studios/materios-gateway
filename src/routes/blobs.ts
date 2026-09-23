@@ -12,6 +12,7 @@ import {
   recordUsage,
 } from "../quota.js";
 import { resolveAuth } from "../auth.js";
+import { hasUploadSignature } from "../upload-auth.js";
 import { notifySponsoredReceiptSubmitter, isSponsoredTier } from "../sponsored-receipts.js";
 import {
   computeRootHashFromChunks,
@@ -96,8 +97,7 @@ interface Manifest {
  * POST /blobs/:contentHash/manifest
  * Saves the manifest JSON for a blob.
  *
- * Auth (unified via resolveAuth): Bearer → x-api-key (legacy incl. SS58-as-key)
- * → sr25519 upload signature. The Bearer and api-key tiers are pre-funded
+ * Auth (unified via resolveAuth): Bearer → x-api-key → sr25519 upload signature. The Bearer and api-key tiers are pre-funded
  * (operators authorised by admin); sig-only tier is balance-gated inside
  * resolveAuth() via checkFunded().
  */
@@ -160,7 +160,7 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
     // Sig-only + registered-validator always use per-account quotas.
     let uploaderAddress: string | undefined;
     const useKeyedQuotas =
-      (auth.tier === "bearer" || auth.tier === "api-key" || auth.tier === "api-key-legacy-ss58") &&
+      (auth.tier === "bearer" || auth.tier === "api-key") &&
       auth.keyInfo !== undefined;
 
     // A chunkless (self-rooted) manifest is complete on arrival: it takes no
@@ -298,7 +298,7 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
  *      No identity is recorded for this tier (it's a service principal, not
  *      an operator), and quota tracking does not apply (read-only).
  *   2. unified resolveAuth — mirrors POST /blobs/:contentHash/manifest:
- *      Bearer → x-api-key (legacy incl. SS58-as-key) → sr25519 upload signature.
+ *      Bearer → x-api-key → sr25519 upload signature.
  *      Sig-only requests are balance-gated inside resolveAuth().
  *
  * Returns:
@@ -354,8 +354,8 @@ blobsRouter.get("/blobs/:contentHash/manifest", async (req: Request, res: Respon
  * Returns 409 if chunk already exists (idempotent).
  * Returns 400 if manifest not found or chunk index out of range.
  *
- * Auth (unified via resolveAuth): Bearer → x-api-key (legacy incl. SS58) →
- * sr25519 upload signature. Same dispatch as POST manifest; no header is
+ * Auth (unified via resolveAuth): Bearer → x-api-key → sr25519 upload
+ * signature. Same dispatch as POST manifest; no header is
  * strictly required on the chunk leg if the manifest was authed, but if any
  * auth is present we validate + record quotas.
  */
@@ -411,7 +411,7 @@ blobsRouter.put("/blobs/:contentHash/chunks/:i", async (req: Request, res: Respo
     const hasAuthHeader =
       typeof req.headers.authorization === "string" ||
       typeof req.headers["x-api-key"] === "string" ||
-      typeof req.headers["x-upload-sig"] === "string";
+      hasUploadSignature(req);
     const auth = hasAuthHeader ? await resolveAuth(req, contentHash) : null;
 
     if (auth && !auth.authenticated) {
@@ -425,7 +425,7 @@ blobsRouter.put("/blobs/:contentHash/chunks/:i", async (req: Request, res: Respo
 
     const useKeyedQuotas =
       auth !== null &&
-      (auth.tier === "bearer" || auth.tier === "api-key" || auth.tier === "api-key-legacy-ss58") &&
+      (auth.tier === "bearer" || auth.tier === "api-key") &&
       auth.keyInfo !== undefined;
 
     if (useKeyedQuotas && auth && auth.keyInfo) {

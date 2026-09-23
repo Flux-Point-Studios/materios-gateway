@@ -20,8 +20,9 @@ import Database from "better-sqlite3";
 import { join } from "path";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { config } from "../config.js";
-import { normalizeSs58, lookupSs58 } from "../ss58.js";
+import { normalizeSs58, lookupSs58, isAccountAddress } from "../ss58.js";
 import type { OperatorIdentity } from "../operator_identity.js";
+import { unguessableKeyHash } from "../quota.js";
 
 export const operatorsRouter = Router();
 
@@ -72,6 +73,27 @@ export function initOperatorsDb(): void {
   `);
 
   migrateRegistrationsSchema(db);
+
+  const retired = retireAddressDerivedRegistrationKeys(db);
+  console.log(`[blob-gateway] registrations: ${retired} address-derived api_key_hash value(s) replaced`);
+}
+
+/**
+ * Replace every registrations.api_key_hash that is sha256(ss58_address). That
+ * "key" is the public address, and PATCH /operators/:ss58/session-keys accepts
+ * whoever presents it. Idempotent; returns how many rows changed.
+ */
+export function retireAddressDerivedRegistrationKeys(database: Database.Database): number {
+  const retire = database.transaction(() => {
+    const rows = database
+      .prepare("SELECT ss58_address, api_key_hash FROM registrations")
+      .all() as Array<{ ss58_address: string; api_key_hash: string }>;
+    const update = database.prepare("UPDATE registrations SET api_key_hash = ? WHERE ss58_address = ?");
+    const guessable = rows.filter((r) => r.api_key_hash === hashToken(r.ss58_address));
+    for (const r of guessable) update.run(unguessableKeyHash(), r.ss58_address);
+    return guessable.length;
+  });
+  return retire.immediate();
 }
 
 const REGISTRATIONS_DDL = `
@@ -392,6 +414,10 @@ operatorsRouter.patch("/operators/:ss58/session-keys", (req: Request, res: Respo
     // Auth: operator must present their API key
     if (!api_key || typeof api_key !== "string") {
       res.status(401).json({ error: "Missing api_key in body" });
+      return;
+    }
+    if (isAccountAddress(api_key)) {
+      res.status(401).json({ error: "api_key holds an account address, which is public and authenticates nothing" });
       return;
     }
     const apiKeyHash = hashToken(api_key);

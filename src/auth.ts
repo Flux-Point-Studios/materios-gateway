@@ -10,8 +10,9 @@
 
 import type { Request } from "express";
 import { resolveKey, resolveKeyByAccount, lookupUploadEligibleValidator, type KeyInfo } from "./quota.js";
-import { verifyUploadSig } from "./upload-auth.js";
+import { verifyUploadSig, spendUploadSig, hasUploadSignature } from "./upload-auth.js";
 import { checkFunded } from "./rpc-client.js";
+import { isAccountAddress } from "./ss58.js";
 import {
   getApiTokensDb,
   verifyToken,
@@ -22,7 +23,6 @@ export type AuthTier =
   | "bearer"
   | "sig-only"
   | "api-key"
-  | "api-key-legacy-ss58"
   | "registered-validator";
 
 export interface AuthResult {
@@ -30,11 +30,14 @@ export interface AuthResult {
   tier?: AuthTier;
   identity?: string; // SS58 address or key name
   keyInfo?: KeyInfo;
+  /** The upload-signature scheme that authenticated a signature tier. */
+  sigVersion?: 1 | 2;
   error?: string;
 }
 
-/** SS58 address shape check — mirrors the one in routes/operators.ts. */
-const SS58_SHAPE = /^[15][a-zA-Z0-9]{45,47}$/;
+const ADDRESS_AS_KEY_ERROR =
+  "x-api-key holds an account address, which is public and authenticates nothing: " +
+  "sign the request (x-upload-sig-v2, x-uploader-address, x-upload-ts) or use a Bearer token";
 
 /**
  * Resolve auth for any request.
@@ -78,49 +81,34 @@ export async function resolveAuth(req: Request, contentHash?: string): Promise<A
     }
   }
 
-  // Priority 1: API key (highest trust, backwards compatible)
+  // Priority 1: API key (highest trust, backwards compatible). An address in
+  // this header is ignored when the request is signed, refused otherwise.
   const apiKey = req.headers["x-api-key"] as string | undefined;
-  if (apiKey) {
+  if (apiKey && isAccountAddress(apiKey)) {
+    if (!contentHash || !hasUploadSignature(req)) {
+      return { authenticated: false, error: ADDRESS_AS_KEY_ERROR };
+    }
+  } else if (apiKey) {
     const keyInfo = resolveKey(apiKey);
     if (!keyInfo) return { authenticated: false, error: "Invalid or disabled API key" };
-
-    // Emit a warn-log whenever the header is an SS58 address bound to the
-    // same address (the deprecated "SS58-as-API-key" pattern). This lets
-    // us grep `deprecated-ss58-auth` to track migration progress.
-    if (SS58_SHAPE.test(apiKey) && keyInfo.validatorId === apiKey) {
-      console.warn(
-        `[blob-gateway] deprecated-ss58-auth account=${apiKey} route=${req.path} method=${req.method}`,
-      );
-      return {
-        authenticated: true,
-        tier: "api-key-legacy-ss58",
-        identity: keyInfo.validatorId ?? keyInfo.name,
-        keyInfo,
-      };
-    }
-
     return { authenticated: true, tier: "api-key", identity: keyInfo.name, keyInfo };
   }
 
-  // Priority 2: Upload signature
+  // Priority 2: Upload signature, spent only once the signer may upload so a
+  // key with no registration and no funds leaves nothing in the store.
   if (contentHash) {
-    const sigResult = verifyUploadSig(req, contentHash);
-    if (sigResult.valid && sigResult.address) {
-      // Is this a registered validator (excluding heartbeat-only rows)? → highest quota tier
-      const info = lookupUploadEligibleValidator(sigResult.address);
-      if (info) {
-        return { authenticated: true, tier: "registered-validator", identity: sigResult.address };
-      }
-      // Is this a funded account? → sig-only tier
-      const funded = await checkFunded(sigResult.address);
-      if (funded) {
-        return { authenticated: true, tier: "sig-only", identity: sigResult.address };
-      }
-      return { authenticated: false, error: "Account below minimum balance" };
+    const sig = verifyUploadSig(req, contentHash);
+    if (!sig.valid) return { authenticated: false, error: sig.error };
+    const tier: AuthTier | undefined = lookupUploadEligibleValidator(sig.address)
+      ? "registered-validator"
+      : (await checkFunded(sig.address))
+        ? "sig-only"
+        : undefined;
+    if (!tier) return { authenticated: false, error: "Account below minimum balance" };
+    if (!spendUploadSig(req, sig)) {
+      return { authenticated: false, error: "Upload signature already used; sign each request afresh" };
     }
-    if (sigResult.error) {
-      return { authenticated: false, error: sigResult.error };
-    }
+    return { authenticated: true, tier, identity: sig.address, sigVersion: sig.version };
   }
 
   return { authenticated: false, error: "No authentication provided" };

@@ -19,7 +19,7 @@
  *     {
  *       "contentHash": "<64 hex, no 0x>",
  *       "operator":    "<SS58 address the upload was authed against>",
- *       "authTier":    "bearer" | "api-key" | "api-key-legacy-ss58",
+ *       "authTier":    "bearer" | "api-key",
  *       "rootHash":    "<64 hex from manifest, optional>",
  *       "manifestHash":"<sha256 of the canonical manifest JSON>",
  *       "source":      "blob-gateway"
@@ -35,7 +35,7 @@ import { config } from "./config.js";
 export interface SponsoredReceiptPayload {
   contentHash: string;
   operator: string;
-  authTier: "bearer" | "api-key" | "api-key-legacy-ss58";
+  authTier: "bearer" | "api-key";
   rootHash?: string;
   manifestHash?: string;
   /**
@@ -129,10 +129,6 @@ export async function notifySponsoredReceiptSubmitter(
  */
 export function isSponsoredTier(
   tier: string | undefined,
-): tier is "bearer" | "api-key" | "api-key-legacy-ss58" {
-  return (
-    tier === "bearer" ||
-    tier === "api-key" ||
-    tier === "api-key-legacy-ss58"
-  );
+): tier is "bearer" | "api-key" {
+  return tier === "bearer" || tier === "api-key";
 }

@@ -68,7 +68,6 @@ Four-tier auth model resolved by `resolveAuth()` in `src/auth.ts`:
 | **bearer** | `Authorization: Bearer matra_<token>` (preferred, revocable, hashed) | Same as api-key |
 | **sig-only** | sr25519 signature + funded on-chain account | 10 receipts/day, 256 MB/day, 3 concurrent |
 | **api-key** | `x-api-key` header (legacy random-hex key) | Per-key (default 100/day, 1 GB/day, 5 concurrent) |
-| **api-key-legacy-ss58** | `x-api-key` header containing the operator's SS58 address (**deprecated**; each call is warn-logged) | Per-key quotas |
 | **registered-validator** | Signature + committee registry membership | API-key-level quotas |
 
 ### Bearer Tokens (Preferred)
@@ -124,40 +123,74 @@ your own fetch call that sends `Authorization: Bearer ...`.
 3. Restart the client, confirm it works.
 4. Revoke the old token: `curl -X DELETE .../auth/token/<old-hash> -H "x-admin-token: ..."`.
 
-### Legacy SS58-as-API-key (Deprecated)
+### An address is not an API key
 
-Historically operators sent their SS58 address as the API key (`x-api-key: <ss58>`).
-This is still accepted for backwards compatibility but:
+An account address is public, so `x-api-key: <address>` authenticates nothing.
+When the request also carries upload-signature headers the address is ignored
+and the signature decides; otherwise the request is refused with 401. On
+`POST /heartbeats` the address is ignored and the heartbeat signature decides.
 
-- Every such call emits a structured warn log — grep for `deprecated-ss58-auth`
-  in blob-gateway logs to track clients that haven't migrated.
-- The secret is an operator's public on-chain identity — anyone watching the
-  explorer can guess it. It will be removed in a future PR after all clients
-  have migrated.
-
-Sample migration-tracking grep:
-
-```bash
-docker logs materios-node-blob-gateway-preprod-1 2>&1 \
-  | grep deprecated-ss58-auth \
-  | awk '{print $4}' | sort | uniq -c | sort -rn
-```
+The faucet registers an operator without issuing a key: its registry rows carry
+a random `key_hash` that no key hashes to, and the operator authenticates by
+signing. At startup the gateway replaces any `key_hash` equal to
+`sha256(validator_id)` in `quota.db:api_keys`, and any `api_key_hash` equal to
+`sha256(ss58_address)` in `operators.db:registrations`, with a random value,
+and logs each row it changed.
 
 ### Upload Signing Protocol
 
-Signing string format:
+v2 signs the whole request:
+
+```
+materios-upload-v2|{METHOD}|{path}|{bodySha256}|{id}|{uploaderAddress}|{timestamp}
+```
+
+- `METHOD` -- upper-case HTTP method (`PUT`, `POST`, `GET`, ...)
+- `path` -- the request path without the query string, as the gateway sees it:
+  the path appended to the gateway base URL (`/batches/<anchorId>`,
+  `/blobs/<contentHash>/manifest`, `/blobs/<contentHash>/chunks/<i>`)
+- `bodySha256` -- lower-case hex sha256 of the exact body bytes sent (of zero
+  bytes when there is no body)
+- `id` -- the anchor id or content hash in the path, without `0x`
+
+v1 signs only the id. It is still accepted everywhere except on batch writes
+and from addresses in `BATCH_WRITER_ADDRESSES`, which must send v2 on every
+route (their v1 signatures exist only for gateways that predate v2, and v1
+does not name the route it was made for):
 
 ```
 materios-upload-v1|{contentHash}|{uploaderAddress}|{timestamp}
 ```
 
-Required headers:
+Headers:
 
-- `x-upload-sig` -- hex-encoded sr25519 signature
-- `x-uploader-address` -- SS58 address
-- `x-upload-ts` -- Unix timestamp (seconds)
+- `x-upload-sig-v2` -- hex-encoded sr25519 signature over the v2 string
+- `x-upload-sig` -- hex-encoded sr25519 signature over the v1 string
+- `x-uploader-address` -- SS58 address (shared by both)
+- `x-upload-ts` -- Unix timestamp in seconds (shared by both)
+
+A client may send both signatures. Every signature a request carries must
+verify, v2 decides, and both are spent together. Batch writes (`PUT`/`POST /batches/:anchorId`) authenticated by
+signature require v2. Each accepted v1 signature logs one
+`{"log":"upload_sig_v1","address":...,"method":...,"route":...}` line so its
+retirement can be tracked.
+
+Every signature is accepted once: reuse is refused with 401, and used
+signatures are kept in `quota.db:used_upload_sigs` until their timestamp leaves
+the window, so a restart does not make them usable again. A signature is
+recorded only once its signer is registered or funded. A signature
+timestamped before the gateway process started is refused too. Sign each
+request afresh.
+
+The used-signature store is per `quota.db`. Gateways that trust the same
+signers must share it (or use distinct signer keys): otherwise a request one
+of them accepted is accepted again by the other until its timestamp leaves the
+window.
 
 Clock skew tolerance: 120 seconds (configurable via `UPLOAD_SIG_MAX_AGE_SEC`).
+
+`src/__tests__/fixtures/upload-sig-v2-golden.json` is a signed v2 test vector
+(`//Alice`) shared with the cert-daemon and the SDK.
 
 ### Anti-Spam (Three Layers)
 
@@ -169,7 +202,7 @@ Clock skew tolerance: 120 seconds (configurable via `UPLOAD_SIG_MAX_AGE_SEC`).
 
 Some clients can upload blobs but cannot sign the on-chain `orinqReceipts.submitReceipt` extrinsic — e.g. OpenHome community abilities, whose Python sandbox has no sr25519 primitives. Without a receipt the blob is an orphan the cert-daemon never sees, and it gets reaped after `RECEIPT_GRACE_HOURS`.
 
-When `SPONSORED_RECEIPT_SUBMITTER_URL` is configured, the gateway fires a fire-and-forget POST to that URL the moment a sponsored-tier upload (Bearer, api-key, or api-key-legacy-ss58) completes. Contract:
+When `SPONSORED_RECEIPT_SUBMITTER_URL` is configured, the gateway fires a fire-and-forget POST to that URL the moment a sponsored-tier upload (Bearer or api-key) completes. Contract:
 
 ```
 POST <SPONSORED_RECEIPT_SUBMITTER_URL>
@@ -180,7 +213,7 @@ Body:
   {
     "contentHash":  "<64 hex, no 0x>",
     "operator":     "<SS58 the upload was authed against>",
-    "authTier":     "bearer" | "api-key" | "api-key-legacy-ss58",
+    "authTier":     "bearer" | "api-key",
     "rootHash":     "<optional 64 hex from the manifest>",
     "manifestHash": "<sha256 of the canonical manifest JSON>",
     "source":       "blob-gateway"

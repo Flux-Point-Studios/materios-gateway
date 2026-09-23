@@ -44,7 +44,8 @@ import { u8aToHex, stringToU8a } from "@polkadot/util";
 import { config } from "../config.js";
 import { checkFunded } from "../rpc-client.js"; // mocked above — overridable per test
 import { blobsRouter } from "../routes/blobs.js";
-import { setQuotaDbForTests, migrateUsageColumns, migrateBindingColumn } from "../quota.js";
+import { setQuotaDbForTests, migrateUsageColumns, migrateBindingColumn, migrateUsedUploadSigs } from "../quota.js";
+import { captureRawBody } from "../raw-body.js";
 import {
   initApiTokensDb,
   issueToken,
@@ -58,7 +59,7 @@ import {
 async function setupApp(opts: { registerOperator?: boolean } = {}): Promise<{
   app: express.Express;
   ss58: string;
-  legacyApiKey: string;
+  addressAsKey: string;
   randomApiKey: string;
   bearerToken: string;
   tokensDb: Database.Database;
@@ -121,9 +122,10 @@ async function setupApp(opts: { registerOperator?: boolean } = {}): Promise<{
   migrateUsageColumns(quotaDb);
   // Task #94: add bound_validator_aura column so resolveKey() doesn't 500.
   migrateBindingColumn(quotaDb);
+  migrateUsedUploadSigs(quotaDb);
   setQuotaDbForTests(quotaDb);
 
-  // SS58-shape account used by both Bearer and legacy-SS58-as-API-key tests.
+  // SS58-shaped account used by the Bearer tests and as a would-be API key.
   const ss58 = "5OperatorUploadAuthTestaaaaaaaaaaaaaaaaaaaaaaab";
 
   // Random per-operator api key (the "real" production pattern — 64 hex).
@@ -139,15 +141,16 @@ async function setupApp(opts: { registerOperator?: boolean } = {}): Promise<{
       )
       .run(randomKeyHash, ss58);
 
-    // Legacy SS58-as-API-key: hash(ss58) also stored, validator_id = ss58.
-    const legacyKeyHash = createHash("sha256").update(ss58).digest("hex");
+    // A row keyed on sha256(address), as the faucet wrote before its keys
+    // were made unguessable.
+    const addressKeyHash = createHash("sha256").update(ss58).digest("hex");
     quotaDb
       .prepare(
         `INSERT INTO api_keys
          (key_hash, name, enabled, max_receipts_per_day, max_bytes_per_day, max_concurrent_uploads, validator_id)
-         VALUES (?, 'operator-test-legacy', 1, 100, 1073741824, 5, ?)`,
+         VALUES (?, 'operator-test-address-key', 1, 100, 1073741824, 5, ?)`,
       )
-      .run(legacyKeyHash, ss58);
+      .run(addressKeyHash, ss58);
   }
 
   // --- api_tokens db (in-memory) ---
@@ -166,15 +169,15 @@ async function setupApp(opts: { registerOperator?: boolean } = {}): Promise<{
   // Raw body parser for chunk uploads (mirrors production index.ts ordering).
   app.put(
     "/blobs/:contentHash/chunks/:i",
-    express.raw({ type: "*/*", limit: `${config.maxChunkBytes}` }),
+    express.raw({ type: "*/*", limit: `${config.maxChunkBytes}`, verify: captureRawBody }),
   );
-  app.use(express.json({ limit: "2mb" }));
+  app.use(express.json({ limit: "2mb", verify: captureRawBody }));
   app.use(blobsRouter);
 
   return {
     app,
     ss58,
-    legacyApiKey: ss58,
+    addressAsKey: ss58,
     randomApiKey,
     bearerToken,
     tokensDb,
@@ -326,23 +329,53 @@ describe("upload endpoints: unified auth (Bearer / x-api-key / sig)", () => {
   });
 
   // ------------------------------------------------------------------------
-  // 3b. Legacy SS58-as-API-key still works (deprecation coexistence window)
+  // 3b. An address is public: sent as x-api-key it authenticates nothing,
+  //     even while a pre-migration sha256(address) row still exists.
   // ------------------------------------------------------------------------
-  test("legacy_ss58_as_api_key_still_works_on_upload", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation((() => {}) as (...args: unknown[]) => void);
-    try {
-      const { manifest, contentHash } = buildSingleChunkManifest();
-      const res = await fetchJson(ctx.app, "POST", `/blobs/${contentHash}/manifest`, {
-        headers: { "x-api-key": ctx.legacyApiKey },
-        jsonBody: manifest,
-      });
-      expect(res.status).toBe(201);
-      // deprecated-ss58-auth warn-log fires in resolveAuth
-      const calls = (warn.mock.calls as unknown[][]).map((c) => c.join(" "));
-      expect(calls.some((m) => m.includes("deprecated-ss58-auth"))).toBe(true);
-    } finally {
-      warn.mockRestore();
-    }
+  test("address_as_api_key_is_refused_and_told_to_sign", async () => {
+    const { manifest, contentHash } = buildSingleChunkManifest();
+    const res = await fetchJson(ctx.app, "POST", `/blobs/${contentHash}/manifest`, {
+      headers: { "x-api-key": ctx.addressAsKey },
+      jsonBody: manifest,
+    });
+    expect(res.status).toBe(401);
+    expect((res.body as { error: string }).error).toMatch(/x-upload-sig/);
+  });
+
+  test("real_address_as_api_key_is_refused_even_when_a_row_is_keyed_on_it", async () => {
+    await cryptoWaitReady();
+    const pair = new Keyring({ type: "sr25519" }).addFromUri("//AddressAsKeyVictim");
+    ctx.quotaDb
+      .prepare(`INSERT INTO api_keys (key_hash, name, enabled, validator_id) VALUES (?, 'faucet-attestor', 1, ?)`)
+      .run(createHash("sha256").update(pair.address).digest("hex"), pair.address);
+    const { manifest, contentHash } = buildSingleChunkManifest(Buffer.from("victim"));
+    const res = await fetchJson(ctx.app, "POST", `/blobs/${contentHash}/manifest`, {
+      headers: { "x-api-key": pair.address },
+      jsonBody: manifest,
+    });
+    expect(res.status).toBe(401);
+  });
+
+  // ------------------------------------------------------------------------
+  // 3c. A client that sends its address as x-api-key AND signs is
+  //     authenticated by the signature; the address header is ignored.
+  // ------------------------------------------------------------------------
+  test("address_as_api_key_alongside_a_signature_authenticates_by_signature", async () => {
+    await cryptoWaitReady();
+    const pair = new Keyring({ type: "sr25519" }).addFromUri("//AddressKeyPlusSig");
+    const { manifest, contentHash } = buildSingleChunkManifest(Buffer.from("address-key-plus-sig"));
+    const ts = Math.floor(Date.now() / 1000);
+    const sig = u8aToHex(pair.sign(stringToU8a(`materios-upload-v1|${contentHash}|${pair.address}|${ts}`)));
+    const res = await fetchJson(ctx.app, "POST", `/blobs/${contentHash}/manifest`, {
+      headers: {
+        "x-api-key": pair.address,
+        "x-upload-sig": sig,
+        "x-uploader-address": pair.address,
+        "x-upload-ts": String(ts),
+      },
+      jsonBody: manifest,
+    });
+    expect(res.status).toBe(201);
   });
 
   // ------------------------------------------------------------------------
@@ -356,30 +389,43 @@ describe("upload endpoints: unified auth (Bearer / x-api-key / sig)", () => {
     const addr = pair.address;
 
     const { manifest, chunk, contentHash } = buildSingleChunkManifest(Buffer.from("sig-only-hello"));
-    const ts = Math.floor(Date.now() / 1000);
-    const signingString = `materios-upload-v1|${contentHash}|${addr}|${ts}`;
-    const sig = u8aToHex(pair.sign(stringToU8a(signingString)));
-
-    // Sanity: the gateway's signatureVerify should accept this pair too.
-    expect(signatureVerify(stringToU8a(signingString), sig, addr).isValid).toBe(true);
-
-    const sigHeaders: Record<string, string> = {
-      "x-upload-sig": sig,
-      "x-uploader-address": addr,
-      "x-upload-ts": String(ts),
+    // A signature authorises one request, so each leg is signed afresh.
+    const sigHeaders = (): Record<string, string> => {
+      const ts = Math.floor(Date.now() / 1000);
+      const signingString = `materios-upload-v1|${contentHash}|${addr}|${ts}`;
+      const sig = u8aToHex(pair.sign(stringToU8a(signingString)));
+      expect(signatureVerify(stringToU8a(signingString), sig, addr).isValid).toBe(true);
+      return { "x-upload-sig": sig, "x-uploader-address": addr, "x-upload-ts": String(ts) };
     };
 
     const mres = await fetchJson(ctx.app, "POST", `/blobs/${contentHash}/manifest`, {
-      headers: sigHeaders,
+      headers: sigHeaders(),
       jsonBody: manifest,
     });
     expect(mres.status).toBe(201);
 
     const cres = await fetchJson(ctx.app, "PUT", `/blobs/${contentHash}/chunks/0`, {
-      headers: sigHeaders,
+      headers: sigHeaders(),
       rawBody: chunk,
     });
     expect(cres.status).toBe(200);
+  });
+
+  test("one_signature_cannot_authorise_two_uploads", async () => {
+    await cryptoWaitReady();
+    const pair = new Keyring({ type: "sr25519" }).addFromUri("//SigReuser");
+    const { manifest, chunk, contentHash } = buildSingleChunkManifest(Buffer.from("sig-reuse"));
+    const ts = Math.floor(Date.now() / 1000);
+    const headers = {
+      "x-upload-sig": u8aToHex(pair.sign(stringToU8a(`materios-upload-v1|${contentHash}|${pair.address}|${ts}`))),
+      "x-uploader-address": pair.address,
+      "x-upload-ts": String(ts),
+    };
+    const mres = await fetchJson(ctx.app, "POST", `/blobs/${contentHash}/manifest`, { headers, jsonBody: manifest });
+    expect(mres.status).toBe(201);
+    const cres = await fetchJson(ctx.app, "PUT", `/blobs/${contentHash}/chunks/0`, { headers, rawBody: chunk });
+    expect(cres.status).toBe(401);
+    expect((cres.body as { error: string }).error).toMatch(/already used/);
   });
 
   // ------------------------------------------------------------------------

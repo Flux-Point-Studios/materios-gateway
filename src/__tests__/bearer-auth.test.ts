@@ -1,9 +1,8 @@
 /**
- * Integration tests for the unified Bearer / x-api-key / SS58-as-API-key auth path.
+ * Integration tests for the Bearer / x-api-key auth middleware.
  *
  * Builds a minimal Express app around resolveKey() + the Bearer middleware,
- * with an in-memory SQLite DB, so we can exercise header parsing and
- * deprecated-SS58 warn-logging end-to-end.
+ * with an in-memory SQLite DB, so we can exercise header parsing end-to-end.
  */
 
 import { describe, test, expect, beforeEach, vi, afterEach } from "vitest";
@@ -18,8 +17,8 @@ import { bearerAuth } from "../bearer-auth.js";
 type MountedApp = {
   app: express.Express;
   ss58: string;
-  /** Raw API key derived directly from an SS58 (legacy behaviour). */
-  legacyApiKey: string;
+  /** The operator's address, which a pre-migration row is keyed on. */
+  addressAsKey: string;
   /** Plaintext Bearer token for the same SS58. */
   bearerToken: string;
   adminToken: string;
@@ -70,16 +69,16 @@ function setupApp(): MountedApp {
   `);
   setOperatorsDbForTests(operatorsDb);
 
-  // Create a known operator with a known API key derived from SS58
-  // (legacy path: `x-api-key: <ss58>` works). SS58 shape: ^[15][a-zA-Z0-9]{45,47}$
+  // An operator row keyed on sha256(address), as the faucet wrote before its
+  // keys were made unguessable.
   const ss58 = "5OperatorTestaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab";
-  const legacyKeyHash = createHash("sha256").update(ss58).digest("hex");
+  const addressKeyHash = createHash("sha256").update(ss58).digest("hex");
   quotaDb
     .prepare(
       `INSERT INTO api_keys (key_hash, name, enabled, max_receipts_per_day, max_bytes_per_day, max_concurrent_uploads, validator_id)
        VALUES (?, ?, 1, 100, 1073741824, 5, ?)`,
     )
-    .run(legacyKeyHash, "operator-legacy", ss58);
+    .run(addressKeyHash, "operator-address-key", ss58);
 
   // Mint a Bearer token for the same account.
   const { token: bearerToken } = issueToken(tokensDb, {
@@ -105,7 +104,7 @@ function setupApp(): MountedApp {
   return {
     app,
     ss58,
-    legacyApiKey: ss58,
+    addressAsKey: ss58,
     bearerToken,
     adminToken,
     tokensDb,
@@ -206,20 +205,13 @@ describe("bearer auth middleware", () => {
     expect(after.status).toBe(401);
   });
 
-  test("ss58_legacy_auth_still_works_but_emits_warn_log", async () => {
-    // Legacy pattern: send SS58 as the x-api-key
+  test("address_as_api_key_is_refused_even_with_a_row_keyed_on_it", async () => {
     const res = await fetchJson(ctx.app, "POST", "/echo", {
-      headers: { "x-api-key": ctx.legacyApiKey },
+      headers: { "x-api-key": ctx.addressAsKey },
       body: {},
     });
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ account: ctx.ss58, tier: "api-key-legacy-ss58" });
-
-    // warn-log must have fired
-    const calls = (warnSpy.mock.calls as unknown[][]).map((c) => c.join(" "));
-    const deprecationLog = calls.find((m: string) => m.includes("deprecated-ss58-auth"));
-    expect(deprecationLog, `warn log not emitted: ${JSON.stringify(calls)}`).toBeTruthy();
-    expect(deprecationLog).toContain(ctx.ss58);
+    expect(res.status).toBe(401);
+    expect((res.body as { error: string }).error).toMatch(/Bearer/);
   });
 
   test("invalid_auth_returns_401", async () => {

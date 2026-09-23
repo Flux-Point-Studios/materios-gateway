@@ -6,7 +6,7 @@
  */
 
 import Database from "better-sqlite3";
-import { createHash } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { config } from "./config.js";
@@ -119,7 +119,103 @@ export function initQuotaDb(): void {
   // transparently. See bindValidatorAura() / getBindingForAura() below.
   migrateBindingColumn(db);
 
+  migrateUsedUploadSigs(db);
+
   loadKeys();
+
+  const retired = retireAddressDerivedApiKeys(db);
+  for (const r of retired) {
+    console.log(
+      `[blob-gateway] api_keys: replaced the address-derived key of ${r.name} (${r.validatorId}) with an unguessable one`,
+    );
+  }
+  console.log(`[blob-gateway] api_keys: ${retired.length} address-derived API key(s) replaced`);
+}
+
+/**
+ * key_hash for a registry row that has no API key. Random, so no key exists
+ * whose sha256 it is and x-api-key can never select the row.
+ */
+export function unguessableKeyHash(): string {
+  return randomBytes(32).toString("hex");
+}
+
+function isAddressDerived(keyHash: string, validatorId: string | null | undefined): boolean {
+  return !!validatorId && keyHash === hashKey(validatorId);
+}
+
+/**
+ * Give every api_keys row whose key_hash is sha256(validator_id) an
+ * unguessable one. Such a key is the validator's public address, so anyone
+ * could present it. The row's quota_daily and uploads_inflight rows follow the
+ * new hash; every other column is kept. Rows keyed by a secret never match,
+ * so running this again changes nothing.
+ */
+export function retireAddressDerivedApiKeys(
+  database: Database.Database,
+): Array<{ validatorId: string; name: string }> {
+  const retire = database.transaction(() => {
+    const rows = database
+      .prepare("SELECT key_hash, validator_id, name FROM api_keys WHERE validator_id IS NOT NULL")
+      .all() as Array<{ key_hash: string; validator_id: string; name: string }>;
+    const guessable = rows.filter((r) => isAddressDerived(r.key_hash, r.validator_id));
+    const rekey = ["api_keys", "quota_daily", "uploads_inflight"].map((table) =>
+      database.prepare(`UPDATE ${table} SET key_hash = ? WHERE key_hash = ?`),
+    );
+    for (const r of guessable) {
+      const next = unguessableKeyHash();
+      for (const stmt of rekey) stmt.run(next, r.key_hash);
+    }
+    return guessable.map((r) => ({ validatorId: r.validator_id, name: r.name }));
+  });
+  return retire.immediate();
+}
+
+/**
+ * Upload signatures already accepted, each kept until its timestamp leaves the
+ * acceptance window. On disk so a restart does not make them usable again.
+ */
+export function migrateUsedUploadSigs(database: Database.Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS used_upload_sigs (
+      sig TEXT PRIMARY KEY,
+      expires_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS used_upload_sigs_expires ON used_upload_sigs (expires_at);
+  `);
+}
+
+/**
+ * Record `sigs` as used until `expiresAt` (unix seconds). Returns false, and
+ * records none of them, when any was recorded before.
+ */
+export function claimUploadSignatures(sigs: string[], expiresAt: number, now: number): boolean {
+  const unique = [...new Set(sigs)];
+  const claim = db.transaction(() => {
+    db.prepare("DELETE FROM used_upload_sigs WHERE expires_at < ?").run(now);
+    const seen = db.prepare("SELECT 1 FROM used_upload_sigs WHERE sig = ?");
+    if (unique.some((sig) => seen.get(sig) !== undefined)) return false;
+    const insert = db.prepare("INSERT INTO used_upload_sigs (sig, expires_at) VALUES (?, ?)");
+    for (const sig of unique) insert.run(sig, expiresAt);
+    return true;
+  });
+  return claim.immediate();
+}
+
+/**
+ * Faucet registration: give `validatorId` an upload-eligible registry row
+ * unless it already has one. A heartbeat-only row does not count, so a
+ * node-only validator that drips gains the faucet row.
+ */
+export function ensureFaucetApiKey(validatorId: string, keyHash: string): void {
+  db.prepare(
+    `INSERT INTO api_keys
+       (key_hash, name, enabled, max_receipts_per_day, max_bytes_per_day, max_concurrent_uploads, validator_id)
+     SELECT ?, 'faucet-attestor', 1, 100, 1073741824, 5, ?
+     WHERE NOT EXISTS (
+       SELECT 1 FROM api_keys WHERE validator_id = ? AND key_hash NOT LIKE 'heartbeat-only:%'
+     )`,
+  ).run(keyHash, validatorId, validatorId);
 }
 
 /**
@@ -240,6 +336,13 @@ function loadKeys(): void {
           bound_validator_aura = COALESCE(excluded.bound_validator_aura, api_keys.bound_validator_aura)
       `);
 
+      const loadable = keys.filter((k) => {
+        if (!isAddressDerived(k.keyHash, k.validatorId)) return true;
+        console.warn(
+          `[blob-gateway] keys.json: skipped ${k.name} — its key is the address ${k.validatorId}, which anyone can present`,
+        );
+        return false;
+      });
       const upsertMany = db.transaction((items: typeof keys) => {
         for (const k of items) {
           upsert.run(
@@ -254,8 +357,8 @@ function loadKeys(): void {
           );
         }
       });
-      upsertMany(keys);
-      console.log(`[blob-gateway] Loaded ${keys.length} API keys from ${keysPath}`);
+      upsertMany(loadable);
+      console.log(`[blob-gateway] Loaded ${loadable.length} API keys from ${keysPath}`);
     } catch (err) {
       console.error(`[blob-gateway] Failed to load keys.json: ${err}`);
     }
