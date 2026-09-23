@@ -13,7 +13,7 @@ import { batchesRouter } from "./routes/batches.js";
 import { statusRouter } from "./routes/status.js";
 import { heartbeatsRouter } from "./routes/heartbeats.js";
 import { operatorsRouter, initOperatorsDb, getOperatorsDb } from "./routes/operators.js";
-import { ensureDir } from "./storage.js";
+import { ensureDir, indexExistingBatches } from "./storage.js";
 import { initQuotaDb } from "./quota.js";
 import { initHeartbeatDb, startHeartbeatCleanup } from "./heartbeat-store.js";
 import { startCleanupTimer } from "./cleanup.js";
@@ -155,6 +155,14 @@ async function start(): Promise<void> {
 
   // Ensure storage directories exist
   await ensureDir(config.storagePath);
+
+  // Trace lineage finds a receipt's anchor through its checkpoint leaf; index
+  // the leaves of batches stored before the index existed.
+  const indexed = await indexExistingBatches();
+  console.log(
+    `[blob-gateway] Leaf index: ${indexed.leaves} leaves across ${indexed.batches} batches` +
+      (indexed.skipped ? `, ${indexed.skipped} unreadable batch file(s) skipped` : ""),
+  );
 
   // Initialize SQLite databases
   initQuotaDb();

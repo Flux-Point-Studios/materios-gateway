@@ -210,15 +210,19 @@ describe("GET /trace/:contentHash", () => {
       },
     });
 
-    // Cardano anchor — Materios POI label 2222. The route looks up the
-    // batch by rootHash (which IS the contentHash here for the
-    // single-receipt case).
+    // Cardano anchor. Batches are keyed by anchorId; the route reaches this
+    // one through the receipt's checkpoint leaf.
+    // The cert-daemon's checkpoint leaf for this receipt on this chain:
+    // sha256("materios-checkpoint-v1" || genesis || receiptId || certHash).
+    const genesis = "0x0e46e33f639a56cc8780fd871d9a15e16d99af248526f907cb560cb40849f7bf";
+    const checkpointLeaf = "a920d75239e81ee8dacf7c67ee60cebf8a6c7ef4cf65bbd1922c9e8ef0b47ff6";
+    const anchorId = "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
     const cardanoTx = "1f14de860adc83cfdc344a5a19a6fe324e3dc555d25b2cdde30932afdd7e0a28";
-    await saveBatch(contentHash, {
-      anchorId: "0x" + contentHash,
-      rootHash: contentHash,
+    await saveBatch(anchorId, {
+      anchorId,
+      rootHash: checkpointLeaf,
       leafCount: 1,
-      leafHashes: [receiptId],
+      leafHashes: [checkpointLeaf],
       blockRangeStart: 91131,
       blockRangeEnd: 91131,
       cardanoTxHash: cardanoTx,
@@ -232,6 +236,7 @@ describe("GET /trace/:contentHash", () => {
 
     __test__setFetchImpl(
       buildRpcFetch({
+        chain_getBlockHash: { result: genesis },
         // contentHash → receipt IDs
         orinq_getReceiptsByContent: { result: [receiptId] },
         // receipt detail (byte arrays mirror live shape)

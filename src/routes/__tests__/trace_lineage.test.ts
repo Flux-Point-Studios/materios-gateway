@@ -18,12 +18,12 @@
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
 
 import express from "express";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
 import { config } from "../../config.js";
-import { saveManifest, saveBatch } from "../../storage.js";
+import { saveManifest, saveBatch, indexExistingBatches } from "../../storage.js";
 import { traceRouter, __test__setFetchImpl, __test__resetFetchImpl } from "../trace.js";
 
 interface RpcResponse {
@@ -342,78 +342,75 @@ describe("GET /trace/api/lineage/:contentHash", () => {
     expect(body.meta.note).toMatch(/2.*3|2 of 3|partial/i);
   });
 
-  test("fully attested + anchored → all 6 kinds present, L1 href to cexplorer", async () => {
-    const contentHash = "c7506e6092c5d609e6cea05f98ddc81122bef8fe8448a9675189446dadc383a2";
-    const receiptId = "0xc7dc93ba23aa1c0f95e5e5d8586bf3998e7de5b8e01bf60adf442b04198a0ca5";
-    const certHash = "0x431b3b3ca216366bd7e53095d66d89e3e301695c320bc5286c7b9c997dadc227";
-    const cardanoTx = "1f14de860adc83cfdc344a5a19a6fe324e3dc555d25b2cdde30932afdd7e0a28";
+  // Production values from receipt 0xfad47721…, checkpointed by the cert-daemon
+  // into anchor 0x80db1b85… and anchored on Cardano mainnet in 6d025849…. The
+  // batch is keyed by anchorId and its leaves are checkpoint leaves
+  // sha256("materios-checkpoint-v1" || genesis || receiptId || certHash), never
+  // the content hash or the receipt id.
+  const PROD = {
+    contentHash: "5b41090de887bfb684ee4fe1d2d3575cf666463c19310460f34e375952481433",
+    receiptId: "0xfad477219ff7d11b05059f39bf546ac130ea6fcaa1c531defb646a9f308a23c3",
+    certHash: "0xad9ec946f00e3d9a9b574aa71be8b24f03cfce09658b46a31db86e094bd5685d",
+    genesis: "0x0e46e33f639a56cc8780fd871d9a15e16d99af248526f907cb560cb40849f7bf",
+    leaf: "652f45194a5d0843492e026eb2fd4d354ea7d24c9b8c837a074818733dd9312a",
+    anchorId: "0x80db1b852b206a9e48746087170afd0645a938039d790de64cc0b837a055b0b8",
+    cardanoTx: "6d0258490759e08e0ac1e59fb177736cee599a922d154a5bd2597c3c2f0d9db5",
+  };
 
-    await saveManifest(contentHash, {
-      formatVersion: "v1",
-      runId: "run-final",
-      agentId: "agent-final",
-      rootHash: contentHash,
-      totalEvents: 17,
-      totalSpans: 3,
-      startedAt: "2026-05-21T14:00:00.000Z",
-      endedAt: "2026-05-21T14:05:00.000Z",
-      durationMs: 300_000,
-      chunks: [
-        { index: 0, sha256: "aa".repeat(32), size: 512 },
-        { index: 1, sha256: "bb".repeat(32), size: 1024 },
-      ],
+  function certifiedReceiptRpc(p: { receiptId: string; contentHash: string; certHash: string }) {
+    return buildRpcFetch({
+      chain_getBlockHash: { result: PROD.genesis },
+      orinq_getReceiptsByContent: { result: [p.receiptId] },
+      orinq_getReceipt: {
+        result: {
+          content_hash: Array.from(Buffer.from(p.contentHash, "hex")),
+          base_root_sha256: Array.from(Buffer.from(p.contentHash, "hex")),
+          base_manifest_hash: Array.from(Buffer.alloc(32)),
+          availability_cert_hash: Array.from(Buffer.from(p.certHash.slice(2), "hex")),
+          created_at_millis: 1790114215510,
+          submitter: "5DZPH4wWB2r4vrea23zXXvNLHroVa4uET7Ea2q5NtwdHkk9q",
+        },
+      },
+      orinq_getReceiptStatus: { result: "Certified" },
+      [`events:receipt-attestors:${p.receiptId}`]: {
+        result: {
+          certified: true,
+          cert_hash: p.certHash,
+          certified_at_block: 1972199,
+          signer_count: 3,
+          signers: [
+            { attester: "5Dd7WuLMyb71NT1Bea6oEZH8Je3MkQzamHVeU4tmQbtPWq2v", reward_base: "1000000" },
+            { attester: "5FHyiV88YBjxMjjZroQKcjW2nGyvHsGrPYmP7HhUNBxEpdZ7", reward_base: "1000000" },
+            { attester: "5FNdLcDWmnDxtsUwznPaxFr9u7nop3K2kmYmvTaZRTVQExkT", reward_base: "1000000" },
+          ],
+        },
+      },
     });
+  }
 
-    await saveBatch(contentHash, {
-      anchorId: "0x" + contentHash,
-      rootHash: contentHash,
-      leafCount: 1,
-      leafHashes: [receiptId],
-      blockRangeStart: 91131,
-      blockRangeEnd: 91131,
-      cardanoTxHash: cardanoTx,
-      cardanoNetwork: "preprod",
-      cardanoBlockHeight: 12345678,
-      cardanoMetadataLabel: 2222,
-      submitter: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-      timestamp: "2026-05-21T14:10:00Z",
+  function batchFor(anchorId: string, leafHashes: string[]) {
+    return {
+      anchorId,
+      rootHash: leafHashes.length === 1 ? leafHashes[0] : "ee".repeat(32),
+      leafCount: leafHashes.length,
+      leafHashes,
+      blockRangeStart: 1972199,
+      blockRangeEnd: 1972199,
+      submitter: "5Dd7WuLMyb71NT1Bea6oEZH8Je3MkQzamHVeU4tmQbtPWq2v",
+      timestamp: "2026-09-22T21:58:24.993606",
       source: "daemon",
-    });
+      cardanoTxHash: PROD.cardanoTx,
+      cardanoNetwork: "mainnet",
+      cardanoMetadataLabel: 8746,
+    };
+  }
 
-    __test__setFetchImpl(
-      buildRpcFetch({
-        orinq_getReceiptsByContent: { result: [receiptId] },
-        orinq_getReceipt: {
-          result: {
-            content_hash: Array.from(Buffer.from(contentHash, "hex")),
-            base_root_sha256: Array.from(Buffer.from(contentHash, "hex")),
-            base_manifest_hash: Array.from(
-              Buffer.from("5fe798feef0a421cebd8263e0f88be49fc65f6e9f8654a594237f35368f0fa77", "hex"),
-            ),
-            availability_cert_hash: Array.from(Buffer.from(certHash.slice(2), "hex")),
-            created_at_millis: 1779379200000,
-            submitter: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-          },
-        },
-        orinq_getReceiptStatus: { result: "Certified" },
-        [`events:receipt-attestors:${receiptId}`]: {
-          result: {
-            certified: true,
-            cert_hash: certHash,
-            certified_at_block: 91131,
-            signer_count: 3,
-            signers: [
-              { attester: "5CDKbyJZ8vgXYY8Cajhh9vCqpa5YDhicLWPMihQ4bb3HH8NS", reward_base: "1000000" },
-              { attester: "5CtBFsSx8HzX272AGNb764sv4sBLQUwb6GfHQjk8YdbMPW2d", reward_base: "1000000" },
-              { attester: "5Ge7JQmazsKLiEVmAZAVFQDHFVArpBnvc9zmxb1ujpzLJDQr", reward_base: "1000000" },
-            ],
-          },
-        },
-      }),
-    );
+  test("fully attested + anchored → all 6 kinds present, L1 href to cexplorer", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
 
-    const app = makeApp();
-    const resp = await getJson(app, `/trace/api/lineage/${contentHash}`);
+    const resp = await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`);
     expect(resp.status).toBe(200);
     const body = resp.body as LineageResponse;
 
@@ -421,16 +418,13 @@ describe("GET /trace/api/lineage/:contentHash", () => {
     expect(findNode(body, "receipt")).toBeTruthy();
     expect(body.nodes.filter((n) => n.kind === "attestation")).toHaveLength(3);
     expect(findNode(body, "cert")?.status).toBe("ok");
-    expect(findNode(body, "batch")).toBeTruthy();
+    expect(findNode(body, "batch")?.hashes.anchorId).toBe(PROD.anchorId);
 
     const l1 = findNode(body, "l1");
-    expect(l1).toBeTruthy();
     expect(l1?.status).toBe("ok");
-    expect(l1?.href).toBe(`https://preprod.cexplorer.io/tx/${cardanoTx}`);
-    expect(l1?.hashes.txHash).toBe(cardanoTx);
+    expect(l1?.href).toBe(`https://cexplorer.io/tx/${PROD.cardanoTx}`);
+    expect(l1?.hashes.txHash).toBe(PROD.cardanoTx);
 
-    // Each attestation edge labelled with cert_hash, batch → l1 with txHash,
-    // receipt → cert with baseRootSha256.
     const certEdge = body.edges.find((e) => e.from.includes("receipt") && e.to.includes("cert"));
     expect(certEdge?.label.toLowerCase()).toContain("baseroot");
     const l1Edge = body.edges.find((e) => e.to.includes("l1"));
@@ -438,6 +432,94 @@ describe("GET /trace/api/lineage/:contentHash", () => {
 
     expect(body.meta.finalized).toBe(true);
     expect(body.meta.minAttestationThreshold).toBeGreaterThan(0);
+  });
+
+  test("a receipt in a multi-leaf batch resolves to that batch through its leaf", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    const otherAnchor = "0x" + "d1".repeat(32);
+    await saveBatch(otherAnchor, batchFor(otherAnchor, ["aa".repeat(32), PROD.leaf, "bb".repeat(32)]));
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(body, "batch")?.hashes.anchorId).toBe(otherAnchor);
+    expect(findNode(body, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
+    expect(body.meta.finalized).toBe(true);
+  });
+
+  test("a batch written before the leaf index existed is found after the index is rebuilt", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    mkdirSync(join(tmpDir, "batches"), { recursive: true });
+    writeFileSync(
+      join(tmpDir, "batches", `${PROD.anchorId.slice(2)}.json`),
+      JSON.stringify(batchFor(PROD.anchorId, [PROD.leaf])),
+    );
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+
+    const before = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(before, "l1")).toBeUndefined();
+
+    expect(await indexExistingBatches()).toEqual({ batches: 1, leaves: 1, skipped: 0 });
+    const after = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(after, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
+  });
+
+  test("a leaf in two batches resolves to the one anchored on Cardano, whichever is saved last", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    const reflush = "0x" + "d3".repeat(32);
+    const { cardanoTxHash: _tx, cardanoNetwork: _net, ...unanchored } = batchFor(reflush, [PROD.leaf]);
+    await saveBatch(reflush, unanchored);
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(body, "batch")?.hashes.anchorId).toBe(PROD.anchorId);
+    expect(findNode(body, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
+  });
+
+  test("unreadable batch files are skipped when rebuilding the index, not fatal", async () => {
+    mkdirSync(join(tmpDir, "batches", `${"e2".repeat(32)}.json`), { recursive: true });
+    writeFileSync(join(tmpDir, "batches", `${"e1".repeat(32)}.json`), "{not json");
+    writeFileSync(join(tmpDir, "batches", "notes.json"), "{}");
+    writeFileSync(
+      join(tmpDir, "batches", `${PROD.anchorId.slice(2)}.json`),
+      JSON.stringify(batchFor(PROD.anchorId, [PROD.leaf])),
+    );
+    expect(await indexExistingBatches()).toEqual({ batches: 1, leaves: 1, skipped: 2 });
+  });
+
+  test("an index entry whose batch no longer lists the leaf is not trusted", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    writeFileSync(
+      join(tmpDir, "batches", `${PROD.anchorId.slice(2)}.json`),
+      JSON.stringify(batchFor(PROD.anchorId, ["ab".repeat(32)])),
+    );
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(body, "l1")).toBeUndefined();
+  });
+
+  test("an anchorId stored with upper-case hex still resolves", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    const upper = "0x" + PROD.anchorId.slice(2).toUpperCase();
+    await saveBatch(upper, batchFor(upper, [PROD.leaf]));
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(body, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
+  });
+
+  test("a batch that does not contain the receipt's leaf is not claimed as its anchor", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    const otherAnchor = "0x" + "d2".repeat(32);
+    await saveBatch(otherAnchor, batchFor(otherAnchor, ["cc".repeat(32)]));
+    await saveBatch(PROD.contentHash, batchFor(PROD.contentHash, ["dd".repeat(32)]));
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(body, "l1")).toBeUndefined();
+    expect(body.meta.finalized).toBe(false);
   });
 
   test("split cert disagreement renders both branches", async () => {
