@@ -5,8 +5,10 @@
 import { Router, type Request, type Response } from "express";
 import { resolveReceiptId, getManifest, getRawBytes } from "../storage.js";
 import { config } from "../config.js";
+import { requireHexId } from "./id-param.js";
 
 export const locatorsRouter = Router();
+locatorsRouter.param("receiptId", requireHexId("receiptId"));
 
 interface ManifestChunk {
   index: number;

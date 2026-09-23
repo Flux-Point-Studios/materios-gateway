@@ -29,6 +29,23 @@ function stripHexPrefix(hex: string): string {
   return hex;
 }
 
+const HEX_ID = /^[0-9a-fA-F]{64}$/;
+
+/** True for a 32-byte hex id, with or without "0x". */
+export function isHexId(value: string): boolean {
+  return HEX_ID.test(stripHexPrefix(value));
+}
+
+/**
+ * The only form of an id that may become part of a file path. Anything else
+ * (Express decodes %2F, so "../x" arrives intact) is refused here, whatever
+ * route or caller it came through.
+ */
+function hexId(value: string, what: string): string {
+  if (!isHexId(value)) throw new Error(`${what} must be a 32-byte hex id`);
+  return stripHexPrefix(value);
+}
+
 /**
  * Compute receiptId from contentHash: SHA256(Buffer.from(contentHash_hex)).
  * Returns hex string with "0x" prefix.
@@ -45,7 +62,7 @@ export async function ensureDir(dir: string): Promise<void> {
 }
 
 function receiptsDir(contentHash: string): string {
-  return join(config.storagePath, "receipts", stripHexPrefix(contentHash));
+  return join(config.storagePath, "receipts", hexId(contentHash, "contentHash"));
 }
 
 function chunksDir(contentHash: string): string {
@@ -223,6 +240,7 @@ export async function getStatus(contentHash: string): Promise<{
  * Resolve a receiptId to its contentHash via the index.
  */
 export async function resolveReceiptId(receiptId: string): Promise<string | null> {
+  if (!isHexId(receiptId)) return null;
   const receiptIdClean = stripHexPrefix(receiptId);
   const indexPath = join(indexDir(), `${receiptIdClean}.txt`);
   try {
@@ -239,7 +257,7 @@ export async function resolveReceiptId(receiptId: string): Promise<string | null
 export async function saveBatch(anchorId: string, metadata: object): Promise<void> {
   const dir = batchesDir();
   await ensureDir(dir);
-  await writeFile(join(dir, `${stripHexPrefix(anchorId)}.json`), JSON.stringify(metadata, null, 2));
+  await writeFile(join(dir, `${hexId(anchorId, "anchorId")}.json`), JSON.stringify(metadata, null, 2));
   await indexBatchLeaves(anchorId, metadata);
 }
 
@@ -281,7 +299,7 @@ async function indexedBatchIsAnchored(entry: string): Promise<boolean> {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw err;
   }
-  return hasCardanoTx(await getBatch(current));
+  return isHexId(current) && hasCardanoTx(await getBatch(current));
 }
 
 /**
@@ -332,6 +350,7 @@ export async function getBatchByLeaf(leafHash: string): Promise<object | null> {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
   }
+  if (!isHexId(anchorId)) return null;
   const batch = await getBatch(anchorId);
   // A batch record can be rewritten after it was indexed; only trust it while
   // it still lists this leaf.
@@ -346,7 +365,7 @@ export async function getBatchByLeaf(leafHash: string): Promise<object | null> {
  * Read batch metadata JSON.
  */
 export async function getBatch(anchorId: string): Promise<object | null> {
-  const batchPath = join(batchesDir(), `${stripHexPrefix(anchorId)}.json`);
+  const batchPath = join(batchesDir(), `${hexId(anchorId, "anchorId")}.json`);
   try {
     const data = await readFile(batchPath, "utf-8");
     return JSON.parse(data);

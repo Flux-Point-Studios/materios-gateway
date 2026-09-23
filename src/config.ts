@@ -2,9 +2,19 @@
  * Environment configuration for Materios blob gateway.
  */
 
+const csv = (value: string | undefined): string[] =>
+  (value || "").split(",").map((s) => s.trim()).filter(Boolean);
+
 export const config = {
   port: parseInt(process.env.PORT || "3000"),
   storagePath: process.env.STORAGE_PATH || "/data/blobs",
+  // Who may write batch records, which carry the Cardano tx trace lineage shows
+  // as a receipt's L1 anchor. An address counts only when it signed the request
+  // (an address used as an API key is public); an API key counts by the sha256
+  // of the key, because its name is chosen by whoever registers it. Both are
+  // comma-separated; empty lists refuse every write.
+  batchWriterAddresses: csv(process.env.BATCH_WRITER_ADDRESSES),
+  batchWriterKeyHashes: csv(process.env.BATCH_WRITER_KEY_HASHES).map((h) => h.toLowerCase()),
   apiKey: process.env.BLOB_GATEWAY_API_KEY || "",
   maxChunkSize: parseInt(process.env.MAX_CHUNK_SIZE || String(64 * 1024 * 1024)),
   gatewayBaseUrl: process.env.GATEWAY_BASE_URL || "http://materios-blob-gateway.materios.svc.cluster.local:3000",
