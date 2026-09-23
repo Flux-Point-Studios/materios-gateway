@@ -20,11 +20,12 @@ steps:
   # Build + push the image on main merges only (never on PRs → no push from an
   # untrusted PR context). Kaniko builds in userspace (no privileged/docker.sock),
   # so it grants no more than the `test` step already has on this shared host.
+  # plugin-kaniko prefixes `registry` to `repo`, so `repo` must not repeat ghcr.io.
   - name: publish
     image: woodpeckerci/plugin-kaniko
     settings:
       registry: ghcr.io
-      repo: ghcr.io/flux-point-studios/materios-gateway
+      repo: flux-point-studios/materios-gateway
       dockerfile: Dockerfile
       tags:
         - latest
