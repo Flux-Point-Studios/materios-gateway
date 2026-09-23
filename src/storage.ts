@@ -60,6 +60,12 @@ function batchesDir(): string {
   return join(config.storagePath, "batches");
 }
 
+function leafIndexDir(): string {
+  return join(config.storagePath, "index", "leaf-to-anchor");
+}
+
+const LEAF_RE = /^[0-9a-f]{64}$/;
+
 /**
  * Save manifest.json for a content hash.
  * Also writes receipt-to-content index file and receipt.meta.json.
@@ -233,6 +239,64 @@ export async function saveBatch(anchorId: string, metadata: object): Promise<voi
   const dir = batchesDir();
   await ensureDir(dir);
   await writeFile(join(dir, `${stripHexPrefix(anchorId)}.json`), JSON.stringify(metadata, null, 2));
+  await indexBatchLeaves(anchorId, metadata);
+}
+
+/**
+ * Record leafHash -> anchorId for every checkpoint leaf in a batch. Batches are
+ * keyed by anchorId, which no receipt carries, so a receipt can only reach its
+ * anchor through the leaf the cert-daemon derived from it.
+ */
+async function indexBatchLeaves(anchorId: string, metadata: object): Promise<number> {
+  const leaves = (metadata as { leafHashes?: unknown }).leafHashes;
+  if (!Array.isArray(leaves)) return 0;
+  const dir = leafIndexDir();
+  await ensureDir(dir);
+  let indexed = 0;
+  for (const leaf of leaves) {
+    const clean = typeof leaf === "string" ? stripHexPrefix(leaf).toLowerCase() : "";
+    if (!LEAF_RE.test(clean)) continue;
+    await writeFile(join(dir, clean), stripHexPrefix(anchorId).toLowerCase());
+    indexed++;
+  }
+  return indexed;
+}
+
+/**
+ * Index the leaves of every stored batch. Idempotent; run at startup so
+ * batches written before the index existed are reachable.
+ */
+export async function indexExistingBatches(): Promise<{ batches: number; leaves: number }> {
+  let files: string[];
+  try {
+    files = await readdir(batchesDir());
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { batches: 0, leaves: 0 };
+    throw err;
+  }
+  let batches = 0;
+  let leaves = 0;
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const record = JSON.parse(await readFile(join(batchesDir(), file), "utf-8")) as object;
+    leaves += await indexBatchLeaves(file.slice(0, -".json".length), record);
+    batches++;
+  }
+  return { batches, leaves };
+}
+
+/**
+ * The batch whose checkpoint leaves include this leaf, or null.
+ */
+export async function getBatchByLeaf(leafHash: string): Promise<object | null> {
+  let anchorId: string;
+  try {
+    anchorId = (await readFile(join(leafIndexDir(), stripHexPrefix(leafHash).toLowerCase()), "utf-8")).trim();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+  return getBatch(anchorId);
 }
 
 /**

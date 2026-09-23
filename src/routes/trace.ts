@@ -17,7 +17,8 @@
  */
 import { Router, type Request, type Response } from "express";
 import { config } from "../config.js";
-import { getManifest, getBatch } from "../storage.js";
+import { createHash } from "crypto";
+import { getManifest, getBatchByLeaf } from "../storage.js";
 import { cexplorerTxUrl } from "./explorer-chain.js";
 
 export const traceRouter = Router();
@@ -238,11 +239,31 @@ async function fetchEventsIndexerCert(receiptId: string): Promise<AttestorCertIn
   }
 }
 
-async function fetchAnchorRecord(rootHash: string): Promise<AnchorInfo> {
-  // anchor-worker-materios PUTs batch records keyed by anchorId. For the
-  // common single-receipt batch the rootHash IS the anchorId. Multi-receipt
-  // batches require an aggregation index keyed by leafHash → anchorId.
-  const empty: AnchorInfo = {
+let genesisHash: string | null = null;
+
+async function fetchGenesisHash(): Promise<string | null> {
+  if (!genesisHash) {
+    const hash = await rpcCall<string>("chain_getBlockHash", [0]);
+    if (typeof hash === "string" && RECEIPT_ID_RE.test(hash)) genesisHash = hash;
+  }
+  return genesisHash;
+}
+
+/**
+ * The cert-daemon's checkpoint leaf for a certified receipt:
+ * sha256("materios-checkpoint-v1" || genesis || receiptId || certHash).
+ */
+function checkpointLeaf(genesis: string, receiptId: string, certHash: string): string {
+  return createHash("sha256")
+    .update(Buffer.from("materios-checkpoint-v1", "utf-8"))
+    .update(Buffer.from(genesis.replace(/^0x/, ""), "hex"))
+    .update(Buffer.from(receiptId.replace(/^0x/, ""), "hex"))
+    .update(Buffer.from(certHash.replace(/^0x/, ""), "hex"))
+    .digest("hex");
+}
+
+function emptyAnchor(): AnchorInfo {
+  return {
     found: false,
     cardanoTxHash: null,
     cardanoNetwork: null,
@@ -252,8 +273,11 @@ async function fetchAnchorRecord(rootHash: string): Promise<AnchorInfo> {
     source: null,
     timestamp: null,
   };
-  const record = await getBatch(rootHash);
-  if (!record) return empty;
+}
+
+async function fetchAnchorRecord(leafHash: string): Promise<AnchorInfo> {
+  const record = await getBatchByLeaf(leafHash);
+  if (!record) return emptyAnchor();
   const r = record as Record<string, unknown>;
   const tx =
     typeof r.cardanoTxHash === "string" && HEX_TX_RE.test(r.cardanoTxHash.toLowerCase())
@@ -295,19 +319,14 @@ async function loadTrace(
     cert = await fetchEventsIndexerCert(receipt.receiptId);
   }
 
-  const rootHash = typeof manifest.rootHash === "string" ? manifest.rootHash : null;
-  const anchor = rootHash
-    ? await fetchAnchorRecord(rootHash)
-    : {
-        found: false,
-        cardanoTxHash: null,
-        cardanoNetwork: null,
-        cardanoBlockHeight: null,
-        cardanoMetadataLabel: null,
-        anchorId: null,
-        source: null,
-        timestamp: null,
-      };
+  // Only a certified receipt has a checkpoint leaf, and the leaf is the only
+  // key that reaches its anchor batch.
+  const certified = receipt !== null && !isAllZeroHex(receipt.availabilityCertHash);
+  const genesis = certified ? await fetchGenesisHash() : null;
+  const anchor =
+    receipt && certified && genesis
+      ? await fetchAnchorRecord(checkpointLeaf(genesis, receipt.receiptId, receipt.availabilityCertHash))
+      : emptyAnchor();
 
   if (receipt) {
     if (isAllZeroHex(receipt.baseManifestHash)) receipt.baseManifestHash = "";
