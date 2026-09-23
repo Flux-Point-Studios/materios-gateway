@@ -32,6 +32,7 @@ import {
   setQuotaDbForTests,
   migrateUsageColumns,
   migrateBindingColumn,
+  migrateUsedUploadSigs,
   resolveKey,
   startUpload,
   finalizeUpload,
@@ -91,6 +92,7 @@ beforeEach(() => {
   quotaDb.exec(SCHEMA);
   migrateUsageColumns(quotaDb);
   migrateBindingColumn(quotaDb);
+  migrateUsedUploadSigs(quotaDb);
   quotaDb
     .prepare(
       `INSERT INTO api_keys (key_hash, name, enabled, max_receipts_per_day, max_bytes_per_day, max_concurrent_uploads)
