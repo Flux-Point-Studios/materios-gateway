@@ -232,6 +232,7 @@ The submitter is a separate service (not provided by this repo today) that holds
 | `PORT` | `3000` | HTTP listen port |
 | `STORAGE_PATH` | `/data/blobs` | Blob storage directory |
 | `MATERIOS_RPC_URL` | `ws://materios-rpc.materios.svc.cluster.local:9945` | Substrate RPC endpoint |
+| `CARDANO_ANCHOR_WALLETS` | `""` (no anchor verifies) | Comma-separated bech32 addresses of the wallets that fund the label-8746 anchor txs. Trace lineage marks a Cardano anchor verified only when the tx is in a block, its materios-anchor-v2 record matches the batch (root, leaves, blocks, chain) and every input spends from one of these. Production: `addr1v8jk9tqygmwd7xvf86pkz2033ahf0zrzdeesz0wy25my7xqgduf4l,addr1qx2h3pcsp6l9lxc0nujfdrczrmmstvju024xxvjcu2ywptslud3z94x5tgw8p0aefdjm8wxwrt0j49y384nuxgsjd9xq89stdk` (the anchor-worker-materios checkpoint wallet, then the second label-8746 worker). |
 | `MIN_UPLOAD_BALANCE` | `1000000` (1 MATRA at 6-dec) | Minimum balance for sig-only uploads |
 | `BALANCE_CACHE_TTL_MS` | `300000` (5 min) | Balance check cache duration |
 | `UPLOAD_SIG_MAX_AGE_SEC` | `120` | Max signature age |

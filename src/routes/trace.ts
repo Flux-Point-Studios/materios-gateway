@@ -10,7 +10,8 @@
  *   trace → receipt → attestation* → cert → batch → l1
  *
  * Edges are labelled with the cryptographic linkage that ties node A to node B
- * (baseRootSha256, cert_hash, anchorId, tx_hash).
+ * (baseRootSha256, cert_hash, anchorId, tx_hash). The l1 node is checked
+ * against Cardano (l1-anchor-verify.ts), never taken from the batch record.
  *
  * Read-only and public — no auth, CORS open. Tests override fetchImpl via
  * `__test__setFetchImpl` so unit suite doesn't touch the real chain.
@@ -19,6 +20,12 @@ import { Router, type Request, type Response } from "express";
 import { config } from "../config.js";
 import { createHash } from "crypto";
 import { getManifest, getBatchByLeaf } from "../storage.js";
+import {
+  verifyL1Anchor,
+  type FetchLike,
+  type L1Status,
+  type L1Verification,
+} from "../l1-anchor-verify.js";
 import { cexplorerTxUrl } from "./explorer-chain.js";
 
 export const traceRouter = Router();
@@ -37,16 +44,6 @@ const DEFAULT_MIN_ATTESTATION_THRESHOLD = 3;
 // gateway image; CSP at the edge can pin unpkg as the only allowed script
 // source.
 const CYTOSCAPE_URL = "https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js";
-
-type FetchLike = (
-  url: string,
-  init?: RequestInit,
-) => Promise<{
-  ok: boolean;
-  status: number;
-  json: () => Promise<unknown>;
-  text: () => Promise<string>;
-}>;
 
 let fetchImpl: FetchLike = (url, init) => fetch(url, init as RequestInit);
 
@@ -86,13 +83,13 @@ interface AttestorCertInfo {
 
 interface AnchorInfo {
   found: boolean;
+  record: Record<string, unknown> | null;
   cardanoTxHash: string | null;
   cardanoNetwork: "preprod" | "mainnet" | null;
-  cardanoBlockHeight: number | null;
-  cardanoMetadataLabel: number | null;
   anchorId: string | null;
   source: string | null;
   timestamp: string | null;
+  verification: L1Verification | null;
 }
 
 // Sentinel thrown when chain RPC is unreachable. Surfaces as 503 on both
@@ -265,13 +262,13 @@ function checkpointLeaf(genesis: string, receiptId: string, certHash: string): s
 function emptyAnchor(): AnchorInfo {
   return {
     found: false,
+    record: null,
     cardanoTxHash: null,
     cardanoNetwork: null,
-    cardanoBlockHeight: null,
-    cardanoMetadataLabel: null,
     anchorId: null,
     source: null,
     timestamp: null,
+    verification: null,
   };
 }
 
@@ -289,15 +286,13 @@ async function fetchAnchorRecord(leafHash: string): Promise<AnchorInfo> {
       : null;
   return {
     found: true,
+    record: r,
     cardanoTxHash: tx,
     cardanoNetwork: net,
-    cardanoBlockHeight:
-      typeof r.cardanoBlockHeight === "number" ? r.cardanoBlockHeight : null,
-    cardanoMetadataLabel:
-      typeof r.cardanoMetadataLabel === "number" ? r.cardanoMetadataLabel : null,
     anchorId: typeof r.anchorId === "string" ? r.anchorId : null,
     source: typeof r.source === "string" ? r.source : null,
     timestamp: typeof r.timestamp === "string" ? r.timestamp : null,
+    verification: null,
   };
 }
 
@@ -323,10 +318,23 @@ async function loadTrace(
   // key that reaches its anchor batch.
   const certified = receipt !== null && !isAllZeroHex(receipt.availabilityCertHash);
   const genesis = certified ? await fetchGenesisHash() : null;
-  const anchor =
+  const leaf =
     receipt && certified && genesis
-      ? await fetchAnchorRecord(checkpointLeaf(genesis, receipt.receiptId, receipt.availabilityCertHash))
-      : emptyAnchor();
+      ? checkpointLeaf(genesis, receipt.receiptId, receipt.availabilityCertHash)
+      : null;
+  const anchor = leaf ? await fetchAnchorRecord(leaf) : emptyAnchor();
+  if (leaf && genesis && anchor.record && anchor.cardanoTxHash && anchor.cardanoNetwork) {
+    anchor.verification = await verifyL1Anchor(
+      {
+        txHash: anchor.cardanoTxHash,
+        network: anchor.cardanoNetwork,
+        batch: anchor.record,
+        leaf,
+        genesis,
+      },
+      fetchImpl,
+    );
+  }
 
   if (receipt) {
     if (isAllZeroHex(receipt.baseManifestHash)) receipt.baseManifestHash = "";
@@ -348,7 +356,7 @@ export type LineageNodeKind =
   | "batch"
   | "l1";
 
-export type LineageStatus = "ok" | "pending" | "missing";
+export type LineageStatus = "ok" | "pending" | "missing" | "failed" | "unknown";
 
 export interface LineageNode {
   id: string;
@@ -358,6 +366,7 @@ export interface LineageNode {
   hashes: Record<string, string>;
   meta?: Record<string, unknown>;
   href?: string;
+  verification?: L1Verification;
 }
 
 export interface LineageEdge {
@@ -377,6 +386,14 @@ export interface LineageResponse {
     note?: string;
   };
 }
+
+const L1_ANCHOR_LABEL = 8746;
+
+const L1_NOTE: Record<Exclude<L1Status, "ok">, (v: L1Verification) => string> = {
+  pending: (v) => `Anchor tx sent to Cardano ${v.network}, not in a Cardano block yet.`,
+  failed: (v) => `Cardano anchor failed verification: ${v.reason}`,
+  unknown: (v) => `Cardano anchor recorded but not verified: ${v.reason}`,
+};
 
 function shortHash(hex: string, head = 8, tail = 6): string {
   const h = hex.startsWith("0x") ? hex.slice(2) : hex;
@@ -578,7 +595,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
     };
   }
 
-  if (!anchor.found || !anchor.cardanoTxHash || !anchor.cardanoNetwork) {
+  if (!anchor.found || !anchor.cardanoTxHash || !anchor.cardanoNetwork || !anchor.verification) {
     return {
       contentHash,
       nodes,
@@ -590,6 +607,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
       },
     };
   }
+  const verification = anchor.verification;
 
   const batchId = "batch";
   nodes.push({
@@ -617,14 +635,16 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
     id: l1Id,
     kind: "l1",
     label: `Cardano ${anchor.cardanoNetwork} · ${shortHash(anchor.cardanoTxHash)}`,
-    status: "ok",
+    status: verification.status,
     hashes: { txHash: anchor.cardanoTxHash },
     meta: {
       network: anchor.cardanoNetwork,
-      blockHeight: anchor.cardanoBlockHeight,
-      metadataLabel: anchor.cardanoMetadataLabel,
+      blockHeight: verification.blockHeight,
+      metadataLabel: verification.status === "ok" ? L1_ANCHOR_LABEL : null,
+      confirmations: verification.confirmations,
     },
     href: cexplorerTxUrl(anchor.cardanoTxHash, anchor.cardanoNetwork),
+    verification,
   });
   edges.push({
     from: batchId,
@@ -639,7 +659,8 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
     edges,
     meta: {
       minAttestationThreshold: threshold,
-      finalized: true,
+      finalized: verification.status === "ok",
+      ...(verification.status === "ok" ? {} : { note: L1_NOTE[verification.status](verification) }),
     },
   };
 }
@@ -676,7 +697,9 @@ const CLIENT_SCRIPT = `
     trace: '#7eb8ff', receipt: '#ffd66b', attestation: '#b58bff',
     cert: '#7be38f', batch: '#ff9b4d', l1: '#ff7b7b'
   };
-  var statusBorder = { ok: '#1c5a2e', pending: '#5a4a1c', missing: '#5a1c1c' };
+  var statusBorder = {
+    ok: '#1c5a2e', pending: '#5a4a1c', missing: '#5a1c1c', failed: '#ff5a5a', unknown: '#5e636d'
+  };
   var elements = [];
   data.nodes.forEach(function(n){
     elements.push({ data: {
@@ -749,6 +772,18 @@ const CLIENT_SCRIPT = `
         if (v === null || v === undefined) return;
         h += '<li><span class="small">' + escapeHtml(k) + '</span> <span class="val mono">'
            + escapeHtml(v) + '</span></li>';
+      });
+      h += '</ul>';
+    }
+    if (node.verification) {
+      var v = node.verification;
+      h += '<h2 style="margin-top:12px">Cardano check · ' + escapeHtml(v.status) + '</h2>';
+      if (v.reason) h += '<div class="small" style="margin-bottom:6px">' + escapeHtml(v.reason) + '</div>';
+      h += '<ul>';
+      v.checks.forEach(function(c){
+        var mark = c.ok === true ? 'pass' : c.ok === false ? 'FAIL' : 'n/a';
+        h += '<li><span class="small">' + mark + ' · ' + escapeHtml(c.name) + '</span> <span class="val">'
+           + escapeHtml(c.detail) + '</span></li>';
       });
       h += '</ul>';
     }
@@ -832,6 +867,7 @@ function renderShell(title: string, bodyHtml: string, lineageJson?: string): str
   .badge.ok{background:#0e3b1f;color:#7be38f;border:1px solid #1c5a2e}
   .badge.warn{background:#3b2e0e;color:#ffd66b;border:1px solid #5a4a1c}
   .badge.err{background:#3b0e0e;color:#ff7b7b;border:1px solid #5a1c1c}
+  .badge.muted{background:#1a1f28;color:#9da3ad;border:1px solid #2a303a}
   a{color:#7eb8ff;text-decoration:none}
   a:hover{text-decoration:underline}
   ul{list-style:none;margin:0;padding:0}
@@ -869,6 +905,7 @@ function renderShell(title: string, bodyHtml: string, lineageJson?: string): str
     border:1px solid #232830;font-size:13px;color:#cdd2da;margin-bottom:16px;
   }
   .note-banner.ok{border-color:#1c5a2e;background:#0e3b1f}
+  .note-banner.err{border-color:#5a1c1c;background:#3b0e0e}
   @media (max-width:900px){
     #graph-shell{grid-template-columns:1fr}
     #side{max-height:none}
@@ -1013,8 +1050,24 @@ function renderReceiptCard(
 </div>`;
 }
 
+const VERIFICATION_BADGE: Record<L1Status, string> = {
+  ok: `<span class="badge ok">VERIFIED ON CARDANO</span>`,
+  pending: `<span class="badge warn">PENDING</span>`,
+  failed: `<span class="badge err">VERIFICATION FAILED</span>`,
+  unknown: `<span class="badge muted">UNVERIFIED</span>`,
+};
+
+function renderChecks(v: L1Verification): string {
+  return `<ul>${v.checks
+    .map((c) => {
+      const [cls, word] = c.ok === true ? ["ok", "PASS"] : c.ok === false ? ["err", "FAIL"] : ["muted", "N/A"];
+      return `<li class="signer"><span class="badge ${cls}">${word}</span><span class="att">${escapeHtml(c.name)}</span><span class="small">${escapeHtml(c.detail)}</span></li>`;
+    })
+    .join("")}</ul>`;
+}
+
 function renderAnchorCard(rootHash: string | null, anchor: AnchorInfo): string {
-  if (!anchor.found || !anchor.cardanoTxHash || !anchor.cardanoNetwork) {
+  if (!anchor.found || !anchor.cardanoTxHash || !anchor.cardanoNetwork || !anchor.verification) {
     return `
 <h2>Cardano L1 anchor</h2>
 <div class="card">
@@ -1027,22 +1080,24 @@ function renderAnchorCard(rootHash: string | null, anchor: AnchorInfo): string {
 </div>`;
   }
   const explorer = cexplorerTxUrl(anchor.cardanoTxHash, anchor.cardanoNetwork);
+  const v = anchor.verification;
   return `
 <h2>Cardano L1 anchor</h2>
 <div class="card">
   <div class="row">
-    <div class="col"><div class="label">Status</div><div class="val"><span class="badge ok">FINALIZED</span> <span class="small">${escapeHtml(anchor.cardanoNetwork)}</span></div></div>
+    <div class="col"><div class="label">Status</div><div class="val">${VERIFICATION_BADGE[v.status]} <span class="small">${escapeHtml(anchor.cardanoNetwork)}</span></div></div>
     ${
-      anchor.cardanoMetadataLabel !== null
-        ? `<div class="col"><div class="label">Metadata label</div><div class="val">${escapeHtml(anchor.cardanoMetadataLabel)}</div></div>`
+      v.blockHeight !== null
+        ? `<div class="col"><div class="label">L1 block height</div><div class="val">${escapeHtml(v.blockHeight)}</div></div>`
         : ""
     }
     ${
-      anchor.cardanoBlockHeight !== null
-        ? `<div class="col"><div class="label">L1 block height</div><div class="val">${escapeHtml(anchor.cardanoBlockHeight)}</div></div>`
+      v.confirmations !== null
+        ? `<div class="col"><div class="label">Confirmations</div><div class="val">${escapeHtml(v.confirmations)}${v.final ? " · final" : ""}</div></div>`
         : ""
     }
   </div>
+  ${v.reason ? `<div class="row"><div class="col"><div class="small">${escapeHtml(v.reason)}</div></div></div>` : ""}
   <div class="row">
     <div class="col"><div class="label">Cardano tx</div><div class="val mono"><a href="${escapeHtml(explorer)}" target="_blank" rel="noopener noreferrer">${escapeHtml(anchor.cardanoTxHash)}</a></div></div>
   </div>
@@ -1056,6 +1111,8 @@ function renderAnchorCard(rootHash: string | null, anchor: AnchorInfo): string {
       ? `<div class="row"><div class="col"><div class="label">Timestamp</div><div class="val">${escapeHtml(anchor.timestamp)}</div></div></div>`
       : ""
   }
+  <h2 style="margin-top:16px">Checked against Cardano${v.checkedAt ? ` <span class="small">at ${escapeHtml(v.checkedAt)}</span>` : ""}</h2>
+  ${renderChecks(v)}
 </div>`;
 }
 
@@ -1120,7 +1177,7 @@ function renderTimeline(
       ts: anchor.timestamp,
       kind: "anchor.cardano",
       signer: anchor.source ?? "anchor-worker",
-      detail: `tx=${anchor.cardanoTxHash.slice(0, 18)}…`,
+      detail: `tx=${anchor.cardanoTxHash.slice(0, 18)}… ${anchor.verification?.status ?? "unknown"}`,
     });
   }
 
@@ -1161,9 +1218,10 @@ function renderLegend(): string {
 
 function renderNoteBanner(lineage: LineageResponse): string {
   if (!lineage.meta.note && !lineage.meta.finalized) return "";
-  const cls = lineage.meta.finalized ? "note-banner ok" : "note-banner";
+  const l1Failed = lineage.nodes.some((n) => n.kind === "l1" && n.status === "failed");
+  const cls = lineage.meta.finalized ? "note-banner ok" : l1Failed ? "note-banner err" : "note-banner";
   const txt = lineage.meta.finalized
-    ? "Trace fully attested and anchored on Cardano L1."
+    ? "Trace fully attested and anchored on Cardano L1; the anchor tx was checked against the chain."
     : lineage.meta.note ?? "";
   return `<div class="${cls}">${escapeHtml(txt)}</div>`;
 }

@@ -10,9 +10,11 @@
  *   batches/{anchorId}.json
  *   index/
  *     receipt-to-content/{receiptId}.txt  -> contentHash (text file)
+ *     leaf-to-anchor/{leafHash}           -> anchorId (text file)
+ *     l1-verified/{cardanoTxHash}.json    -> chain facts of a verified, final anchor tx
  */
 
-import { mkdir, readFile, writeFile, access, readdir } from "fs/promises";
+import { mkdir, readFile, writeFile, access, readdir, rename } from "fs/promises";
 import { join } from "path";
 import { createHash } from "crypto";
 import { config } from "./config.js";
@@ -79,6 +81,10 @@ function batchesDir(): string {
 
 function leafIndexDir(): string {
   return join(config.storagePath, "index", "leaf-to-anchor");
+}
+
+function l1VerifiedFile(txHash: string): string {
+  return join(config.storagePath, "index", "l1-verified", `${hexId(txHash, "txHash")}.json`);
 }
 
 const LEAF_RE = /^[0-9a-f]{64}$/;
@@ -372,6 +378,28 @@ export async function getBatch(anchorId: string): Promise<object | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * The persisted chain facts of a Cardano anchor tx, or null if none were
+ * persisted. Throws on an unreadable record.
+ */
+export async function getL1Verified(txHash: string): Promise<object | null> {
+  let data: string;
+  try {
+    data = await readFile(l1VerifiedFile(txHash), "utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+  return JSON.parse(data) as object;
+}
+
+export async function saveL1Verified(txHash: string, record: object): Promise<void> {
+  const file = l1VerifiedFile(txHash);
+  await ensureDir(join(file, ".."));
+  await writeFile(`${file}.tmp`, JSON.stringify(record, null, 2));
+  await rename(`${file}.tmp`, file);
 }
 
 /**

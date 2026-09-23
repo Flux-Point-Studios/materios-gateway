@@ -21,6 +21,7 @@ import { AddressInfo } from "net";
 import { config } from "../../config.js";
 import { saveManifest, saveBatch } from "../../storage.js";
 import { traceRouter, __test__setFetchImpl, __test__resetFetchImpl } from "../trace.js";
+import { koiosResponder } from "../../__tests__/fixtures/l1_anchor.js";
 
 const PLAYWRIGHT_CACHE = join(
   process.env.HOME ?? "/root",
@@ -48,6 +49,9 @@ interface RpcResponse {
   result?: unknown;
 }
 
+// Cardano cannot be asked in this suite, so the L1 anchor renders unverified.
+const koiosDown = koiosResponder({ tip: { status: 503 } });
+
 function buildRpcFetch(answers: Record<string, RpcResponse>) {
   return async (
     url: string,
@@ -58,6 +62,8 @@ function buildRpcFetch(answers: Record<string, RpcResponse>) {
     json: () => Promise<unknown>;
     text: () => Promise<string>;
   }> => {
+    const fromKoios = await koiosDown(url, init);
+    if (fromKoios) return fromKoios;
     if (init && init.method === "POST" && typeof init.body === "string") {
       const body = JSON.parse(init.body) as { method: string };
       const ans = answers[body.method] ?? { result: null };
@@ -291,6 +297,9 @@ browserDescribe("trace lineage page in headless Chromium", () => {
     const sideAfter = (await page.locator("#side").textContent()) ?? "";
     expect(sideAfter).toContain(cardanoTx);
     expect(sideAfter.toLowerCase()).toContain("cexplorer");
+    expect(l1?.status).toBe("unknown");
+    expect(sideAfter).toContain("Cardano check · unknown");
+    expect(sideAfter).toContain("Cardano lookup unavailable");
 
     // The L1 side-panel button links to preprod.cexplorer.io.
     const linkHref = await page.locator("#side a").getAttribute("href");
