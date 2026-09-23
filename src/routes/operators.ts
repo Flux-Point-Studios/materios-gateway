@@ -20,7 +20,7 @@ import Database from "better-sqlite3";
 import { join } from "path";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { config } from "../config.js";
-import { normalizeSs58, lookupSs58 } from "../ss58.js";
+import { normalizeSs58, lookupSs58, isAccountAddress } from "../ss58.js";
 import type { OperatorIdentity } from "../operator_identity.js";
 import { unguessableKeyHash } from "../quota.js";
 
@@ -414,6 +414,10 @@ operatorsRouter.patch("/operators/:ss58/session-keys", (req: Request, res: Respo
     // Auth: operator must present their API key
     if (!api_key || typeof api_key !== "string") {
       res.status(401).json({ error: "Missing api_key in body" });
+      return;
+    }
+    if (isAccountAddress(api_key)) {
+      res.status(401).json({ error: "api_key holds an account address, which is public and authenticates nothing" });
       return;
     }
     const apiKeyHash = hashToken(api_key);

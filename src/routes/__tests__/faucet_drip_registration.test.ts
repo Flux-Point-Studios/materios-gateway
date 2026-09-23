@@ -237,6 +237,7 @@ describe("POST /faucet/drip — registration", () => {
       peer_id: "12D3KooWattacker",
       api_key: operator.address,
     });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(401);
+    expect(res.body.error).toMatch(/address/);
   });
 });
