@@ -390,6 +390,7 @@ describe("GET /trace/api/lineage/:contentHash", () => {
   function certifiedReceiptRpc(
     p: { receiptId: string; contentHash: string; certHash: string },
     koios: Record<string, KoiosAnswer> = { [PROD.cardanoTx]: { rows: [koiosTx(TX_FAD)] } },
+    tip?: KoiosAnswer,
   ) {
     return buildRpcFetch({
       chain_getBlockHash: { result: PROD.genesis },
@@ -418,7 +419,7 @@ describe("GET /trace/api/lineage/:contentHash", () => {
           ],
         },
       },
-    }, { txInfo: koios });
+    }, { txInfo: koios, tip });
   }
 
   function batchFor(anchorId: string, leafHashes: string[]) {
@@ -434,6 +435,7 @@ describe("GET /trace/api/lineage/:contentHash", () => {
       source: "daemon",
       cardanoTxHash: PROD.cardanoTx,
       cardanoNetwork: "mainnet",
+      cardanoSubmittedAt: "2026-09-22T21:58:25.521Z",
       cardanoMetadataLabel: 8746,
     };
   }
@@ -451,14 +453,17 @@ describe("GET /trace/api/lineage/:contentHash", () => {
     expect(findNode(body, "receipt")).toBeTruthy();
     expect(body.nodes.filter((n) => n.kind === "attestation")).toHaveLength(3);
     expect(findNode(body, "cert")?.status).toBe("ok");
-    expect(findNode(body, "batch")?.hashes.anchorId).toBe(PROD.anchorId);
+    const batch = findNode(body, "batch");
+    expect(batch?.status).toBe("ok");
+    expect(batch?.hashes.anchorId).toBe(PROD.anchorId);
+    expect(batch?.meta).toEqual({ gatewaySource: "daemon", gatewayTimestamp: "2026-09-22T21:58:24.993606" });
 
     const l1 = findNode(body, "l1");
     expect(l1?.status).toBe("ok");
     expect(l1?.href).toBe(`https://cexplorer.io/tx/${PROD.cardanoTx}`);
     expect(l1?.hashes.txHash).toBe(PROD.cardanoTx);
     expect(l1?.verification?.status).toBe("ok");
-    expect(l1?.verification?.checks).toHaveLength(9);
+    expect(l1?.verification?.checks).toHaveLength(11);
     expect(l1?.verification?.checks.every((c) => c.ok === true)).toBe(true);
     expect(l1?.meta?.blockHeight).toBe(13975415);
     expect(l1?.meta?.confirmations).toBe(815);
@@ -538,6 +543,17 @@ describe("GET /trace/api/lineage/:contentHash", () => {
     expect(findNode(body, "l1")).toBeUndefined();
   });
 
+  test("an error while loading a trace is answered with a 500, never left unhandled", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    mkdirSync(join(tmpDir, "index", "leaf-to-anchor", PROD.leaf), { recursive: true });
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+
+    const json = await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`);
+    expect(json.status).toBe(500);
+    expect(json.body).toEqual({ error: "Could not build the lineage for this trace." });
+    expect((await getJson(makeApp(), `/trace/${PROD.contentHash}`)).status).toBe(500);
+  }, 10_000);
+
   test("an anchorId stored with upper-case hex still resolves", async () => {
     await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
     const upper = "0x" + PROD.anchorId.slice(2).toUpperCase();
@@ -561,22 +577,28 @@ describe("GET /trace/api/lineage/:contentHash", () => {
   });
 
   describe("L1 anchor verified against Cardano, not taken from the batch record", () => {
-    async function lineageWith(koios: Record<string, KoiosAnswer>) {
+    const verifiedTx = { [PROD.cardanoTx]: { rows: [koiosTx(TX_FAD)] } };
+
+    async function serve(
+      path: string,
+      koios: Record<string, KoiosAnswer>,
+      batch: Record<string, unknown> = {},
+      tip?: KoiosAnswer,
+    ) {
       await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
-      await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
-      __test__setFetchImpl(certifiedReceiptRpc(PROD, koios));
-      const resp = await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`);
+      await saveBatch(PROD.anchorId, JSON.parse(JSON.stringify({ ...batchFor(PROD.anchorId, [PROD.leaf]), ...batch })));
+      __test__setFetchImpl(certifiedReceiptRpc(PROD, koios, tip));
+      const resp = await getJson(makeApp(), path);
       expect(resp.status).toBe(200);
-      return resp.body as LineageResponse;
+      return resp.body;
     }
 
-    async function pageWith(koios: Record<string, KoiosAnswer>) {
-      await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
-      await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
-      __test__setFetchImpl(certifiedReceiptRpc(PROD, koios));
-      const resp = await getJson(makeApp(), `/trace/${PROD.contentHash}`);
-      expect(resp.status).toBe(200);
-      return resp.body as string;
+    async function lineageWith(koios: Record<string, KoiosAnswer>, batch?: Record<string, unknown>, tip?: KoiosAnswer) {
+      return (await serve(`/trace/api/lineage/${PROD.contentHash}`, koios, batch, tip)) as LineageResponse;
+    }
+
+    async function pageWith(koios: Record<string, KoiosAnswer>, batch?: Record<string, unknown>) {
+      return (await serve(`/trace/${PROD.contentHash}`, koios, batch)) as string;
     }
 
     test("a Koios outage leaves the anchor unknown and the lineage unfinalized, but it still renders", async () => {
@@ -599,18 +621,69 @@ describe("GET /trace/api/lineage/:contentHash", () => {
       expect(body.meta.note).toMatch(/failed verification/i);
     });
 
-    test("a tx not in a block yet is pending", async () => {
-      const body = await lineageWith({});
+    test("a tx Koios cannot find yet is pending, without repeating the record's claim that it was sent", async () => {
+      const body = await lineageWith({}, { cardanoSubmittedAt: "2026-09-23T02:30:00Z" });
       expect(findNode(body, "l1")?.status).toBe("pending");
       expect(body.meta.finalized).toBe(false);
-      expect(body.meta.note).toMatch(/not in a Cardano block yet/i);
+      expect(body.meta.note).toMatch(/not found on Cardano mainnet yet/);
+      expect(body.meta.note).not.toMatch(/sent/);
+    });
+
+    test("a tx still missing an hour after the batch says it was sent fails", async () => {
+      const body = await lineageWith({});
+      expect(findNode(body, "l1")?.status).toBe("failed");
+      expect(body.meta.note).toMatch(/failed verification: .*not on Cardano mainnet an hour after/);
+    });
+
+    test("a verified anchor fewer than 15 blocks deep is ok but the lineage is not final yet", async () => {
+      const body = await lineageWith(verifiedTx, {}, { rows: [{ block_height: 13975417, block_time: 1790131132 }] });
+      const l1 = findNode(body, "l1");
+      expect(l1?.status).toBe("ok");
+      expect(l1?.verification?.confirmations).toBe(3);
+      expect(body.meta.finalized).toBe(false);
+      expect(body.meta.note).toMatch(/verified on Cardano mainnet, 3 of 15 confirmations before the lineage counts as final/);
+    });
+
+    test("a batch whose leaves do not recompute to its root is a failed batch node", async () => {
+      const body = await lineageWith(verifiedTx, { rootHash: "ab".repeat(32) });
+      expect(findNode(body, "batch")?.status).toBe("failed");
+      expect(findNode(body, "l1")?.status).toBe("failed");
+    });
+
+    test("a batch naming an anchor id its tx does not give is a failed batch node", async () => {
+      const forged = "0x" + "ee".repeat(32);
+      const body = await lineageWith(verifiedTx, { anchorId: forged });
+      const batch = findNode(body, "batch");
+      expect(batch?.status).toBe("failed");
+      expect(batch?.hashes.anchorId).toBe(PROD.anchorId);
+      expect(findNode(body, "l1")?.verification?.reason).toMatch(/anchor id/);
+      expect(body.meta.finalized).toBe(false);
+    });
+
+    test("a malformed batch record fails the anchor and the gateway keeps serving", async () => {
+      const body = await lineageWith(verifiedTx, { leafCount: { toString: 1 } });
+      expect(findNode(body, "l1")?.status).toBe("failed");
+      expect(findNode(body, "batch")?.status).toBe("failed");
+      expect(findNode(body, "l1")?.verification?.reason).toMatch(/malformed batch record/);
+
+      const html = await pageWith(verifiedTx, { leafCount: { toString: 1 } });
+      expect(html).toContain("VERIFICATION FAILED");
+    });
+
+    test("a hostile label-8746 value in Koios's answer fails the anchor and the gateway keeps serving", async () => {
+      const hostile = koiosTx(TX_FAD);
+      hostile.metadata = { "8746": { p: "materios", v: 2, leaves: { toString: 1 }, root: PROD.leaf, chain: "00", blocks: [0, 0] } };
+      const body = await lineageWith({ [PROD.cardanoTx]: { rows: [hostile] } });
+      expect(findNode(body, "l1")?.status).toBe("failed");
     });
 
     test("the HTML page shows what was checked for a verified anchor", async () => {
-      const html = await pageWith({ [PROD.cardanoTx]: { rows: [koiosTx(TX_FAD)] } });
+      const html = await pageWith(verifiedTx);
       expect(html).toContain("VERIFIED ON CARDANO");
       expect(html).toContain("funding_wallet");
       expect(html).toContain("815 confirmations");
+      expect(html).toContain("Anchor ID (from the tx&#39;s root and manifest)");
+      expect(html).toContain("Batch timestamp (gateway record)");
     });
 
     test("the HTML page never calls an unverifiable anchor verified", async () => {

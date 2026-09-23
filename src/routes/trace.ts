@@ -21,6 +21,8 @@ import { config } from "../config.js";
 import { createHash } from "crypto";
 import { getManifest, getBatchByLeaf } from "../storage.js";
 import {
+  BATCH_RECORD_CHECKS,
+  SETTLED_DEPTH,
   verifyL1Anchor,
   type FetchLike,
   type L1Status,
@@ -389,8 +391,10 @@ export interface LineageResponse {
 
 const L1_ANCHOR_LABEL = 8746;
 
-const L1_NOTE: Record<Exclude<L1Status, "ok">, (v: L1Verification) => string> = {
-  pending: (v) => `Anchor tx sent to Cardano ${v.network}, not in a Cardano block yet.`,
+const L1_NOTE: Record<L1Status, (v: L1Verification) => string> = {
+  ok: (v) =>
+    `Anchor verified on Cardano ${v.network}, ${v.confirmations} of ${SETTLED_DEPTH} confirmations before the lineage counts as final.`,
+  pending: (v) => `Anchor tx not found on Cardano ${v.network} yet.`,
   failed: (v) => `Cardano anchor failed verification: ${v.reason}`,
   unknown: (v) => `Cardano anchor recorded but not verified: ${v.reason}`,
 };
@@ -608,26 +612,26 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
     };
   }
   const verification = anchor.verification;
+  const anchorId = verification.anchorId ?? anchor.anchorId;
+  const batchFailed = verification.checks.some((c) => BATCH_RECORD_CHECKS.has(c.name) && c.ok === false);
 
   const batchId = "batch";
   nodes.push({
     id: batchId,
     kind: "batch",
-    label: anchor.anchorId
-      ? `Anchor batch · ${shortHash(anchor.anchorId)}`
-      : "Anchor batch",
-    status: "ok",
-    hashes: anchor.anchorId ? { anchorId: anchor.anchorId } : {},
+    label: anchorId ? `Anchor batch · ${shortHash(anchorId)}` : "Anchor batch",
+    status: batchFailed ? "failed" : "ok",
+    hashes: anchorId ? { anchorId } : {},
     meta: {
-      source: anchor.source,
-      timestamp: anchor.timestamp,
+      gatewaySource: anchor.source,
+      gatewayTimestamp: anchor.timestamp,
     },
   });
   edges.push({
     from: certId,
     to: batchId,
     label: "anchorId",
-    hash: anchor.anchorId ?? undefined,
+    hash: anchorId ?? undefined,
   });
 
   const l1Id = "l1";
@@ -653,14 +657,15 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
     hash: anchor.cardanoTxHash,
   });
 
+  const finalized = verification.status === "ok" && verification.settled;
   return {
     contentHash,
     nodes,
     edges,
     meta: {
       minAttestationThreshold: threshold,
-      finalized: verification.status === "ok",
-      ...(verification.status === "ok" ? {} : { note: L1_NOTE[verification.status](verification) }),
+      finalized,
+      ...(finalized ? {} : { note: L1_NOTE[verification.status](verification) }),
     },
   };
 }
@@ -1081,6 +1086,7 @@ function renderAnchorCard(rootHash: string | null, anchor: AnchorInfo): string {
   }
   const explorer = cexplorerTxUrl(anchor.cardanoTxHash, anchor.cardanoNetwork);
   const v = anchor.verification;
+  const anchorId = v.anchorId ?? anchor.anchorId;
   return `
 <h2>Cardano L1 anchor</h2>
 <div class="card">
@@ -1102,13 +1108,13 @@ function renderAnchorCard(rootHash: string | null, anchor: AnchorInfo): string {
     <div class="col"><div class="label">Cardano tx</div><div class="val mono"><a href="${escapeHtml(explorer)}" target="_blank" rel="noopener noreferrer">${escapeHtml(anchor.cardanoTxHash)}</a></div></div>
   </div>
   ${
-    anchor.anchorId
-      ? `<div class="row"><div class="col"><div class="label">Anchor ID</div><div class="val mono">${escapeHtml(anchor.anchorId)}</div></div></div>`
+    anchorId
+      ? `<div class="row"><div class="col"><div class="label">${escapeHtml(v.anchorId ? "Anchor ID (from the tx's root and manifest)" : "Anchor ID (gateway record)")}</div><div class="val mono">${escapeHtml(anchorId)}</div></div></div>`
       : ""
   }
   ${
     anchor.timestamp
-      ? `<div class="row"><div class="col"><div class="label">Timestamp</div><div class="val">${escapeHtml(anchor.timestamp)}</div></div></div>`
+      ? `<div class="row"><div class="col"><div class="label">Batch timestamp (gateway record)</div><div class="val">${escapeHtml(anchor.timestamp)}</div></div></div>`
       : ""
   }
   <h2 style="margin-top:16px">Checked against Cardano${v.checkedAt ? ` <span class="small">at ${escapeHtml(v.checkedAt)}</span>` : ""}</h2>
@@ -1307,9 +1313,9 @@ traceRouter.get(
       return;
     }
 
-    let loaded: LoadedTrace;
     try {
-      loaded = await loadTrace(raw, manifest);
+      const lineage = buildLineage(await loadTrace(raw, manifest), DEFAULT_MIN_ATTESTATION_THRESHOLD);
+      res.status(200).json(lineage);
     } catch (err) {
       if (err instanceof ChainUnreachable) {
         res.status(503).json({
@@ -1317,11 +1323,9 @@ traceRouter.get(
         });
         return;
       }
-      throw err;
+      console.error(`[trace] lineage error for ${raw}:`, err);
+      res.status(500).json({ error: "Could not build the lineage for this trace." });
     }
-
-    const lineage = buildLineage(loaded, DEFAULT_MIN_ATTESTATION_THRESHOLD);
-    res.status(200).json(lineage);
   },
 );
 
@@ -1348,9 +1352,10 @@ traceRouter.get("/trace/:contentHash", async (req: Request, res: Response) => {
     return;
   }
 
-  let loaded: LoadedTrace;
   try {
-    loaded = await loadTrace(raw, manifest);
+    const loaded = await loadTrace(raw, manifest);
+    const lineage = buildLineage(loaded, DEFAULT_MIN_ATTESTATION_THRESHOLD);
+    res.status(200).send(renderTracePage(loaded, lineage, DEFAULT_MIN_ATTESTATION_THRESHOLD));
   } catch (err) {
     if (err instanceof ChainUnreachable) {
       res.status(503).send(render503(err.cause));
@@ -1364,9 +1369,5 @@ traceRouter.get("/trace/:contentHash", async (req: Request, res: Response) => {
         `<h1>Render error</h1><div class="card"><div class="small">${escapeHtml(msg)}</div></div>`,
       ),
     );
-    return;
   }
-
-  const lineage = buildLineage(loaded, DEFAULT_MIN_ATTESTATION_THRESHOLD);
-  res.status(200).send(renderTracePage(loaded, lineage, DEFAULT_MIN_ATTESTATION_THRESHOLD));
 });

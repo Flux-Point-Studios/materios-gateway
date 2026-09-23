@@ -4,6 +4,7 @@
  * responses; nothing here touches the network.
  */
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
+import { createHash } from "crypto";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -17,6 +18,8 @@ import {
   TX_BFC,
   TX_FAD,
   TX_KNOWN_BAD,
+  TIP_HEIGHT,
+  TIP_TIME,
   WORKER_LUCID,
   gatewayBatch,
   koiosFetch,
@@ -94,8 +97,11 @@ describe("verifyL1Anchor", () => {
     expect(v.blockHeight).toBe(13976167);
     expect(v.blockHash).toBe("8f43e00b91342ba3a1cd38a4e15c5db83f244d8ddf359e66353ed3dba29df96f");
     expect(v.confirmations).toBe(63);
+    expect(v.settled).toBe(true);
     expect(v.final).toBe(false);
+    expect(v.anchorId).toBe("0x842c83eba6c680d893ed195f063430ddb4a035af902dccc83f5c67ee9e2de068");
     expect(v.checks.map((c) => c.name)).toEqual([
+      "batch_record",
       "merkle_root",
       "leaf_included",
       "tx_in_block",
@@ -104,6 +110,7 @@ describe("verifyL1Anchor", () => {
       "leaves",
       "blocks",
       "chain",
+      "anchor_id",
       "funding_wallet",
     ]);
     expect(v.checks.every((c) => c.ok === true)).toBe(true);
@@ -164,7 +171,7 @@ describe("verifyL1Anchor", () => {
     const v = await verifyL1Anchor(claimKnownBad(batch), koiosFetch({ txInfo: served(TX_KNOWN_BAD) }));
     expect(v.status).toBe("ok");
     expect(check(v, "root")?.ok).toBe(true);
-    for (const name of ["chain", "blocks", "leaves"]) {
+    for (const name of ["chain", "blocks", "leaves", "anchor_id"]) {
       expect(check(v, name)?.ok).toBeNull();
       expect(check(v, name)?.detail).toMatch(/root only/);
     }
@@ -241,9 +248,13 @@ describe("verifyL1Anchor", () => {
     const a = "aa".repeat(32);
     const b = "bb".repeat(32);
 
+    // The 842c83eb tx's manifest hash, which the anchor id binds with the root.
+    const manifest = "22027e67a61136ce1701bf03549f1a36077802aa42d991c959c928b7622e9de3";
+
     function multiLeaf(leafHashes: string[], rootHex: string) {
       const batch = {
         ...gatewayBatch("842c83eb"),
+        anchorId: `0x${createHash("sha256").update(Buffer.from(rootHex + manifest, "hex")).digest("hex")}`,
         rootHash: rootHex,
         leafCount: leafHashes.length,
         leafHashes,
@@ -287,12 +298,172 @@ describe("verifyL1Anchor", () => {
     });
   });
 
-  test("a tx that is not in a block yet is pending, never ok", async () => {
-    const v = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: {} }));
-    expect(v.status).toBe("pending");
-    expect(v.reason).toMatch(/not in a block/i);
-    expect(check(v, "tx_in_block")?.ok).toBeNull();
-    expect(v.blockHeight).toBeNull();
+  describe("a tx Koios cannot find", () => {
+    // The recorded tip was minted at 2026-09-23T02:38:52Z; the 842c83eb batch
+    // says its tx was sent at 02:15:13Z.
+    const sent = (iso: string | undefined) => {
+      const { cardanoSubmittedAt: _drop, ...batch } = gatewayBatch("842c83eb");
+      return iso === undefined ? batch : { ...batch, cardanoSubmittedAt: iso };
+    };
+
+    test("is pending, never ok, within an hour of being sent by Koios's clock, however late the page is viewed", async () => {
+      const v = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: {} }));
+      expect(v.status).toBe("pending");
+      expect(v.reason).toMatch(/not found on Cardano mainnet yet/);
+      expect(v.reason).not.toMatch(/sent/);
+      expect(check(v, "tx_in_block")?.ok).toBeNull();
+      expect(v.blockHeight).toBeNull();
+    });
+
+    test("fails once Koios's tip is an hour past the time the batch says it was sent", async () => {
+      const v = await verifyL1Anchor(claimBfc(sent("2026-09-23T01:38:51Z")), koiosFetch({ txInfo: {} }));
+      expect(v.status).toBe("failed");
+      expect(check(v, "tx_in_block")?.ok).toBe(false);
+      expect(v.reason).toMatch(/not on Cardano mainnet an hour after .*2026-09-23T01:38:51/);
+    });
+
+    test("stays pending while Koios's own tip lags, even when the batch is old", async () => {
+      const lagging = { rows: [{ block_height: TIP_HEIGHT, block_time: Date.parse("2026-09-23T02:00:00Z") / 1000 }] };
+      const v = await verifyL1Anchor(claimBfc(sent("2026-09-23T01:30:00Z")), koiosFetch({ txInfo: {}, tip: lagging }));
+      expect(v.status).toBe("pending");
+    });
+
+    test("fails when the batch names no time it was sent", async () => {
+      const v = await verifyL1Anchor(claimBfc(sent(undefined)), koiosFetch({ txInfo: {} }));
+      expect(v.status).toBe("failed");
+      expect(v.reason).toMatch(/no time it was sent/);
+    });
+
+    test("fails when the batch says it was sent in the future", async () => {
+      const future = new Date(Date.now() + 24 * 3600_000).toISOString();
+      const v = await verifyL1Anchor(claimBfc(sent(future)), koiosFetch({ txInfo: {} }));
+      expect(v.status).toBe("failed");
+      expect(v.reason).toMatch(/in the future/);
+    });
+  });
+
+  test("a verified tx is settled only 15 blocks deep; shallower it is ok but not settled", async () => {
+    const at = (depth: number) => ({ rows: [{ block_height: 13976167 + depth - 1, block_time: TIP_TIME }] });
+    const shallow = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: served(TX_BFC), tip: at(1) }));
+    expect(shallow.status).toBe("ok");
+    expect(shallow.confirmations).toBe(1);
+    expect(shallow.settled).toBe(false);
+
+    __test__resetL1Cache();
+    const settled = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: served(TX_BFC), tip: at(15) }));
+    expect(settled.confirmations).toBe(15);
+    expect(settled.settled).toBe(true);
+    expect(settled.final).toBe(false);
+  });
+
+  describe("anchor id", () => {
+    test("a batch naming an anchor id other than sha256(root || manifest) of its tx fails", async () => {
+      const batch = { ...gatewayBatch("842c83eb"), anchorId: "0x" + "ee".repeat(32) };
+      const v = await verifyL1Anchor(claimBfc(batch), koiosFetch({ txInfo: served(TX_BFC) }));
+      expect(v.status).toBe("failed");
+      expect(check(v, "anchor_id")?.ok).toBe(false);
+      expect(v.reason).toMatch(/anchor id 0xeeeeeeee.*842c83eb/);
+      expect(v.anchorId).toBe("0x842c83eba6c680d893ed195f063430ddb4a035af902dccc83f5c67ee9e2de068");
+    });
+
+    test("a batch naming no anchor id takes the one its tx gives", async () => {
+      const { anchorId: _drop, ...batch } = gatewayBatch("842c83eb");
+      const v = await verifyL1Anchor(claimBfc(batch), koiosFetch({ txInfo: served(TX_BFC) }));
+      expect(v.status).toBe("ok");
+      expect(check(v, "anchor_id")?.ok).toBeNull();
+      expect(v.anchorId).toBe("0x842c83eba6c680d893ed195f063430ddb4a035af902dccc83f5c67ee9e2de068");
+    });
+
+    test("a tx that anchors another root gives no anchor id for the batch", async () => {
+      const row = setAnchorField(koiosTx(TX_BFC), "root", { string: "ab".repeat(32) });
+      const v = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: served(TX_BFC, row) }));
+      expect(v.status).toBe("failed");
+      expect(v.anchorId).toBeNull();
+    });
+  });
+
+  describe("hostile or malformed input is judged, never thrown", () => {
+    // Valid JSON that a batch writer or Koios can send; String() on it throws.
+    const hostile = { toString: 1 };
+
+    test.each([
+      ["leafCount", { leafCount: hostile }],
+      ["leafCount", { leafCount: 2 }],
+      ["blockRangeStart", { blockRangeStart: hostile }],
+      ["blockRangeEnd", { blockRangeEnd: { toString: 0 } }],
+      ["blockRangeEnd", { blockRangeEnd: 1974756 }],
+      ["rootHash", { rootHash: hostile }],
+      ["leafHashes", { leafHashes: [hostile] }],
+      ["anchorId", { anchorId: hostile }],
+    ] as Array<[string, Record<string, unknown>]>)("a batch record with a malformed %s fails as malformed", async (_field, overrides) => {
+      const batch = JSON.parse(JSON.stringify({ ...gatewayBatch("842c83eb"), ...overrides })) as Record<string, unknown>;
+      const v = await verifyL1Anchor(claimBfc(batch), koiosFetch({ txInfo: served(TX_BFC) }));
+      expect(v.status).toBe("failed");
+      expect(check(v, "batch_record")?.ok).toBe(false);
+      expect(v.reason).toMatch(/malformed batch record/);
+    });
+
+    test("a detailed-schema field that is a map fails its comparison", async () => {
+      const row = setAnchorField(koiosTx(TX_BFC), "leaves", { map: [{ k: { string: "toString" }, v: { int: 1 } }] });
+      const v = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: served(TX_BFC, row) }));
+      expect(v.status).toBe("failed");
+      expect(check(v, "leaves")?.ok).toBe(false);
+    });
+
+    test("a plain-JSON record whose fields are objects fails its comparisons", async () => {
+      const row = koiosTx(TX_BFC);
+      row.metadata = {
+        "8746": { p: "materios", v: 2, chain: GENESIS.slice(2), root: LEAF_BFC, leaves: hostile, blocks: [hostile, 1], manifest: hostile },
+      };
+      const v = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: served(TX_BFC, row) }));
+      expect(v.status).toBe("failed");
+      expect(check(v, "leaves")?.ok).toBe(false);
+      expect(check(v, "blocks")?.ok).toBe(false);
+      expect(check(v, "anchor_id")?.ok).toBe(false);
+    });
+
+    test("a record entry whose key is not a string is ignored", async () => {
+      const row = koiosTx(TX_BFC);
+      (row.metadata as { "8746": { map: unknown[] } })["8746"].map.push({ k: hostile, v: { int: 0 } }, { k: { map: [] }, v: { int: 0 } });
+      const v = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: served(TX_BFC, row) }));
+      expect(v.status).toBe("ok");
+    });
+
+    test("a deeply nested value fails its comparison instead of overflowing the stack", async () => {
+      let deep: unknown = { int: 1 };
+      for (let i = 0; i < 200_000; i++) deep = { list: [deep] };
+      const row = setAnchorField(koiosTx(TX_BFC), "blocks", deep);
+      const v = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: served(TX_BFC, row) }));
+      expect(v.status).toBe("failed");
+      expect(check(v, "blocks")?.ok).toBe(false);
+    });
+  });
+
+  describe("a Koios answer missing what it always carries is unknown, not failed", () => {
+    test("an input without an address", async () => {
+      const row = koiosTx(TX_BFC) as unknown as { inputs: Array<Record<string, unknown>> };
+      delete row.inputs[0].payment_addr;
+      const v = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: served(TX_BFC, row as never) }));
+      expect(v.status).toBe("unknown");
+      expect(v.reason).toMatch(/Cardano lookup unavailable: .*address/);
+    });
+
+    test("a tx row without its metadata field", async () => {
+      const row = koiosTx(TX_BFC) as unknown as Record<string, unknown>;
+      delete row.metadata;
+      const v = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: served(TX_BFC, row as never) }));
+      expect(v.status).toBe("unknown");
+      expect(v.reason).toMatch(/metadata/);
+    });
+
+    test("a tip without its block time", async () => {
+      const v = await verifyL1Anchor(
+        claimBfc(),
+        koiosFetch({ txInfo: served(TX_BFC), tip: { rows: [{ block_height: TIP_HEIGHT }] } }),
+      );
+      expect(v.status).toBe("unknown");
+      expect(v.reason).toMatch(/tip/);
+    });
   });
 
   test("a Koios timeout makes the result unknown, within a bounded wait", async () => {
@@ -434,7 +605,8 @@ describe("verifyL1Anchor", () => {
         { ...claimKnownBad(knownBadBatch({ cardanoNetwork: "preprod" })), network: "preprod" },
         koiosFetch({ txInfo: {} }),
       );
-      expect(v.status).toBe("pending");
+      expect(v.blockHeight).toBeNull();
+      expect(v.reason).toMatch(/not on Cardano preprod/);
     });
   });
 });

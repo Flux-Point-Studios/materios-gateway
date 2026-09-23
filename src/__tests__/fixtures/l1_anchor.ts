@@ -30,7 +30,10 @@ export const TX_BFC = "3d5d5bb83e154ca33874411da7f4bea55291ba1a7377152ee9c10eb5a
 export const TX_FAD = "6d0258490759e08e0ac1e59fb177736cee599a922d154a5bd2597c3c2f0d9db5";
 export const TX_KNOWN_BAD = "a44d975fa72955cf46a883adf0fd2721e35a8b7f0c1d2366a56ad0872742ae19";
 
-export const TIP_HEIGHT = 13976229;
+/** The recorded mainnet tip: block 13976229, minted 2026-09-23T02:38:52Z. */
+export const TIP = load("koios_mainnet_tip.json") as Array<{ block_height: number; block_time: number }>;
+export const TIP_HEIGHT = TIP[0].block_height;
+export const TIP_TIME = TIP[0].block_time;
 
 export interface KoiosInput {
   payment_addr: { bech32: string; cred: string };
@@ -104,7 +107,7 @@ export function koiosResponder(opts: {
     opts.calls?.push(`${m[1]}:${m[2]}`);
     let answer: KoiosAnswer;
     if (m[2] === "tip") {
-      answer = opts.tip ?? { rows: [{ block_height: TIP_HEIGHT, block_no: TIP_HEIGHT }] };
+      answer = opts.tip ?? { rows: TIP };
     } else {
       const body = JSON.parse(String(init?.body ?? "{}")) as { _tx_hashes?: string[] };
       const hash = body._tx_hashes?.[0] ?? "";

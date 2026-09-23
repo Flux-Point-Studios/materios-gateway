@@ -170,7 +170,7 @@
     {
       "id": "l1-anchor-verifier",
       "name": "Cardano L1 anchor verifier",
-      "desc": "Checks a checkpoint batch's Cardano anchor against the chain through Koios instead of trusting the gateway record: tx in a block, label-8746 materios-anchor-v2 record matching the batch root, leaf count, block range and Materios genesis, every input spent from an allowlisted anchor wallet, and the receipt leaf included under the recomputed Merkle root. Chain facts of a verified tx at least k = 2160 blocks deep are persisted; other answers are re-read after a minute.",
+      "desc": "Checks a checkpoint batch's Cardano anchor against the chain through Koios instead of trusting the gateway record: a well-formed batch whose leaves recompute to its root and include the receipt leaf, tx in a block, label-8746 materios-anchor-v2 record matching the batch root, leaf count, block range and Materios genesis and hashing to its anchor id, and every input spent from an allowlisted anchor wallet. Total over hostile batch records and Koios answers; a tx still missing an hour after it was sent fails; settled at 15 confirmations. Chain facts of a verified tx at least k = 2160 blocks deep are persisted; other answers are re-read after a minute.",
       "kind": "toolkit",
       "paths": [
         "src/l1-anchor-verify.ts"
