@@ -4,8 +4,10 @@
 
 import { Router, type Request, type Response } from "express";
 import { resolveReceiptId, getChunk } from "../storage.js";
+import { requireHexId } from "./id-param.js";
 
 export const chunksRouter = Router();
+chunksRouter.param("receiptId", requireHexId("receiptId"));
 
 /**
  * GET /chunks/:receiptId/:i

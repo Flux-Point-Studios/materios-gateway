@@ -5,6 +5,14 @@
 export const config = {
   port: parseInt(process.env.PORT || "3000"),
   storagePath: process.env.STORAGE_PATH || "/data/blobs",
+  // Identities allowed to write batch records: the auth identity resolveAuth
+  // returns (an SS58 address, or an API key's name), comma-separated. Batch
+  // records carry the Cardano tx the trace lineage displays, so only the
+  // anchoring pipeline may write them; empty refuses every write.
+  batchWriters: (process.env.BATCH_WRITERS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
   apiKey: process.env.BLOB_GATEWAY_API_KEY || "",
   maxChunkSize: parseInt(process.env.MAX_CHUNK_SIZE || String(64 * 1024 * 1024)),
   gatewayBaseUrl: process.env.GATEWAY_BASE_URL || "http://materios-blob-gateway.materios.svc.cluster.local:3000",

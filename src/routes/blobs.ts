@@ -18,8 +18,10 @@ import {
   isValidRootHash,
   stripHexPrefix as stripHexPrefixUtil,
 } from "../merkle.js";
+import { requireHexId } from "./id-param.js";
 
 export const blobsRouter = Router();
+blobsRouter.param("contentHash", requireHexId("contentHash"));
 
 /**
  * Read-only privileged-callback recogniser for GET /blobs/:contentHash/manifest.

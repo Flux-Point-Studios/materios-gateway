@@ -24,7 +24,7 @@ vi.mock("../rpc-client.js", () => ({
 
 import express from "express";
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -70,10 +70,15 @@ function makeQuotaDb(): Database.Database {
   db.prepare(
     `INSERT INTO api_keys (key_hash, name, enabled) VALUES (?, ?, 1)`,
   ).run(keyHash, "batches-route-test");
+  // A customer's key: it authenticates, but it is not a batch writer.
+  db.prepare(
+    `INSERT INTO api_keys (key_hash, name, enabled) VALUES (?, ?, 1)`,
+  ).run(createHash("sha256").update(CUSTOMER_API_KEY).digest("hex"), "customer");
   return db;
 }
 
 const TEST_API_KEY = "test-batches-key";
+const CUSTOMER_API_KEY = "test-customer-key";
 
 /** Build an Express app that mounts only the batches router. */
 function makeApp(): express.Express {
@@ -140,11 +145,13 @@ describe("/batches/:anchorId route", () => {
     tmpDir = mkdtempSync(join(tmpdir(), "batches-route-test-"));
     originalStoragePath = config.storagePath;
     (config as { storagePath: string }).storagePath = tmpDir;
+    config.batchWriters.splice(0, config.batchWriters.length, "batches-route-test");
     setQuotaDbForTests(makeQuotaDb());
   });
 
   afterEach(() => {
     (config as { storagePath: string }).storagePath = originalStoragePath;
+    config.batchWriters.splice(0, config.batchWriters.length);
     try {
       rmSync(tmpDir, { recursive: true, force: true });
     } catch {
@@ -261,5 +268,35 @@ describe("/batches/:anchorId route", () => {
     const getResp = await request(app, "GET", `/batches/${anchorId}`, null);
     expect(getResp.status).toBe(200);
     expect(getResp.body.rootHash).toBe(metadata.rootHash);
+  });
+  test("PUT by an authenticated caller who is not a batch writer is refused", async () => {
+    const app = makeApp();
+    const anchorId = "33".repeat(32);
+    const resp = await request(
+      app,
+      "PUT",
+      `/batches/${anchorId}`,
+      { rootHash: "cc".repeat(32), leafHashes: ["44".repeat(32)], cardanoTxHash: "55".repeat(32) },
+      { "x-api-key": CUSTOMER_API_KEY },
+    );
+    expect(resp.status).toBe(403);
+    expect((await request(app, "GET", `/batches/${anchorId}`, null)).status).toBe(404);
+  });
+
+  test("GET with a path-traversal id is rejected, and nothing outside batches/ is read", async () => {
+    const app = makeApp();
+    writeFileSync(join(tmpDir, "secret.json"), JSON.stringify({ secret: true }));
+    const resp = await request(app, "GET", "/batches/..%2Fsecret", null);
+    expect(resp.status).toBe(400);
+    expect(resp.body.secret).toBeUndefined();
+  });
+
+  test("PUT with a non-hex anchorId is rejected before anything is written", async () => {
+    const app = makeApp();
+    const resp = await request(app, "PUT", "/batches/..%2Fescaped", { rootHash: "00".repeat(32) }, {
+      "x-api-key": TEST_API_KEY,
+    });
+    expect(resp.status).toBe(400);
+    expect(existsSync(join(tmpDir, "escaped.json"))).toBe(false);
   });
 });
