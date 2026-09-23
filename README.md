@@ -153,7 +153,10 @@ materios-upload-v2|{METHOD}|{path}|{bodySha256}|{id}|{uploaderAddress}|{timestam
   bytes when there is no body)
 - `id` -- the anchor id or content hash in the path, without `0x`
 
-v1 signs only the id and is still accepted everywhere except batch writes:
+v1 signs only the id. It is still accepted everywhere except on batch writes
+and from addresses in `BATCH_WRITER_ADDRESSES`, which must send v2 on every
+route (their v1 signatures exist only for gateways that predate v2, and v1
+does not name the route it was made for):
 
 ```
 materios-upload-v1|{contentHash}|{uploaderAddress}|{timestamp}
@@ -166,17 +169,23 @@ Headers:
 - `x-uploader-address` -- SS58 address (shared by both)
 - `x-upload-ts` -- Unix timestamp in seconds (shared by both)
 
-A client may send both signatures; the gateway then verifies v2 and burns v1
-with it. Batch writes (`PUT`/`POST /batches/:anchorId`) authenticated by
+A client may send both signatures. Every signature a request carries must
+verify, v2 decides, and both are spent together. Batch writes (`PUT`/`POST /batches/:anchorId`) authenticated by
 signature require v2. Each accepted v1 signature logs one
 `{"log":"upload_sig_v1","address":...,"method":...,"route":...}` line so its
 retirement can be tracked.
 
 Every signature is accepted once: reuse is refused with 401, and used
 signatures are kept in `quota.db:used_upload_sigs` until their timestamp leaves
-the window, so a restart does not make them usable again. A signature
+the window, so a restart does not make them usable again. A signature is
+recorded only once its signer is registered or funded. A signature
 timestamped before the gateway process started is refused too. Sign each
 request afresh.
+
+The used-signature store is per `quota.db`. Gateways that trust the same
+signers must share it (or use distinct signer keys): otherwise a request one
+of them accepted is accepted again by the other until its timestamp leaves the
+window.
 
 Clock skew tolerance: 120 seconds (configurable via `UPLOAD_SIG_MAX_AGE_SEC`).
 

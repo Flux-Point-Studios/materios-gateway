@@ -180,7 +180,8 @@ export function migrateUsedUploadSigs(database: Database.Database): void {
     CREATE TABLE IF NOT EXISTS used_upload_sigs (
       sig TEXT PRIMARY KEY,
       expires_at INTEGER NOT NULL
-    )
+    );
+    CREATE INDEX IF NOT EXISTS used_upload_sigs_expires ON used_upload_sigs (expires_at);
   `);
 }
 

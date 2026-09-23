@@ -11,8 +11,12 @@
 
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 
+const funding = vi.hoisted(() => ({ funded: true, delayMs: 0 }));
 vi.mock("../rpc-client.js", () => ({
-  checkFunded: vi.fn(async () => true),
+  checkFunded: vi.fn(async () => {
+    if (funding.delayMs) await new Promise((r) => setTimeout(r, funding.delayMs));
+    return funding.funded;
+  }),
   checkReceiptStatus: vi.fn(async () => "not_found" as const),
   disconnectRpc: vi.fn(async () => {}),
 }));
@@ -22,7 +26,8 @@ vi.mock("../notify.js", () => ({
 
 import express from "express";
 import Database from "better-sqlite3";
-import { createHash } from "crypto";
+import { createHash, randomBytes } from "crypto";
+import { performance } from "perf_hooks";
 import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
@@ -178,6 +183,18 @@ function signed(pair: KeyringPair, o: SignOpts): Record<string, string> {
 
 const json = (v: unknown) => Buffer.from(JSON.stringify(v));
 const JSON_TYPE = { "content-type": "application/json" };
+const usedSignatures = (db: Database.Database) =>
+  (db.prepare("SELECT COUNT(*) AS n FROM used_upload_sigs").get() as { n: number }).n;
+
+function manifestFor(label: string): { contentHash: string; path: string; body: Buffer } {
+  const payload = Buffer.from(label);
+  const contentHash = sha256hex(payload);
+  return {
+    contentHash,
+    path: `/blobs/${contentHash}/manifest`,
+    body: json({ chunks: [{ index: 0, sha256: contentHash, size: payload.length }] }),
+  };
+}
 
 describe("golden vector", () => {
   test("the gateway builds the same signing string from the same request parts", () => {
@@ -253,6 +270,29 @@ describe("claimUploadSignatures", () => {
     expect(claimUploadSignatures(["bb"], 100, 60)).toBe(true);
     expect(claimUploadSignatures(["aa"], 200, 101)).toBe(true);
   });
+
+  test("its cost does not grow with the number of signatures it holds", () => {
+    const db = quotaDb();
+    setQuotaDbForTests(db);
+    const medianClaimMs = () => {
+      const times: number[] = [];
+      for (let i = 0; i < 301; i++) {
+        const sig = randomBytes(64).toString("hex");
+        const t0 = performance.now();
+        expect(claimUploadSignatures([sig], 2_000, 1_000)).toBe(true);
+        times.push(performance.now() - t0);
+      }
+      times.sort((a, b) => a - b);
+      return times[150];
+    };
+    const nearlyEmpty = medianClaimMs();
+    const insert = db.prepare("INSERT INTO used_upload_sigs (sig, expires_at) VALUES (?, ?)");
+    db.transaction(() => {
+      for (let i = 0; i < 100_000; i++) insert.run(randomBytes(64).toString("hex"), 1_500 + (i % 400));
+    })();
+    const full = medianClaimMs();
+    expect(full).toBeLessThan(nearlyEmpty * 4 + 0.05);
+  });
 });
 
 describe("upload signatures bound to the request", () => {
@@ -260,10 +300,13 @@ describe("upload signatures bound to the request", () => {
   let prevStorage: string;
   let db: Database.Database;
   let writer: KeyringPair;
+  let uploader: KeyringPair;
   let app: express.Express;
 
   beforeEach(async () => {
     await cryptoWaitReady();
+    funding.funded = true;
+    funding.delayMs = 0;
     storage = mkdtempSync(join(tmpdir(), "upload-sig-v2-"));
     prevStorage = config.storagePath;
     config.storagePath = storage;
@@ -271,6 +314,8 @@ describe("upload signatures bound to the request", () => {
     setQuotaDbForTests(db);
     writer = new Keyring({ type: "sr25519" }).addFromUri("//BatchWriterV2");
     register(db, writer.address);
+    uploader = new Keyring({ type: "sr25519" }).addFromUri("//RegisteredUploader");
+    register(db, uploader.address);
     config.batchWriterAddresses.splice(0, config.batchWriterAddresses.length, writer.address);
     config.batchWriterKeyHashes.splice(0, config.batchWriterKeyHashes.length);
     app = makeApp();
@@ -401,27 +446,97 @@ describe("upload signatures bound to the request", () => {
   });
 
   test("a v1 signature sent alongside v2 is burned with it", async () => {
-    const id = anchor(12);
-    const body = json({ rootHash: "ab".repeat(32) });
-    const both = signed(writer, { method: "PUT", path: `/batches/${id}`, id, body, v1: true });
-    expect((await send(app, "PUT", `/batches/${id}`, body, { ...JSON_TYPE, ...both })).status).toBe(200);
+    const m = manifestFor("burned-with-v2");
+    const both = signed(uploader, { method: "POST", path: m.path, id: m.contentHash, body: m.body, v1: true });
+    expect((await send(app, "POST", m.path, m.body, { ...JSON_TYPE, ...both })).status).toBe(201);
 
     const v1Only = {
       "x-upload-sig": both["x-upload-sig"],
       "x-uploader-address": both["x-uploader-address"],
       "x-upload-ts": both["x-upload-ts"],
     };
-    const manifest = json({ chunks: [] });
-    const replay = await send(app, "POST", `/blobs/${id}/manifest`, manifest, { ...JSON_TYPE, ...v1Only });
+    const replay = await send(app, "POST", m.path, json({ chunks: [] }), { ...JSON_TYPE, ...v1Only });
     expect(replay.status).toBe(401);
     expect(replay.body.error).toMatch(/already used/);
+  });
+
+  test("a v1 signature lifted from a batch write before it lands authenticates nothing, and the batch write still lands", async () => {
+    const id = anchor(13);
+    const body = json({ rootHash: "ab".repeat(32) });
+    const both = signed(writer, { method: "PUT", path: `/batches/${id}`, id, body, v1: true });
+    const lifted = {
+      "x-upload-sig": both["x-upload-sig"],
+      "x-uploader-address": both["x-uploader-address"],
+      "x-upload-ts": both["x-upload-ts"],
+    };
+    const cross = await send(app, "POST", `/blobs/${id}/manifest`, json({ chunks: [] }), { ...JSON_TYPE, ...lifted });
+    expect(cross.status).toBe(401);
+    expect(cross.body.error).toMatch(/x-upload-sig-v2/);
+
+    const real = await send(app, "PUT", `/batches/${id}`, body, { ...JSON_TYPE, ...both });
+    expect(real.status).toBe(200);
+  });
+
+  test("a companion v1 signature that does not verify refuses the request and records nothing", async () => {
+    const m = manifestFor("forged-companion");
+    const res = await send(app, "POST", m.path, m.body, {
+      ...JSON_TYPE,
+      ...signed(uploader, { method: "POST", path: m.path, id: m.contentHash, body: m.body }),
+      "x-upload-sig": "0x" + randomBytes(64).toString("hex"),
+    });
+    expect(res.status).toBe(401);
+    expect(res.body.error).toMatch(/signature in x-upload-sig$/);
+    expect(usedSignatures(db)).toBe(0);
+  });
+
+  test("a signer who is neither registered nor funded leaves nothing in the store", async () => {
+    funding.funded = false;
+    const stranger = new Keyring({ type: "sr25519" }).addFromUri("//UnfundedStranger");
+    const m = manifestFor("unfunded-stranger");
+    const res = await send(app, "POST", m.path, m.body, {
+      ...JSON_TYPE,
+      ...signed(stranger, { method: "POST", path: m.path, id: m.contentHash, body: m.body, v1: true }),
+    });
+    expect(res.status).toBe(403);
+    expect(usedSignatures(db)).toBe(0);
+  });
+
+  test("another signer cannot burn a victim's v1 signature by carrying it next to their own v2", async () => {
+    funding.funded = false;
+    const burner = new Keyring({ type: "sr25519" }).addFromUri("//SignatureBurner");
+    const m = manifestFor("victim-v1");
+    const victimV1 = signed(uploader, { method: "POST", path: m.path, id: m.contentHash, v1: true, v2: false });
+    const burn = await send(app, "POST", m.path, m.body, {
+      ...JSON_TYPE,
+      ...signed(burner, { method: "POST", path: m.path, id: m.contentHash, body: m.body }),
+      "x-upload-sig": victimV1["x-upload-sig"],
+    });
+    expect(burn.status).toBe(401);
+
+    const victim = await send(app, "POST", m.path, m.body, { ...JSON_TYPE, ...victimV1 });
+    expect(victim.status).toBe(201);
+  });
+
+  test("two copies of one signed request in flight together: exactly one is accepted", async () => {
+    funding.delayMs = 50;
+    const fundedSigner = new Keyring({ type: "sr25519" }).addFromUri("//FundedSigOnly");
+    const m = manifestFor("in-flight-twice");
+    const headers = {
+      ...JSON_TYPE,
+      ...signed(fundedSigner, { method: "POST", path: m.path, id: m.contentHash, body: m.body }),
+    };
+    const results = await Promise.all([
+      send(app, "POST", m.path, m.body, headers),
+      send(app, "POST", m.path, m.body, headers),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual([201, 401]);
   });
 
   test("v1 still authenticates other routes, once, and each use is logged", async () => {
     const payload = Buffer.from("v1-still-accepted");
     const contentHash = sha256hex(payload);
     const manifest = json({ chunks: [{ index: 0, sha256: contentHash, size: payload.length }] });
-    const headers = signed(writer, { method: "POST", path: `/blobs/${contentHash}/manifest`, id: contentHash, v1: true, v2: false });
+    const headers = signed(uploader, { method: "POST", path: `/blobs/${contentHash}/manifest`, id: contentHash, v1: true, v2: false });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const first = await send(app, "POST", `/blobs/${contentHash}/manifest`, manifest, { ...JSON_TYPE, ...headers });
@@ -430,7 +545,7 @@ describe("upload signatures bound to the request", () => {
       expect(lines).toHaveLength(1);
       expect(JSON.parse(lines[0])).toEqual({
         log: "upload_sig_v1",
-        address: writer.address,
+        address: uploader.address,
         method: "POST",
         route: "/blobs/:contentHash/manifest",
       });

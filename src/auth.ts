@@ -10,7 +10,7 @@
 
 import type { Request } from "express";
 import { resolveKey, resolveKeyByAccount, lookupUploadEligibleValidator, type KeyInfo } from "./quota.js";
-import { verifyUploadSig, hasUploadSignature } from "./upload-auth.js";
+import { verifyUploadSig, spendUploadSig, hasUploadSignature } from "./upload-auth.js";
 import { checkFunded } from "./rpc-client.js";
 import { isAccountAddress } from "./ss58.js";
 import {
@@ -94,26 +94,21 @@ export async function resolveAuth(req: Request, contentHash?: string): Promise<A
     return { authenticated: true, tier: "api-key", identity: keyInfo.name, keyInfo };
   }
 
-  // Priority 2: Upload signature
+  // Priority 2: Upload signature, spent only once the signer may upload so a
+  // key with no registration and no funds leaves nothing in the store.
   if (contentHash) {
-    const sigResult = verifyUploadSig(req, contentHash);
-    if (sigResult.valid && sigResult.address) {
-      const signer = { identity: sigResult.address, sigVersion: sigResult.version };
-      // Is this a registered validator (excluding heartbeat-only rows)? → highest quota tier
-      const info = lookupUploadEligibleValidator(sigResult.address);
-      if (info) {
-        return { authenticated: true, tier: "registered-validator", ...signer };
-      }
-      // Is this a funded account? → sig-only tier
-      const funded = await checkFunded(sigResult.address);
-      if (funded) {
-        return { authenticated: true, tier: "sig-only", ...signer };
-      }
-      return { authenticated: false, error: "Account below minimum balance" };
+    const sig = verifyUploadSig(req, contentHash);
+    if (!sig.valid) return { authenticated: false, error: sig.error };
+    const tier: AuthTier | undefined = lookupUploadEligibleValidator(sig.address)
+      ? "registered-validator"
+      : (await checkFunded(sig.address))
+        ? "sig-only"
+        : undefined;
+    if (!tier) return { authenticated: false, error: "Account below minimum balance" };
+    if (!spendUploadSig(req, sig)) {
+      return { authenticated: false, error: "Upload signature already used; sign each request afresh" };
     }
-    if (sigResult.error) {
-      return { authenticated: false, error: sigResult.error };
-    }
+    return { authenticated: true, tier, identity: sig.address, sigVersion: sig.version };
   }
 
   return { authenticated: false, error: "No authentication provided" };
