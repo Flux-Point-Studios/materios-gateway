@@ -11,6 +11,7 @@ import { join } from "path";
 
 import { config } from "../config.js";
 import { merkleRoot } from "../merkle.js";
+import { saveL1Verified } from "../storage.js";
 import { verifyL1Anchor, __test__resetL1Cache, type L1Verification } from "../l1-anchor-verify.js";
 import {
   ANCHOR_WALLETS,
@@ -456,6 +457,22 @@ describe("verifyL1Anchor", () => {
       expect(v.reason).toMatch(/metadata/);
     });
 
+    test("a tx row whose block height is not a number", async () => {
+      const row = koiosTx(TX_BFC) as unknown as Record<string, unknown>;
+      row.block_height = String(row.block_height);
+      const v = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: served(TX_BFC, row as never) }));
+      expect(v.status).toBe("unknown");
+      expect(v.reason).toMatch(/block height/);
+    });
+
+    test("a label 8746 value that is not an object", async () => {
+      const row = koiosTx(TX_BFC) as unknown as Record<string, unknown>;
+      row.metadata = { "8746": "materios" };
+      const v = await verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: served(TX_BFC, row as never) }));
+      expect(v.status).toBe("unknown");
+      expect(v.reason).toMatch(/8746/);
+    });
+
     test("a tip without its block time", async () => {
       const v = await verifyL1Anchor(
         claimBfc(),
@@ -588,6 +605,12 @@ describe("verifyL1Anchor", () => {
       const results = await Promise.all([1, 2, 3].map(() => verifyL1Anchor(claimBfc(), fetch)));
       expect(results.every((r) => r.status === "ok")).toBe(true);
       expect(calls.filter((c) => c.endsWith("tx_info"))).toHaveLength(1);
+    });
+
+    test("concurrent saves of one tx each land a whole record", async () => {
+      const record = { network: "mainnet", txHash: TX_BFC, big: "x".repeat(200_000) };
+      await expect(Promise.all(Array.from({ length: 8 }, () => saveL1Verified(TX_BFC, record)))).resolves.toHaveLength(8);
+      expect(JSON.parse(readFileSync(persisted(TX_BFC), "utf-8"))).toEqual(record);
     });
 
     test("an unreadable persisted record is ignored and the tx is looked up live", async () => {

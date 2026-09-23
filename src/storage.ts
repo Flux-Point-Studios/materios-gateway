@@ -16,7 +16,7 @@
 
 import { mkdir, readFile, writeFile, access, readdir, rename } from "fs/promises";
 import { join } from "path";
-import { createHash } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import { config } from "./config.js";
 import { notifyDaemon } from "./notify.js";
 
@@ -398,8 +398,10 @@ export async function getL1Verified(txHash: string): Promise<object | null> {
 export async function saveL1Verified(txHash: string, record: object): Promise<void> {
   const file = l1VerifiedFile(txHash);
   await ensureDir(join(file, ".."));
-  await writeFile(`${file}.tmp`, JSON.stringify(record, null, 2));
-  await rename(`${file}.tmp`, file);
+  // Concurrent saves of one tx each write their own temp file.
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  await writeFile(tmp, JSON.stringify(record, null, 2));
+  await rename(tmp, file);
 }
 
 /**

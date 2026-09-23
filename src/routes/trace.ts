@@ -612,7 +612,9 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
     };
   }
   const verification = anchor.verification;
-  const anchorId = verification.anchorId ?? anchor.anchorId;
+  // Only an id derived from the tx is shown as the batch's; the gateway's own
+  // claim is kept apart until Cardano confirms it.
+  const anchorId = verification.anchorId;
   const batchFailed = verification.checks.some((c) => BATCH_RECORD_CHECKS.has(c.name) && c.ok === false);
 
   const batchId = "batch";
@@ -625,6 +627,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
     meta: {
       gatewaySource: anchor.source,
       gatewayTimestamp: anchor.timestamp,
+      ...(!anchorId && anchor.anchorId ? { claimedAnchorId: anchor.anchorId } : {}),
     },
   });
   edges.push({

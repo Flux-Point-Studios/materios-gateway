@@ -252,7 +252,7 @@ function parseObservation(
   }
   const base = { network, txHash, tipTime: tipRow.block_time, checkedAt, source: { txInfo, tip } };
   const row = txInfo.find((r) => isRecord(r) && r.tx_hash === txHash);
-  if (!isRecord(row) || typeof row.block_height !== "number") {
+  if (!isRecord(row) || row.block_height === null || row.block_height === undefined) {
     return {
       ...base,
       blockHeight: null,
@@ -263,16 +263,23 @@ function parseObservation(
       inputAddresses: [],
     };
   }
+  const blockHeight = row.block_height;
+  if (typeof blockHeight !== "number" || !Number.isSafeInteger(blockHeight)) {
+    throw new Error("tx_info with a malformed block height");
+  }
   if (!Array.isArray(row.inputs)) throw new Error("tx_info without inputs");
   if (!Object.hasOwn(row, "metadata")) throw new Error("tx_info without metadata");
   const metadata = row.metadata;
   if (metadata !== null && !isRecord(metadata)) throw new Error("tx_info with malformed metadata");
+  if (isRecord(metadata) && Object.hasOwn(metadata, ANCHOR_LABEL) && !isRecord(metadata[ANCHOR_LABEL])) {
+    throw new Error(`tx_info with a malformed label ${ANCHOR_LABEL} value`);
+  }
   return {
     ...base,
-    blockHeight: row.block_height,
+    blockHeight,
     blockHash: typeof row.block_hash === "string" ? row.block_hash : null,
     blockTime: typeof row.tx_timestamp === "number" ? row.tx_timestamp : null,
-    confirmations: Math.max(1, tipRow.block_height - row.block_height + 1),
+    confirmations: Math.max(1, tipRow.block_height - blockHeight + 1),
     anchorRecord: metadata === null ? null : anchorRecord(metadata[ANCHOR_LABEL]),
     inputAddresses: row.inputs.map((i) => {
       const addr = isRecord(i) && isRecord(i.payment_addr) ? i.payment_addr.bech32 : null;

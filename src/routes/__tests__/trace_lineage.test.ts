@@ -478,6 +478,20 @@ describe("GET /trace/api/lineage/:contentHash", () => {
     expect(body.meta.minAttestationThreshold).toBeGreaterThan(0);
   });
 
+  test("while Cardano is unreachable the batch's own anchor id is shown only as claimed", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    __test__setFetchImpl(certifiedReceiptRpc(PROD, { [PROD.cardanoTx]: { status: 503 } }));
+
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+
+    expect(findNode(body, "l1")?.verification?.status).toBe("unknown");
+    const batch = findNode(body, "batch");
+    expect(batch?.hashes).not.toHaveProperty("anchorId");
+    expect(batch?.meta?.claimedAnchorId).toBe(PROD.anchorId);
+    expect(body.meta.finalized).toBe(false);
+  });
+
   test("a receipt in a multi-leaf batch resolves to that batch through its leaf", async () => {
     await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
     const otherAnchor = "0x" + "d1".repeat(32);
@@ -485,7 +499,8 @@ describe("GET /trace/api/lineage/:contentHash", () => {
     __test__setFetchImpl(certifiedReceiptRpc(PROD));
 
     const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
-    expect(findNode(body, "batch")?.hashes.anchorId).toBe(otherAnchor);
+    // A synthetic batch the tx does not anchor: found, but its id is only claimed.
+    expect(findNode(body, "batch")?.meta?.claimedAnchorId).toBe(otherAnchor);
     expect(findNode(body, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
   });
 
