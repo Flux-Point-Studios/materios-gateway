@@ -36,6 +36,7 @@ import { getApiTokensDb } from "../api-tokens.js";
 import { verifyToken } from "../api-tokens.js";
 import { billingMiddlewareErrorTotal } from "../metrics.js";
 import { warnThrottled } from "./warn-throttle.js";
+import { MAX_ACCOUNT_ID_CHARS } from "../ss58.js";
 
 const X402_HEADER_NAME = "X-402-Payment-Required";
 const X402_SIGNATURE_HEADER = "x-402-payment-signature";
@@ -268,8 +269,10 @@ function identifyPayer(req: Request): PayerIdentity {
     // header (x-402-payer-ss58). We trust it for routing only; the
     // gateway will verify the sr25519 sig against the canonical pay_request
     // payload before submitting.
+    // Longer than any AccountId spelling: never decoded (base58 is quadratic)
+    // and never logged.
     const payerSs58 = req.headers["x-402-payer-ss58"];
-    if (typeof payerSs58 === "string" && payerSs58.length > 0) {
+    if (typeof payerSs58 === "string" && payerSs58.length > 0 && payerSs58.length <= MAX_ACCOUNT_ID_CHARS) {
       return { kind: "self", ss58: payerSs58 };
     }
   }

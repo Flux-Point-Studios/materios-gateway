@@ -8,7 +8,31 @@
  * identifies anything. Every writer and every lookup goes through here.
  */
 
-import { decodeAddress, encodeAddress } from "@polkadot/util-crypto";
+import { checkAddress, decodeAddress, encodeAddress } from "@polkadot/util-crypto";
+
+/**
+ * The longest spelling of an AccountId: 0x plus 32 bytes of hex. SS58 spellings
+ * are shorter (about 52 at most, with a two-byte prefix).
+ */
+export const MAX_ACCOUNT_ID_CHARS = 66;
+
+/**
+ * decodeAddress for caller-supplied strings. base58 decoding is quadratic in
+ * length (64k characters block the event loop for ~10 s), so anything longer
+ * than an AccountId can be is refused before it is decoded.
+ */
+export function decodeAccountId(value: string): Uint8Array {
+  if (value.length > MAX_ACCOUNT_ID_CHARS) {
+    throw new Error("account id too long");
+  }
+  return decodeAddress(value);
+}
+
+/** checkAddress, bounded like decodeAccountId: whether `address` is valid SS58 for `prefix`. */
+export function checkAccountAddress(address: string, prefix: number): boolean {
+  if (address.length > MAX_ACCOUNT_ID_CHARS) return false;
+  return checkAddress(address, prefix)[0];
+}
 
 /**
  * decodeAddress throws on malformed input — wrong length, bad checksum,
@@ -21,7 +45,7 @@ export function normalizeSs58(address: unknown): string {
   if (!address || typeof address !== "string") {
     throw new Error("address must be a string");
   }
-  const raw = decodeAddress(address);
+  const raw = decodeAccountId(address);
   if (raw.length !== 32) {
     throw new Error(`unexpected AccountId byte length: ${raw.length}`);
   }

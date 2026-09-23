@@ -30,7 +30,8 @@
  */
 
 import { Router, type Request, type Response } from "express";
-import { signatureVerify, decodeAddress } from "@polkadot/util-crypto";
+import { signatureVerify } from "@polkadot/util-crypto";
+import { decodeAccountId } from "../ss58.js";
 import { hexToU8a } from "@polkadot/util";
 import { bearerAuth, type AuthedRequest } from "../bearer-auth.js";
 import { config } from "../config.js";
@@ -141,7 +142,7 @@ function verifyObserverSig(
  */
 function ss58ToPubkeyHex(ss58: string): string | null {
   try {
-    const raw = decodeAddress(ss58);
+    const raw = decodeAccountId(ss58);
     if (raw.length !== 32) return null;
     return Buffer.from(raw).toString("hex");
   } catch {

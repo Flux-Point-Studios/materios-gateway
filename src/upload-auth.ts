@@ -9,6 +9,7 @@ import { signatureVerify } from "@polkadot/util-crypto";
 import { hexToU8a, stringToU8a } from "@polkadot/util";
 import type { Request } from "express";
 import { config } from "./config.js";
+import { decodeAccountId } from "./ss58.js";
 
 export interface UploadAuthResult {
   valid: boolean;
@@ -34,7 +35,7 @@ export function verifyUploadSig(req: Request, contentHash: string): UploadAuthRe
 
   const signingString = `materios-upload-v1|${contentHash}|${address}|${ts}`;
   try {
-    const result = signatureVerify(stringToU8a(signingString), hexToU8a(sig), address);
+    const result = signatureVerify(stringToU8a(signingString), hexToU8a(sig), decodeAccountId(address));
     return result.isValid
       ? { valid: true, address }
       : { valid: false, error: "Invalid sr25519 signature" };
