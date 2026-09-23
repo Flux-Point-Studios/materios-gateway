@@ -142,6 +142,9 @@ export function verifyUploadSig(req: Request, id: string): UploadAuthResult {
  */
 export function spendUploadSig(req: Request, sig: Extract<UploadAuthResult, { valid: true }>): boolean {
   const now = Math.floor(Date.now() / 1000);
+  // Freshness is rechecked on the clock reading the purge uses: verified at the
+  // window's edge and spent a second later, the prior use's row is already gone.
+  if (Math.abs(now - sig.ts) > config.uploadSigMaxAgeSec) return false;
   if (!claimUploadSignatures(sig.signatures, sig.ts + config.uploadSigMaxAgeSec, now)) return false;
   if (sig.version === 1) {
     console.warn(

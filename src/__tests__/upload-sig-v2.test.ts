@@ -24,7 +24,7 @@ vi.mock("../notify.js", () => ({
   notifyDaemon: vi.fn(async () => {}),
 }));
 
-import express from "express";
+import express, { type Request } from "express";
 import Database from "better-sqlite3";
 import { createHash, randomBytes } from "crypto";
 import { performance } from "perf_hooks";
@@ -41,7 +41,7 @@ import { config } from "../config.js";
 import { batchesRouter } from "../routes/batches.js";
 import { blobsRouter } from "../routes/blobs.js";
 import { captureRawBody } from "../raw-body.js";
-import { uploadSigV2Message } from "../upload-auth.js";
+import { spendUploadSig, uploadSigV2Message } from "../upload-auth.js";
 import {
   setQuotaDbForTests,
   migrateUsageColumns,
@@ -292,6 +292,23 @@ describe("claimUploadSignatures", () => {
     })();
     const full = medianClaimMs();
     expect(full).toBeLessThan(nearlyEmpty * 4 + 0.05);
+  });
+});
+
+describe("spendUploadSig", () => {
+  test("refuses a signature once its window has passed, even after its record was purged", () => {
+    setQuotaDbForTests(quotaDb());
+    const ts = 1_800_000_000;
+    const sig = { valid: true as const, address: "5Signer", version: 2 as const, ts, signatures: ["cafe"] };
+    const req = { method: "PUT", baseUrl: "", path: "/batches/x" } as unknown as Request;
+    vi.useFakeTimers({ toFake: ["Date"], now: (ts + 1) * 1000 });
+    try {
+      expect(spendUploadSig(req, sig)).toBe(true);
+      vi.setSystemTime((ts + config.uploadSigMaxAgeSec + 1) * 1000);
+      expect(spendUploadSig(req, sig)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
