@@ -11,7 +11,7 @@ import {
   startAccountUpload, recordAccountChunkBytes, finalizeAccountUpload,
   recordUsage,
 } from "../quota.js";
-import { resolveAuth } from "../auth.js";
+import { resolveAuth, type AuthResult } from "../auth.js";
 import { notifySponsoredReceiptSubmitter, isSponsoredTier } from "../sponsored-receipts.js";
 import {
   computeRootHashFromChunks,
@@ -19,6 +19,19 @@ import {
   stripHexPrefix as stripHexPrefixUtil,
 } from "../merkle.js";
 import { requireHexId } from "./id-param.js";
+
+/** Frees the upload's concurrency slot and counts its receipt against the daily quota. */
+function finalizeQuota(auth: AuthResult, keyed: boolean, contentHash: string): void {
+  if (keyed && auth.keyInfo) {
+    if (!finalizeUpload(auth.keyInfo, contentHash).allowed) {
+      console.warn(`[blob-gateway] Receipt quota exceeded for key ${auth.keyInfo.name} but upload already complete`);
+    }
+  } else if (auth.identity) {
+    if (!finalizeAccountUpload(auth.identity, contentHash).allowed) {
+      console.warn(`[blob-gateway] Receipt quota exceeded for ${auth.identity} but upload already complete`);
+    }
+  }
+}
 
 export const blobsRouter = Router();
 blobsRouter.param("contentHash", requireHexId("contentHash"));
@@ -106,6 +119,27 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
       return;
     }
 
+    // Content limits are checked before a quota slot is taken, so a rejected
+    // manifest never holds one.
+    const manifestBody = req.body as { chunks?: Array<{ size?: number; sha256?: string; index?: number }>; rootHash?: unknown };
+    if (manifestBody.chunks) {
+      if (manifestBody.chunks.length > config.maxChunksPerManifest) {
+        res.status(400).json({ error: `Too many chunks: ${manifestBody.chunks.length} > ${config.maxChunksPerManifest}` });
+        return;
+      }
+      const totalBytes = manifestBody.chunks.reduce((sum, c) => sum + (c.size || 0), 0);
+      if (totalBytes > config.maxBlobBytesPerManifest) {
+        res.status(400).json({ error: `Total blob size ${totalBytes} exceeds limit ${config.maxBlobBytesPerManifest}` });
+        return;
+      }
+      for (const chunk of manifestBody.chunks) {
+        if (chunk.size && chunk.size > config.maxChunkBytes) {
+          res.status(400).json({ error: `Chunk size ${chunk.size} exceeds limit ${config.maxChunkBytes}` });
+          return;
+        }
+      }
+    }
+
     // Dispatch quota tracking by tier. Bearer/api-key tiers use per-operator
     // keyed quotas if the account is a registered operator; otherwise (bearer
     // tied to an unregistered account) we fall back to per-account quotas.
@@ -152,26 +186,6 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
       // previous behaviour (Bearer/api-key don't set uploaderAddress in meta).
       if (auth.tier === "sig-only" || auth.tier === "registered-validator") {
         uploaderAddress = accountId;
-      }
-    }
-
-    // Content limits validation
-    const manifestBody = req.body as { chunks?: Array<{ size?: number; sha256?: string; index?: number }>; rootHash?: unknown };
-    if (manifestBody.chunks) {
-      if (manifestBody.chunks.length > config.maxChunksPerManifest) {
-        res.status(400).json({ error: `Too many chunks: ${manifestBody.chunks.length} > ${config.maxChunksPerManifest}` });
-        return;
-      }
-      const totalBytes = manifestBody.chunks.reduce((sum, c) => sum + (c.size || 0), 0);
-      if (totalBytes > config.maxBlobBytesPerManifest) {
-        res.status(400).json({ error: `Total blob size ${totalBytes} exceeds limit ${config.maxBlobBytesPerManifest}` });
-        return;
-      }
-      for (const chunk of manifestBody.chunks) {
-        if (chunk.size && chunk.size > config.maxChunkBytes) {
-          res.status(400).json({ error: `Chunk size ${chunk.size} exceeds limit ${config.maxChunkBytes}` });
-          return;
-        }
       }
     }
 
@@ -243,6 +257,10 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
     if (uploaderAddress) {
       await updateReceiptMeta(contentHash, { uploaderAddress });
     }
+
+    // A chunkless (self-rooted) manifest is already a complete upload; no chunk
+    // PUT will ever arrive to free its concurrency slot.
+    if (!manifestBody.chunks?.length) finalizeQuota(auth, useKeyedQuotas, contentHash);
 
     res.status(201).json({ status: "ok", contentHash });
   } catch (error) {
@@ -445,17 +463,7 @@ blobsRouter.put("/blobs/:contentHash/chunks/:i", async (req: Request, res: Respo
     // Check if upload is now complete and finalize quota
     const statusAfter = await getStatus(contentHash);
     if (statusAfter.complete) {
-      if (useKeyedQuotas && auth && auth.keyInfo) {
-        const finalCheck = finalizeUpload(auth.keyInfo, contentHash);
-        if (!finalCheck.allowed) {
-          console.warn(`[blob-gateway] Receipt quota exceeded for key ${auth.keyInfo.name} but upload already complete`);
-        }
-      } else if (auth && auth.identity) {
-        const finalCheck = finalizeAccountUpload(auth.identity, contentHash);
-        if (!finalCheck.allowed) {
-          console.warn(`[blob-gateway] Receipt quota exceeded for ${auth.identity} but upload already complete`);
-        }
-      }
+      if (auth) finalizeQuota(auth, useKeyedQuotas, contentHash);
 
       // Sponsored-receipt hand-off: if this upload was sponsored (Bearer
       // or api-key tier) and an external submitter is configured, fire
