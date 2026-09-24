@@ -29,9 +29,12 @@
         "src/routes/tokens.ts",
         "src/auth.ts",
         "src/bearer-auth.ts",
-        "src/upload-auth.ts"
+        "src/upload-auth.ts",
+        "src/raw-body.ts"
       ],
-      "consumes": [],
+      "consumes": [
+        "ss58-codec"
+      ],
       "status": "live"
     },
     {
@@ -42,7 +45,9 @@
       "paths": [
         "src/routes/faucet.ts"
       ],
-      "consumes": [],
+      "consumes": [
+        "ss58-codec"
+      ],
       "status": "live"
     },
     {
@@ -81,10 +86,12 @@
         "src/routes/billing.ts",
         "src/routes/metering.ts",
         "src/routes/metering_v2.ts",
-        "src/billing"
+        "src/billing",
+        "src/middleware/billing-402.ts"
       ],
       "consumes": [
-        "billing-pallet"
+        "billing-pallet",
+        "ss58-codec"
       ],
       "status": "live"
     },
@@ -101,7 +108,9 @@
         "src/witness_observations.ts",
         "src/witness_targets.ts"
       ],
-      "consumes": [],
+      "consumes": [
+        "ss58-codec"
+      ],
       "status": "live"
     },
     {
@@ -136,7 +145,9 @@
         "src/routes/chain-info.ts",
         "src/routes/status.ts"
       ],
-      "consumes": [],
+      "consumes": [
+        "ss58-codec"
+      ],
       "status": "live"
     },
     {
@@ -152,7 +163,9 @@
         "src/fleet_operators.ts",
         "src/operator_identity.ts"
       ],
-      "consumes": [],
+      "consumes": [
+        "ss58-codec"
+      ],
       "status": "live"
     },
     {
@@ -196,6 +209,17 @@
         "gateway-explorer",
         "orinq-receipts-pallet"
       ],
+      "status": "live"
+    },
+    {
+      "id": "ss58-codec",
+      "name": "Bounded SS58 codec",
+      "desc": "The only place caller-supplied SS58 strings are decoded: decodeAccountId/checkAccountAddress reject anything over 66 characters before base58 runs, closing the unauthenticated quadratic-decode DoS. A test fails if any other module reaches a base58 sink.",
+      "kind": "toolkit",
+      "paths": [
+        "src/ss58.ts"
+      ],
+      "consumes": [],
       "status": "live"
     }
   ]
