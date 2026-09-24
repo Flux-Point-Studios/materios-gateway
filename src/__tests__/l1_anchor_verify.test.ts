@@ -488,9 +488,16 @@ describe("verifyL1Anchor", () => {
     // Koios, and that real I/O needs real event-loop turns.
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     let settled = false;
-    const pending = verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: { [TX_BFC]: { hang: true } } })).finally(() => {
+    const calls: string[] = [];
+    const pending = verifyL1Anchor(claimBfc(), koiosFetch({ txInfo: { [TX_BFC]: { hang: true } }, calls })).finally(() => {
       settled = true;
     });
+    // The bound runs from the request, not from the cache read before it: fake time
+    // advanced while that real I/O is pending would be counted against the wait.
+    for (let turn = 0; calls.length === 0 && !settled; turn++) {
+      if (turn > 100_000) throw new Error("the lookup never reached Koios");
+      await new Promise((r) => setImmediate(r));
+    }
     let waitedMs = 0;
     while (!settled && waitedMs < 60_000) {
       await new Promise((r) => setImmediate(r));
