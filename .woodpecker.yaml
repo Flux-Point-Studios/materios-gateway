@@ -1,9 +1,17 @@
 # `test` reports ci/woodpecker/pr/woodpecker, which main's branch protection
-# requires; `publish` builds + pushes the GHCR image on main merges only.
+# requires; the image is built with no registry credential and published on main
+# merges only.
 when:
   - event: [push, pull_request]
     branch: main
   - event: manual
+
+variables:
+  # plugin-kaniko 2.3.2, pinned by digest.
+  - &kaniko woodpeckerci/plugin-kaniko@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
+  # The ci/oci-index plugin from materios-operator-kit. The gchr_token secret's image
+  # filter names this exact digest, so it is the only code here that can hold the token.
+  - &oci_index ghcr.io/flux-point-studios/materios-operator-kit@sha256:d3178aaf4dc548dda5bd2d15a09f7c650ac1325fa7bc9215a861a3f34774c84b
 
 steps:
   - name: test
@@ -15,24 +23,36 @@ steps:
       - npx playwright install --with-deps chromium
       - npm run typecheck
       - npm test
-      - npm run build   # emits dist/ into the shared workspace for the publish step's COPY
+      - npm run build   # emits dist/ into the shared workspace for build-image's COPY
 
-  # Build + push the image on main merges only (never on PRs → no push from an
-  # untrusted PR context). Kaniko builds in userspace (no privileged/docker.sock),
-  # so it grants no more than the `test` step already has on this shared host.
-  # plugin-kaniko prefixes `registry` to `repo`, so `repo` must not repeat ghcr.io.
+  # No registry credential: kaniko runs the Dockerfile's RUN steps (apt, npm install
+  # with a compiler) in its own container, where any credential it held is readable.
+  - name: build-image
+    image: *kaniko
+    settings:
+      dry_run: true
+      dockerfile: Dockerfile
+      extra_opts: --custom-platform=linux/amd64 --oci-layout-path=/woodpecker/oci/amd64
+    when:
+      - event: push
+        branch: main
+
+  # One platform publishes the image itself (not an index), so the gateway autoroll's
+  # RepoDigests pin sees the same kind of manifest kaniko used to push.
   - name: publish
-    image: woodpeckerci/plugin-kaniko
+    image: *oci_index
     settings:
       registry: ghcr.io
-      repo: flux-point-studios/materios-gateway
-      dockerfile: Dockerfile
-      tags:
-        - latest
-        - ${CI_COMMIT_SHA}
       username: realdecimalist
       password:
         from_secret: gchr_token
+      sources:
+        - /woodpecker/oci/amd64=ghcr.io/flux-point-studios/materios-gateway:${CI_COMMIT_SHA}
+      platforms:
+        - linux/amd64
+      target: ghcr.io/flux-point-studios/materios-gateway:${CI_COMMIT_SHA}
+      tags:
+        - latest
     when:
       - event: push
         branch: main
