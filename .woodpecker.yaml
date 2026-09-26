@@ -25,8 +25,15 @@ steps:
       - npm test
       - npm run build   # emits dist/ into the shared workspace for build-image's COPY
 
-  # No registry credential: kaniko runs the Dockerfile's RUN steps (apt, npm install
-  # with a compiler) in its own container, where any credential it held is readable.
+  # The Gemtek autoroll that deploys each main build; its test refuses to run anywhere
+  # docker is reachable, and this step has none.
+  - name: autoroll-test
+    image: node:20-bookworm
+    commands:
+      - bash deploy/autoroll/test.sh
+
+  # No registry credential: kaniko runs the Dockerfile's RUN steps (apt, npm ci with a
+  # compiler) in its own container, where any credential it held is readable.
   - name: build-image
     image: *kaniko
     settings:
