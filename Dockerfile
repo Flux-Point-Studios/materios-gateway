@@ -4,8 +4,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 make g+
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install --production
+# The lockfile, not a fresh resolve: the autoroll deploys every main build, so two builds
+# of one commit must carry the same dependency tree.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 COPY dist/ ./dist/
 COPY bin/ ./bin/
