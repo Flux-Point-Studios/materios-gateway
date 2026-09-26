@@ -61,7 +61,10 @@ running_digest(){ local cid img d
   # re-homes the repo refs; the digest-pinned Config.Image still has the truth.
   [ -z "$d" ] && d=$(timeout 15 docker inspect "$cid" --format '{{.Config.Image}}' 2>/dev/null | grep -o 'sha256:[0-9a-f]\{64\}')
   [ -n "$d" ] && printf '%s\n' "$d"; }
-pin_env(){ printf 'GATEWAY_IMAGE=%s@%s\n' "$IMAGE" "$1" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"; }  # full pullable ref, not a bare digest
+# Rewrites only the GATEWAY_IMAGE line (a full pullable ref, not a bare digest); any other
+# entry in the compose project's .env survives, and the swap is atomic.
+pin_env(){ { grep -v '^GATEWAY_IMAGE=' "$ENV_FILE" 2>/dev/null; printf 'GATEWAY_IMAGE=%s@%s\n' "$IMAGE" "$1"; } > "$ENV_FILE.tmp" \
+  && mv "$ENV_FILE.tmp" "$ENV_FILE"; }
 recreate(){ GATEWAY_IMAGE="$1" timeout 300 docker compose -f "$COMPOSE" up -d "$SVC" >/dev/null 2>&1; }
 recreate_force(){ GATEWAY_IMAGE="$1" timeout 300 docker compose -f "$COMPOSE" up -d --force-recreate "$SVC" >/dev/null 2>&1; }
 short(){ echo "sha256:${1:7:12}"; }

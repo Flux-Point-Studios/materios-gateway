@@ -71,18 +71,18 @@ run() {
 advance() { echo $(( $(cat "$T/now") + $1 )) > "$T/now"; }
 alerts() { wc -l < "$T/alerts" | tr -d ' '; }
 good() { cat "$T/compose/gateway-autoroll/good.digest" 2>/dev/null; }
-pinned() { cat "$T/compose/.env" 2>/dev/null; }
 
 scenario; run
 if grep -q "up-to-date" "$T/log" && [ "$(alerts)" = 0 ] && [ ! -s "$T/recreated" ] && [ "$(good)" = "$OLD" ]; then
   ok "an up-to-date gateway is left alone and recorded as good"
 else bad "up-to-date run: $(tail -1 "$T/log")"; fi
 
-scenario; echo "$NEW" > "$T/latest"; run
-if [ "$(cat "$T/running")" = "$NEW" ] && [ "$(good)" = "$NEW" ] && [ "$(pinned)" = "GATEWAY_IMAGE=$IMAGE@$NEW" ] \
+scenario; echo "$NEW" > "$T/latest"; printf 'OTHER_SETTING=keep\nGATEWAY_IMAGE=%s@%s\n' "$IMAGE" "$OLD" > "$T/compose/.env"; run
+if [ "$(cat "$T/running")" = "$NEW" ] && [ "$(good)" = "$NEW" ] && grep -qx "GATEWAY_IMAGE=$IMAGE@$NEW" "$T/compose/.env" \
+  && [ "$(grep -c '^GATEWAY_IMAGE=' "$T/compose/.env")" = 1 ] && grep -qx "OTHER_SETTING=keep" "$T/compose/.env" \
   && grep -q "rolled" "$T/alerts"; then
-  ok "a healthy new :latest is deployed by digest, pinned in .env and announced"
-else bad "healthy roll: $(tail -2 "$T/log" | tr '\n' ' ')"; fi
+  ok "a healthy new :latest is deployed by digest, pinned in .env without touching its other entries, and announced"
+else bad "healthy roll: .env=[$(tr '\n' ' ' < "$T/compose/.env")] $(tail -2 "$T/log" | tr '\n' ' ')"; fi
 
 scenario; echo "$NEW" > "$T/latest"; echo "$NEW" > "$T/bad"; echo "$OLD" > "$T/compose/gateway-autoroll/good.digest"; run
 if [ "$(cat "$T/running")" = "$OLD" ] && [ "$(good)" = "$OLD" ] && grep -q "^$NEW 1$" "$T/compose/gateway-autoroll/failed.digest" \
