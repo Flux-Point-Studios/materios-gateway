@@ -29,6 +29,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 
 import { config } from "../config.js";
+import { checkpointBatch } from "./fixtures/checkpoint-batch.js";
 import { batchesRouter } from "../routes/batches.js";
 import {
   setQuotaDbForTests,
@@ -205,18 +206,13 @@ describe("/batches/:anchorId route", () => {
 
   test("PUT then GET returns the same metadata (canonical happy path)", async () => {
     const app = makeApp();
-    const anchorId = "abcd".repeat(16); // 64-char prefix-less hex
     const metadata = {
-      anchorId: "0x" + anchorId,
-      rootHash: "ee".repeat(32),
-      leafCount: 2,
-      leafHashes: ["aa".repeat(32), "bb".repeat(32)],
-      blockRangeStart: 100,
-      blockRangeEnd: 105,
+      ...checkpointBatch(["aa".repeat(32), "bb".repeat(32)], 100, 105),
       submitter: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
       timestamp: "2026-05-06T17:00:00Z",
       source: "daemon",
     };
+    const anchorId = metadata.anchorId.slice(2);
 
     const putResp = await request(app, "PUT", `/batches/${anchorId}`, metadata, {
       "x-api-key": TEST_API_KEY,
@@ -238,8 +234,8 @@ describe("/batches/:anchorId route", () => {
 
   test("GET with 0x prefix resolves to same record as without prefix", async () => {
     const app = makeApp();
-    const anchorId = "ffaa".repeat(16);
-    const metadata = { rootHash: "ab".repeat(32), leafCount: 1, leafHashes: ["00".repeat(32)] };
+    const metadata = checkpointBatch(["00".repeat(32)]);
+    const anchorId = metadata.anchorId.slice(2);
 
     const putResp = await request(app, "PUT", `/batches/${anchorId}`, metadata, {
       "x-api-key": TEST_API_KEY,
@@ -283,26 +279,23 @@ describe("/batches/:anchorId route", () => {
     expect(resp.status).toBe(401);
   });
 
-  test("PUT is idempotent (re-PUT overwrites)", async () => {
+  test("re-PUT enriches metadata while refusing changed checkpoint content", async () => {
     const app = makeApp();
-    const anchorId = "11".repeat(32);
-
-    const first = { rootHash: "aa".repeat(32), leafCount: 1, leafHashes: ["11".repeat(32)] };
-    const second = { rootHash: "aa".repeat(32), leafCount: 2, leafHashes: ["11".repeat(32), "22".repeat(32)] };
-
-    await request(app, "PUT", `/batches/${anchorId}`, first, { "x-api-key": TEST_API_KEY });
-    await request(app, "PUT", `/batches/${anchorId}`, second, { "x-api-key": TEST_API_KEY });
-
+    const first = checkpointBatch();
+    const anchorId = first.anchorId.slice(2);
+    const second = { ...first, annotation: "worker metadata" };
+    expect((await request(app, "PUT", `/batches/${anchorId}`, first, { "x-api-key": TEST_API_KEY })).status).toBe(200);
+    expect((await request(app, "PUT", `/batches/${anchorId}`, second, { "x-api-key": TEST_API_KEY })).status).toBe(200);
+    expect((await request(app, "PUT", `/batches/${anchorId}`, { ...first, leafCount: 2 }, { "x-api-key": TEST_API_KEY })).status).toBe(422);
     const getResp = await request(app, "GET", `/batches/${anchorId}`, null);
     expect(getResp.status).toBe(200);
-    expect(getResp.body.leafCount).toBe(2);
-    expect(getResp.body.leafHashes).toHaveLength(2);
+    expect(getResp.body).toMatchObject(second);
   });
 
   test("POST is accepted as backwards-compat alias of PUT", async () => {
     const app = makeApp();
-    const anchorId = "22".repeat(32);
-    const metadata = { rootHash: "bb".repeat(32), leafCount: 1, leafHashes: ["33".repeat(32)] };
+    const metadata = checkpointBatch(["33".repeat(32)]);
+    const anchorId = metadata.anchorId.slice(2);
 
     const postResp = await request(app, "POST", `/batches/${anchorId}`, metadata, {
       "x-api-key": TEST_API_KEY,
@@ -345,8 +338,8 @@ describe("/batches/:anchorId route", () => {
   });
   test("a signed write from an allowlisted, registered address is accepted", async () => {
     const app = makeApp();
-    const anchorId = "44".repeat(32);
-    const body = { rootHash: "ab".repeat(32) };
+    const body = checkpointBatch();
+    const anchorId = body.anchorId.slice(2);
     const { address, headers } = await signedHeaders("//CertDaemon", anchorId, body);
     bindAddress(address, sha256hex(`registered-${address}`), "cert-daemon");
     config.batchWriterAddresses.push(address);

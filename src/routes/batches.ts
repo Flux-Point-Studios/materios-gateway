@@ -5,7 +5,8 @@
  */
 
 import { Router, type Request, type Response } from "express";
-import { saveBatch, getBatch } from "../storage.js";
+import { saveBatch, getBatch, getBatchesByLeaf, saveCardanoClaim, getCardanoClaims } from "../storage.js";
+import { BatchCapacityError, BatchNotFoundError, BatchValidationError } from "../batch-record.js";
 import { resolveAuth, type AuthResult } from "../auth.js";
 import { config } from "../config.js";
 import { requireHexId } from "./id-param.js";
@@ -24,6 +25,34 @@ function mayWriteBatches(auth: AuthResult): boolean {
   return false;
 }
 batchesRouter.param("anchorId", requireHexId("anchorId"));
+batchesRouter.param("leaf", requireHexId("leaf"));
+
+async function authorizeBatchWrite(req: Request, res: Response): Promise<boolean> {
+  const auth = await resolveAuth(req, req.params.anchorId);
+  if (!auth.authenticated) {
+    res.status(401).json({ error: auth.error });
+    return false;
+  }
+  if (SIGNATURE_TIERS.includes(auth.tier) && auth.sigVersion !== 2) {
+    res.status(401).json({ error: "Batch writes signed by an address require x-upload-sig-v2, which covers the body" });
+    return false;
+  }
+  if (!mayWriteBatches(auth)) {
+    res.status(403).json({ error: "Only the anchoring pipeline may write batch records" });
+    return false;
+  }
+  return true;
+}
+
+function batchError(res: Response, error: unknown, read = false): void {
+  if (error instanceof BatchNotFoundError) { res.status(404).json({ error: error.message }); return; }
+  if (error instanceof BatchValidationError) {
+    res.status(error instanceof BatchCapacityError ? 413 : read ? 400 : 422).json({ error: error.message });
+    return;
+  }
+  console.error("[blob-gateway] Batch operation failed:", error instanceof Error ? error.name : "unknown error");
+  res.status(500).json({ error: "Batch operation failed" });
+}
 
 /**
  * PUT /batches/:anchorId (also accepts POST for backwards compat)
@@ -36,26 +65,11 @@ async function upsertBatch(req: Request, res: Response): Promise<void> {
   try {
     const { anchorId } = req.params;
 
-    // Auth: sig or API key (anchorId used as contentHash for sig verification)
-    const auth = await resolveAuth(req, anchorId);
-    if (!auth.authenticated) {
-      res.status(401).json({ error: auth.error });
-      return;
-    }
-    if (SIGNATURE_TIERS.includes(auth.tier) && auth.sigVersion !== 2) {
-      res.status(401).json({ error: "Batch writes signed by an address require x-upload-sig-v2, which covers the body" });
-      return;
-    }
-    // A batch record carries the Cardano tx that trace lineage shows as a
-    // receipt's L1 anchor; any other writer could fake one.
-    if (!mayWriteBatches(auth)) {
-      res.status(403).json({ error: "Only the anchoring pipeline may write batch records" });
-      return;
-    }
+    if (!await authorizeBatchWrite(req, res)) return;
 
     const metadata = req.body;
 
-    if (!metadata || typeof metadata !== "object") {
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
       res.status(400).json({ error: "Invalid metadata: expected JSON object" });
       return;
     }
@@ -63,14 +77,48 @@ async function upsertBatch(req: Request, res: Response): Promise<void> {
     await saveBatch(anchorId, metadata);
     res.status(200).json({ status: "ok", anchorId });
   } catch (error) {
-    console.error("[blob-gateway] Error saving batch:", error);
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ error: message });
+    batchError(res, error);
   }
 }
 
 batchesRouter.post("/batches/:anchorId", upsertBatch);
 batchesRouter.put("/batches/:anchorId", upsertBatch);
+
+batchesRouter.get("/batches/by-leaf/:leaf", async (req: Request, res: Response) => {
+  try {
+    const { cursor, limit } = req.query;
+    if ((cursor !== undefined && (typeof cursor !== "string" || !/^(?:0x)?[0-9a-fA-F]{64}$/.test(cursor))) ||
+        (limit !== undefined && (typeof limit !== "string" || !/^[0-9]+$/.test(limit) || Number(limit) < 1 || Number(limit) > 64))) {
+      res.status(400).json({ error: "Expected a hex cursor and a page limit of 1..64" });
+      return;
+    }
+    res.json(await getBatchesByLeaf(req.params.leaf, { cursor: cursor as string | undefined, limit: limit === undefined ? undefined : Number(limit) }));
+  } catch (error) {
+    console.error("[blob-gateway] Error reading batch candidates:", error);
+    res.status(500).json({ error: "Could not read batch candidates" });
+  }
+});
+
+batchesRouter.post("/batches/:anchorId/cardano-claims", async (req: Request, res: Response) => {
+  try {
+    if (!await authorizeBatchWrite(req, res)) return;
+    await saveCardanoClaim(req.params.anchorId, req.body);
+    res.json({ status: "ok", anchorId: req.params.anchorId });
+  } catch (error) {
+    batchError(res, error);
+  }
+});
+
+batchesRouter.get("/batches/:anchorId/cardano-claims", async (req: Request, res: Response) => {
+  try {
+    const { cursor, limit } = req.query;
+    if ((cursor !== undefined && (typeof cursor !== "string" || !/^(mainnet|preprod):[0-9a-f]{64}$/.test(cursor))) ||
+        (limit !== undefined && (typeof limit !== "string" || !/^[0-9]+$/.test(limit) || Number(limit) < 1 || Number(limit) > 64))) throw new BatchValidationError("Invalid Cardano claim page");
+    res.json(await getCardanoClaims(req.params.anchorId, { cursor: cursor as string | undefined, limit: limit === undefined ? undefined : Number(limit) }));
+  } catch (error) {
+    batchError(res, error, true);
+  }
+});
 
 /**
  * GET /batches/:anchorId

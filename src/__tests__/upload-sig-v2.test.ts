@@ -38,6 +38,7 @@ import { stringToU8a, u8aToHex } from "@polkadot/util";
 import type { KeyringPair } from "@polkadot/keyring/types";
 
 import { config } from "../config.js";
+import { checkpointBatch } from "./fixtures/checkpoint-batch.js";
 import { batchesRouter } from "../routes/batches.js";
 import { blobsRouter } from "../routes/blobs.js";
 import { captureRawBody } from "../raw-body.js";
@@ -218,7 +219,7 @@ describe("golden vector", () => {
     ).toBe(true);
   });
 
-  test("the golden request is accepted by a gateway running at its timestamp, once", async () => {
+  test("the golden request authenticates once before checkpoint validation", async () => {
     await cryptoWaitReady();
     vi.useFakeTimers({ toFake: ["Date"], now: GOLDEN.ts * 1000 });
     vi.resetModules();
@@ -250,7 +251,8 @@ describe("golden vector", () => {
 
       cfg.storagePath = prevStorage;
       cfg.batchWriterAddresses.splice(0, cfg.batchWriterAddresses.length);
-      expect(first.status).toBe(200);
+      expect(first.status).toBe(422);
+      expect(first.body.error).toMatch(/batch|root|leaf|anchor/i);
       expect(replay.status).toBe(401);
       expect(replay.body.error).toMatch(/already used/);
     } finally {
@@ -344,11 +346,12 @@ describe("upload signatures bound to the request", () => {
     rmSync(storage, { recursive: true, force: true });
   });
 
-  const anchor = (n: number) => n.toString(16).padStart(2, "0").repeat(32);
+  const batchFor = (n: number) => checkpointBatch([n.toString(16).padStart(2, "0").repeat(32)]);
+  const anchor = (n: number) => batchFor(n).anchorId.slice(2);
 
   test("a v2-signed batch write is stored", async () => {
     const id = anchor(1);
-    const body = json({ rootHash: "ab".repeat(32), cardanoTxHash: "cd".repeat(32) });
+    const body = json({ ...batchFor(1), cardanoTxHash: "cd".repeat(32) });
     const res = await send(app, "PUT", `/batches/${id}`, body, {
       ...JSON_TYPE,
       ...signed(writer, { method: "PUT", path: `/batches/${id}`, id, body }),
@@ -360,7 +363,7 @@ describe("upload signatures bound to the request", () => {
 
   test("a batch write signed only with v1 is refused", async () => {
     const id = anchor(2);
-    const body = json({ rootHash: "ab".repeat(32) });
+    const body = json(batchFor(2));
     const res = await send(app, "PUT", `/batches/${id}`, body, {
       ...JSON_TYPE,
       ...signed(writer, { method: "PUT", path: `/batches/${id}`, id, body, v1: true, v2: false }),
@@ -391,7 +394,7 @@ describe("upload signatures bound to the request", () => {
 
   test("a v2 signature is bound to its method and path", async () => {
     const id = anchor(5);
-    const body = json({ rootHash: "ab".repeat(32) });
+    const body = json(batchFor(5));
     const asPut = signed(writer, { method: "PUT", path: `/batches/${id}`, id, body });
     const viaPost = await send(app, "POST", `/batches/${id}`, body, { ...JSON_TYPE, ...asPut });
     expect(viaPost.status).toBe(401);
@@ -404,7 +407,7 @@ describe("upload signatures bound to the request", () => {
 
   test("the query string is not part of the signed path", async () => {
     const id = anchor(7);
-    const body = json({ rootHash: "ab".repeat(32) });
+    const body = json(batchFor(7));
     const res = await send(app, "PUT", `/batches/${id}?via=proxy`, body, {
       ...JSON_TYPE,
       ...signed(writer, { method: "PUT", path: `/batches/${id}`, id, body }),
@@ -414,7 +417,7 @@ describe("upload signatures bound to the request", () => {
 
   test("an identical request sent twice is refused the second time", async () => {
     const id = anchor(8);
-    const body = json({ rootHash: "ab".repeat(32) });
+    const body = json(batchFor(8));
     const headers = { ...JSON_TYPE, ...signed(writer, { method: "PUT", path: `/batches/${id}`, id, body }) };
     expect((await send(app, "PUT", `/batches/${id}`, body, headers)).status).toBe(200);
     const replay = await send(app, "PUT", `/batches/${id}`, body, headers);
@@ -428,7 +431,7 @@ describe("upload signatures bound to the request", () => {
     register(before, writer.address);
     setQuotaDbForTests(before);
     const id = anchor(9);
-    const body = json({ rootHash: "ab".repeat(32) });
+    const body = json(batchFor(9));
     const headers = { ...JSON_TYPE, ...signed(writer, { method: "PUT", path: `/batches/${id}`, id, body }) };
     expect((await send(app, "PUT", `/batches/${id}`, body, headers)).status).toBe(200);
     before.close();
@@ -439,7 +442,7 @@ describe("upload signatures bound to the request", () => {
 
   test("a signature timestamped before the gateway started is refused", async () => {
     const id = anchor(10);
-    const body = json({ rootHash: "ab".repeat(32) });
+    const body = json(batchFor(10));
     const ts = Math.floor(Date.now() / 1000) - 60;
     const res = await send(app, "PUT", `/batches/${id}`, body, {
       ...JSON_TYPE,
@@ -451,7 +454,7 @@ describe("upload signatures bound to the request", () => {
 
   test("with v1 and v2 together, v2 decides", async () => {
     const id = anchor(11);
-    const body = json({ rootHash: "ab".repeat(32) });
+    const body = json(batchFor(11));
     const good = signed(writer, { method: "PUT", path: `/batches/${id}`, id, body, v1: true });
     const badV2 = signed(writer, { method: "PUT", path: `/batches/${id}`, id, body: json({}), v1: false });
     const res = await send(app, "PUT", `/batches/${id}`, body, {
@@ -479,7 +482,7 @@ describe("upload signatures bound to the request", () => {
 
   test("a v1 signature lifted from a batch write before it lands authenticates nothing, and the batch write still lands", async () => {
     const id = anchor(13);
-    const body = json({ rootHash: "ab".repeat(32) });
+    const body = json(batchFor(13));
     const both = signed(writer, { method: "PUT", path: `/batches/${id}`, id, body, v1: true });
     const lifted = {
       "x-upload-sig": both["x-upload-sig"],

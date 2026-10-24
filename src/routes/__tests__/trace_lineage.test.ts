@@ -18,16 +18,19 @@
  *                                   otherwise, never finalized
  *   - split cert disagreement     → two cert nodes, both branches rendered
  */
-import { describe, test, expect, beforeEach, afterEach } from "vitest";
+import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 
 import express from "express";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import Database from "better-sqlite3";
 
 import { config } from "../../config.js";
 import { merkleRoot } from "../../merkle.js";
-import { saveManifest, saveBatch, indexExistingBatches } from "../../storage.js";
+import { saveLegacyBatch } from "../../__tests__/fixtures/legacy-batch.js";
+import { saveManifest, saveBatch, saveCardanoClaim, indexExistingBatches } from "../../storage.js";
+import { checkpointBatch } from "../../__tests__/fixtures/checkpoint-batch.js";
 import { __test__resetL1Cache } from "../../l1-anchor-verify.js";
 import { traceRouter, __test__setFetchImpl, __test__resetFetchImpl } from "../trace.js";
 import {
@@ -171,6 +174,7 @@ interface LineageResponse {
     minAttestationThreshold: number;
     finalized: boolean;
     note?: string;
+    anchorSearch?: { complete: boolean; checked: number; next: { anchorCursor?: string; claimAnchor?: string; claimCursor?: string } | null };
   };
 }
 
@@ -193,6 +197,7 @@ describe("GET /trace/api/lineage/:contentHash", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     (config as { storagePath: string }).storagePath = originalStoragePath;
     (config as { cardanoAnchorWallets: string[] }).cardanoAnchorWallets = originalWallets;
     __test__resetFetchImpl();
@@ -442,7 +447,7 @@ describe("GET /trace/api/lineage/:contentHash", () => {
 
   test("fully attested + anchored + verified on Cardano → all 6 kinds present, L1 href to cexplorer", async () => {
     await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
-    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    await saveLegacyBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
     __test__setFetchImpl(certifiedReceiptRpc(PROD));
 
     const resp = await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`);
@@ -480,7 +485,7 @@ describe("GET /trace/api/lineage/:contentHash", () => {
 
   test("while Cardano is unreachable the batch's own anchor id is shown only as claimed", async () => {
     await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
-    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    await saveLegacyBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
     __test__setFetchImpl(certifiedReceiptRpc(PROD, { [PROD.cardanoTx]: { status: 503 } }));
 
     const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
@@ -492,10 +497,128 @@ describe("GET /trace/api/lineage/:contentHash", () => {
     expect(body.meta.finalized).toBe(false);
   });
 
+  test("a fake claim on the same valid batch cannot hide a later real Cardano claim", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    const fake = "ab".repeat(32);
+    await saveBatch(PROD.anchorId, { ...batchFor(PROD.anchorId, [PROD.leaf]), cardanoTxHash: fake });
+    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    __test__setFetchImpl(certifiedReceiptRpc(PROD, { [fake]: { rows: [] }, [PROD.cardanoTx]: { rows: [koiosTx(TX_FAD)] } }));
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(body, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
+    expect(body.meta.finalized).toBe(true);
+  });
+
+  test("a fake anchored candidate cannot repoint a leaf away from the verified batch", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    const fakeId = "0x" + "00".repeat(32);
+    const fakeTx = "ab".repeat(32);
+    await saveLegacyBatch(fakeId, { ...batchFor(fakeId, [PROD.leaf]), cardanoTxHash: fakeTx });
+    const rpc = certifiedReceiptRpc(PROD, { [fakeTx]: { rows: [] }, [PROD.cardanoTx]: { rows: [koiosTx(TX_FAD)] } });
+    const observed = new Set<string>();
+    __test__setFetchImpl(async (url, init) => {
+      if (url.endsWith("/tx_info") && typeof init?.body === "string") {
+        for (const tx of JSON.parse(init.body)._tx_hashes ?? []) observed.add(tx);
+      }
+      return rpc(url, init);
+    });
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(body, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
+    expect(body.meta.finalized).toBe(true);
+    expect(observed).toEqual(new Set([fakeTx, PROD.cardanoTx]));
+  });
+
+  test("a bounded search exposes a continuation that reaches a later genuine claim", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    const fake = ["00".repeat(31) + "01", "00".repeat(31) + "02"];
+    await saveBatch(PROD.anchorId, { ...batchFor(PROD.anchorId, [PROD.leaf]), cardanoTxHash: fake[0], cardanoClaims: [{ cardanoNetwork: "mainnet", cardanoTxHash: fake[1] }, { cardanoNetwork: "mainnet", cardanoTxHash: PROD.cardanoTx }] });
+    const rpc = certifiedReceiptRpc(PROD, { [fake[0]]: { rows: [] }, [fake[1]]: { rows: [] }, [PROD.cardanoTx]: { rows: [koiosTx(TX_FAD)] } });
+    let clock = performance.now();
+    const time = vi.spyOn(performance, "now").mockImplementation(() => clock);
+    __test__setFetchImpl(async (url, init) => {
+      if (url.endsWith("/tx_info")) clock += 9_000;
+      return rpc(url, init);
+    });
+    const html = (await getJson(makeApp(), `/trace/${PROD.contentHash}`)).body as string;
+    expect(html).toContain("Continue anchor verification");
+    const embedded = /<script id="lineage-data" type="application\/json">([\s\S]*?)<\/script>/.exec(html);
+    expect(embedded).not.toBeNull();
+    const first = JSON.parse(embedded![1]) as LineageResponse;
+    expect(first.meta).toMatchObject({ finalized: false, anchorSearch: { complete: false, next: { claimAnchor: PROD.anchorId.slice(2), claimCursor: expect.any(String) } } });
+    expect(first.meta.anchorSearch!.checked).toBeLessThanOrEqual(2);
+    time.mockRestore();
+    __test__setFetchImpl(rpc);
+    const query = new URLSearchParams(Object.entries(first.meta.anchorSearch!.next!).map(([key, value]) => [key, String(value)]));
+    const resumed = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}?${query}`)).body as LineageResponse;
+    expect(findNode(resumed, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
+    expect(resumed.meta.finalized).toBe(true);
+  });
+
+  test("SQL-only Cardano claims are independently verified for lineage", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    const fake = "00".repeat(32);
+    await saveBatch(PROD.anchorId, { ...batchFor(PROD.anchorId, [PROD.leaf]), cardanoTxHash: fake });
+    await saveCardanoClaim(PROD.anchorId, { cardanoNetwork: "mainnet", cardanoTxHash: PROD.cardanoTx });
+    __test__setFetchImpl(certifiedReceiptRpc(PROD, { [fake]: { rows: [] }, [PROD.cardanoTx]: { rows: [koiosTx(TX_FAD)] } }));
+    const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(findNode(body, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
+    expect(body.meta.finalized).toBe(true);
+  });
+
+  test("continuing through failed claims retains the earlier verified anchor", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    const fake = "ff".repeat(32);
+    await saveCardanoClaim(PROD.anchorId, { cardanoNetwork: "mainnet", cardanoTxHash: fake });
+    const rpc = certifiedReceiptRpc(PROD, { [fake]: { rows: [] }, [PROD.cardanoTx]: { rows: [koiosTx(TX_FAD)] } });
+    __test__setFetchImpl(rpc);
+    const first = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
+    expect(first.meta.finalized).toBe(true);
+    const observed = new Set<string>();
+    __test__setFetchImpl(async (url, init) => {
+      if (url.endsWith("/tx_info") && typeof init?.body === "string") for (const tx of JSON.parse(init.body)._tx_hashes ?? []) observed.add(tx);
+      return rpc(url, init);
+    });
+    const query = new URLSearchParams({ claimAnchor: PROD.anchorId.slice(2), claimCursor: `mainnet:${PROD.cardanoTx}` });
+    const later = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}?${query}`)).body as LineageResponse;
+    expect(later.meta.finalized).toBe(true);
+    expect(findNode(later, "l1")?.hashes.txHash).toBe(PROD.cardanoTx);
+    // Clear the tx observation cache to make the later page's attempted claim observable.
+    __test__resetL1Cache();
+    await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}?${query}`);
+    expect(observed.has(fake)).toBe(true);
+  });
+
+  test("claim continuation must belong to the certified receipt's leaf", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    const other = checkpointBatch(["ab".repeat(32)]);
+    await saveBatch(other.anchorId, other);
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+    const query = new URLSearchParams({ claimAnchor: other.anchorId.slice(2), claimCursor: `mainnet:${"00".repeat(32)}` });
+    const response = await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}?${query}`);
+    expect(response.status).toBe(400);
+  });
+
+  test("corrupt stored claims are diagnosed without reporting a complete search", async () => {
+    await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
+    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    const db = new Database(join(tmpDir, "index/batches.sqlite"));
+    try {
+      db.pragma("ignore_check_constraints = ON");
+      const insert = db.prepare("INSERT INTO cardano_claims(anchor_id,network,tx_hash) VALUES(?,?,?)");
+      for (let i = 0; i < 65; i++) insert.run(PROD.anchorId.slice(2), "mainnet", `00-invalid-${i.toString().padStart(3, "0")}`);
+    } finally { db.close(); }
+    __test__setFetchImpl(certifiedReceiptRpc(PROD));
+    const response = await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`);
+    expect(response.status).toBe(200);
+    expect((response.body as LineageResponse).meta).toMatchObject({ anchorSearch: { complete: false, unreadableCandidates: [PROD.anchorId.slice(2)] } });
+  });
+
   test("a receipt in a multi-leaf batch resolves to that batch through its leaf", async () => {
     await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
     const otherAnchor = "0x" + "d1".repeat(32);
-    await saveBatch(otherAnchor, batchFor(otherAnchor, ["aa".repeat(32), PROD.leaf, "bb".repeat(32)]));
+    await saveLegacyBatch(otherAnchor, batchFor(otherAnchor, ["aa".repeat(32), PROD.leaf, "bb".repeat(32)]));
     __test__setFetchImpl(certifiedReceiptRpc(PROD));
 
     const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
@@ -523,10 +646,10 @@ describe("GET /trace/api/lineage/:contentHash", () => {
 
   test("a leaf in two batches resolves to the one anchored on Cardano, whichever is saved last", async () => {
     await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
-    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    await saveLegacyBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
     const reflush = "0x" + "d3".repeat(32);
     const { cardanoTxHash: _tx, cardanoNetwork: _net, ...unanchored } = batchFor(reflush, [PROD.leaf]);
-    await saveBatch(reflush, unanchored);
+    await saveLegacyBatch(reflush, unanchored);
     __test__setFetchImpl(certifiedReceiptRpc(PROD));
 
     const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
@@ -547,7 +670,7 @@ describe("GET /trace/api/lineage/:contentHash", () => {
 
   test("an index entry whose batch no longer lists the leaf is not trusted", async () => {
     await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
-    await saveBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
+    await saveLegacyBatch(PROD.anchorId, batchFor(PROD.anchorId, [PROD.leaf]));
     writeFileSync(
       join(tmpDir, "batches", `${PROD.anchorId.slice(2)}.json`),
       JSON.stringify(batchFor(PROD.anchorId, ["ab".repeat(32)])),
@@ -572,7 +695,7 @@ describe("GET /trace/api/lineage/:contentHash", () => {
   test("an anchorId stored with upper-case hex still resolves", async () => {
     await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
     const upper = "0x" + PROD.anchorId.slice(2).toUpperCase();
-    await saveBatch(upper, batchFor(upper, [PROD.leaf]));
+    await saveLegacyBatch(upper, batchFor(upper, [PROD.leaf]));
     __test__setFetchImpl(certifiedReceiptRpc(PROD));
 
     const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
@@ -582,8 +705,8 @@ describe("GET /trace/api/lineage/:contentHash", () => {
   test("a batch that does not contain the receipt's leaf is not claimed as its anchor", async () => {
     await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
     const otherAnchor = "0x" + "d2".repeat(32);
-    await saveBatch(otherAnchor, batchFor(otherAnchor, ["cc".repeat(32)]));
-    await saveBatch(PROD.contentHash, batchFor(PROD.contentHash, ["dd".repeat(32)]));
+    await saveLegacyBatch(otherAnchor, batchFor(otherAnchor, ["cc".repeat(32)]));
+    await saveLegacyBatch(PROD.contentHash, batchFor(PROD.contentHash, ["dd".repeat(32)]));
     __test__setFetchImpl(certifiedReceiptRpc(PROD));
 
     const body = (await getJson(makeApp(), `/trace/api/lineage/${PROD.contentHash}`)).body as LineageResponse;
@@ -601,7 +724,7 @@ describe("GET /trace/api/lineage/:contentHash", () => {
       tip?: KoiosAnswer,
     ) {
       await saveManifest(PROD.contentHash, { rootHash: `0x${PROD.contentHash}`, chunks: [] });
-      await saveBatch(PROD.anchorId, JSON.parse(JSON.stringify({ ...batchFor(PROD.anchorId, [PROD.leaf]), ...batch })));
+      await saveLegacyBatch(PROD.anchorId, JSON.parse(JSON.stringify({ ...batchFor(PROD.anchorId, [PROD.leaf]), ...batch })));
       __test__setFetchImpl(certifiedReceiptRpc(PROD, koios, tip));
       const resp = await getJson(makeApp(), path);
       expect(resp.status).toBe(200);

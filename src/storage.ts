@@ -16,6 +16,9 @@
 
 import { mkdir, readFile, writeFile, access, readdir, rename } from "fs/promises";
 import { join } from "path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, renameSync, rmSync, statSync } from "node:fs";
+import Database from "better-sqlite3";
+import { BatchCapacityError, BatchNotFoundError, BatchValidationError, BATCH_BYTE_BUDGET, cardanoClaims, mergeBatch, parseCardanoClaim, validateBatch, type CardanoClaim } from "./batch-record.js";
 import { createHash, randomBytes } from "crypto";
 import { config } from "./config.js";
 import { notifyDaemon } from "./notify.js";
@@ -257,126 +260,279 @@ export async function resolveReceiptId(receiptId: string): Promise<string | null
   }
 }
 
-/**
- * Save batch metadata JSON.
- */
-export async function saveBatch(anchorId: string, metadata: object): Promise<void> {
-  const dir = batchesDir();
-  await ensureDir(dir);
-  await writeFile(join(dir, `${hexId(anchorId, "anchorId")}.json`), JSON.stringify(metadata, null, 2));
-  await indexBatchLeaves(anchorId, metadata);
+function batchDatabase(readOnly = false, timeout = 5000): Database.Database | null {
+  const file = join(config.storagePath, "index", "batches.sqlite");
+  if (readOnly && !existsSync(file)) return null;
+  if (!readOnly) mkdirSync(join(config.storagePath, "index"), { recursive: true });
+  const db = new Database(file, { readonly: readOnly, timeout });
+  try {
+    if (!readOnly) {
+      // Establish the file/schema under SQLite's busy handler before changing journal mode.
+      db.exec("CREATE TABLE IF NOT EXISTS leaf_batches (leaf_hash TEXT NOT NULL, anchor_id TEXT NOT NULL, PRIMARY KEY (leaf_hash, anchor_id));");
+      db.pragma("journal_mode = WAL");
+      db.exec("CREATE TABLE IF NOT EXISTS cardano_claims (anchor_id TEXT NOT NULL, network TEXT NOT NULL CHECK(network IN ('mainnet','preprod')), tx_hash TEXT NOT NULL CHECK(length(tx_hash)=64 AND tx_hash NOT GLOB '*[^0-9a-f]*'), submitted_at TEXT CHECK(submitted_at IS NULL OR (typeof(submitted_at)='text' AND length(submitted_at)<=64)), PRIMARY KEY (anchor_id, network, tx_hash))");
+      db.exec("CREATE TABLE IF NOT EXISTS preferred_cardano_claims (leaf_hash TEXT PRIMARY KEY, anchor_id TEXT NOT NULL, network TEXT NOT NULL, tx_hash TEXT NOT NULL, submitted_at TEXT)");
+      db.exec("CREATE TABLE IF NOT EXISTS legacy_batch_files (anchor_id TEXT PRIMARY KEY, file_id TEXT NOT NULL)");
+    }
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+  return db;
 }
 
-/**
- * Record leafHash -> anchorId for every checkpoint leaf in a batch. Batches are
- * keyed by anchorId, which no receipt carries, so a receipt can only reach its
- * anchor through the leaf the cert-daemon derived from it.
- */
-async function indexBatchLeaves(anchorId: string, metadata: object): Promise<number> {
+function legacyBatch(anchorId: string, db?: Database.Database | null): Record<string, unknown> | null {
+  const mapped = db?.prepare("SELECT file_id FROM legacy_batch_files WHERE anchor_id = ?").get(stripHexPrefix(anchorId).toLowerCase()) as { file_id: string } | undefined;
+  const canonical = stripHexPrefix(anchorId).toLowerCase();
+  anchorId = existsSync(join(batchesDir(), `${canonical}.json`)) ? canonical : mapped?.file_id ?? anchorId;
+  let text: string;
+  try {
+    const file = join(batchesDir(), `${hexId(anchorId, "anchorId")}.json`);
+    if (statSync(file).size > BATCH_BYTE_BUDGET) throw new BatchCapacityError("Historical batch exceeds its size budget");
+    text = readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  const record = JSON.parse(text) as unknown;
+  return record !== null && typeof record === "object" && !Array.isArray(record) ? record as Record<string, unknown> : null;
+}
+
+function indexBatchLeaves(db: Database.Database, anchorId: string, metadata: object): number {
   const leaves = (metadata as { leafHashes?: unknown }).leafHashes;
   if (!Array.isArray(leaves)) return 0;
-  const dir = leafIndexDir();
-  await ensureDir(dir);
-  const anchored = hasCardanoTx(metadata);
+  const insert = db.prepare("INSERT OR IGNORE INTO leaf_batches (leaf_hash, anchor_id) VALUES (?, ?)");
   let indexed = 0;
   for (const leaf of leaves) {
     const clean = typeof leaf === "string" ? stripHexPrefix(leaf).toLowerCase() : "";
     if (!LEAF_RE.test(clean)) continue;
-    const entry = join(dir, clean);
-    // A receipt re-checkpointed after a failed flush sits in two batches; keep
-    // the mapping that already reaches Cardano.
-    if (!anchored && (await indexedBatchIsAnchored(entry))) continue;
-    await writeFile(entry, stripHexPrefix(anchorId));
+    insert.run(clean, anchorId);
     indexed++;
   }
   return indexed;
 }
 
-function hasCardanoTx(record: object | null): boolean {
-  const tx = (record as { cardanoTxHash?: unknown } | null)?.cardanoTxHash;
-  return typeof tx === "string" && tx.length > 0;
-}
-
-async function indexedBatchIsAnchored(entry: string): Promise<boolean> {
-  let current: string;
+// The database write lock serializes JSON merges across gateway processes.
+// A crash after rename but before index commit is repaired by startup backfill.
+export async function saveBatch(anchorId: string, metadata: object): Promise<void> {
+  const key = hexId(anchorId, "anchorId").toLowerCase();
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) throw new BatchValidationError("Batch metadata must be an object");
+  const db = batchDatabase()!;
   try {
-    current = (await readFile(entry, "utf-8")).trim();
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw err;
+    db.transaction(() => {
+      const previous = legacyBatch(anchorId, db);
+      const merged = mergeBatch(previous, metadata as Record<string, unknown>);
+      validateBatch(key, merged);
+      const directory = batchesDir();
+      mkdirSync(directory, { recursive: true });
+      const temporary = join(directory, `${key}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
+      let descriptor: number | undefined;
+      try {
+        descriptor = openSync(temporary, "wx", 0o600);
+        writeFileSync(descriptor, JSON.stringify(merged));
+        fsyncSync(descriptor);
+        closeSync(descriptor);
+        descriptor = undefined;
+        renameSync(temporary, join(directory, `${key}.json`));
+        descriptor = openSync(directory, "r");
+        fsyncSync(descriptor);
+      } finally {
+        if (descriptor !== undefined) closeSync(descriptor);
+        rmSync(temporary, { force: true });
+      }
+      db.prepare("INSERT INTO legacy_batch_files (anchor_id, file_id) VALUES (?, ?) ON CONFLICT(anchor_id) DO UPDATE SET file_id=excluded.file_id").run(key, key);
+      indexBatchLeaves(db, key, merged);
+    }).immediate();
+  } finally {
+    db.close();
   }
-  return isHexId(current) && hasCardanoTx(await getBatch(current));
 }
 
-/**
- * Index the leaves of every stored batch. Idempotent; run at startup so
- * batches written before the index existed are reachable.
- */
-export async function indexExistingBatches(): Promise<{
-  batches: number;
-  leaves: number;
-  skipped: number;
-}> {
+// Backfill every historical batch without rewriting its JSON or its old index.
+export async function indexExistingBatches(): Promise<{ batches: number; leaves: number; skipped: number }> {
   let files: string[];
   try {
     files = await readdir(batchesDir());
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { batches: 0, leaves: 0, skipped: 0 };
-    throw err;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    files = [];
   }
+  const db = batchDatabase()!;
   let batches = 0;
   let leaves = 0;
   let skipped = 0;
-  for (const file of files) {
-    if (!BATCH_FILE_RE.test(file)) continue;
-    let record: object;
-    try {
-      record = JSON.parse(await readFile(join(batchesDir(), file), "utf-8")) as object;
-    } catch (err) {
-      // One corrupt record must not keep the gateway from booting.
-      console.error(`[storage] leaf index: skipped ${file}: ${err instanceof Error ? err.message : err}`);
-      skipped++;
-      continue;
-    }
-    leaves += await indexBatchLeaves(file.slice(0, -".json".length), record);
-    batches++;
+  try {
+    db.transaction(() => {
+      for (const file of files) {
+        if (!BATCH_FILE_RE.test(file)) continue;
+        const key = file.slice(0, -".json".length).toLowerCase();
+        if (file !== `${key}.json` && files.includes(`${key}.json`)) continue;
+        let record: Record<string, unknown> | null;
+        try {
+          record = legacyBatch(file.slice(0, -".json".length));
+        } catch (error) {
+          console.error(`[storage] leaf index: skipped ${file}: ${error instanceof Error ? error.message : "unreadable batch"}`);
+          skipped++;
+          continue;
+        }
+        if (record === null) { skipped++; continue; }
+        db.prepare("INSERT INTO legacy_batch_files (anchor_id, file_id) VALUES (?, ?) ON CONFLICT(anchor_id) DO UPDATE SET file_id=excluded.file_id").run(key, file.slice(0, -".json".length));
+        leaves += indexBatchLeaves(db, key, record);
+        batches++;
+      }
+    }).immediate();
+  } finally {
+    db.close();
   }
   return { batches, leaves, skipped };
 }
 
-/**
- * The batch whose checkpoint leaves include this leaf, or null.
- */
-export async function getBatchByLeaf(leafHash: string): Promise<object | null> {
-  const leaf = stripHexPrefix(leafHash).toLowerCase();
-  let anchorId: string;
+export async function saveCardanoClaim(anchorId: string, value: unknown): Promise<void> {
+  const key = hexId(anchorId, "anchorId").toLowerCase();
+  const claim = parseCardanoClaim(value);
+  const db = batchDatabase()!;
   try {
-    anchorId = (await readFile(join(leafIndexDir(), leaf), "utf-8")).trim();
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw err;
+    db.transaction(() => {
+      const record = legacyBatch(key, db);
+      if (!record) throw new BatchNotFoundError("Batch metadata is not available yet");
+      validateBatch(key, record);
+      db.prepare("INSERT OR IGNORE INTO cardano_claims (anchor_id, network, tx_hash, submitted_at) VALUES (?, ?, ?, ?)").run(key, claim.cardanoNetwork, claim.cardanoTxHash, claim.cardanoSubmittedAt ?? null);
+    }).immediate();
+  } finally {
+    db.close();
   }
-  if (!isHexId(anchorId)) return null;
-  const batch = await getBatch(anchorId);
-  // A batch record can be rewritten after it was indexed; only trust it while
-  // it still lists this leaf.
-  const leaves = (batch as { leafHashes?: unknown } | null)?.leafHashes;
-  const listed =
-    Array.isArray(leaves) &&
-    leaves.some((l) => typeof l === "string" && stripHexPrefix(l).toLowerCase() === leaf);
-  return listed ? batch : null;
 }
 
-/**
- * Read batch metadata JSON.
- */
-export async function getBatch(anchorId: string): Promise<object | null> {
-  const batchPath = join(batchesDir(), `${hexId(anchorId, "anchorId")}.json`);
+export class BatchStorageError extends Error {}
+
+export async function getCardanoClaims(anchorId: string, options: { cursor?: string; limit?: number } = {}): Promise<{ claims: CardanoClaim[]; nextCursor: string | null }> {
+  const key = hexId(anchorId, "anchorId").toLowerCase();
+  const cursor = options.cursor ?? "";
+  if (cursor !== "" && !/^(mainnet|preprod):[0-9a-f]{64}$/.test(cursor)) throw new BatchValidationError("Invalid Cardano claim cursor");
+  const limit = options.limit ?? 64;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64) throw new BatchValidationError("Claim page limit must be 1..64");
+  const [network = "", tx = ""] = cursor.split(":");
+  const db = batchDatabase(true);
   try {
-    const data = await readFile(batchPath, "utf-8");
-    return JSON.parse(data);
-  } catch {
-    return null;
+    const record = legacyBatch(key, db);
+    if (!record) throw new BatchNotFoundError("Batch metadata is not available yet");
+    const rows = db?.prepare("SELECT network AS cardanoNetwork, tx_hash AS cardanoTxHash, submitted_at AS cardanoSubmittedAt FROM cardano_claims WHERE anchor_id = ? AND (network, tx_hash) > (?, ?) ORDER BY network, tx_hash LIMIT ?").all(key, network, tx, limit + 1) as CardanoClaim[] | undefined;
+    const stored = (rows ?? []).map((row) => {
+      try {
+        if (typeof row.cardanoTxHash !== "string" || !LEAF_RE.test(row.cardanoTxHash)) throw new BatchStorageError("Stored Cardano claim key is noncanonical");
+        return parseCardanoClaim({ cardanoNetwork: row.cardanoNetwork, cardanoTxHash: row.cardanoTxHash, ...(row.cardanoSubmittedAt === null ? {} : { cardanoSubmittedAt: row.cardanoSubmittedAt }) });
+      } catch (error) {
+        throw new BatchStorageError("Stored Cardano claim is malformed", { cause: error });
+      }
+    });
+    const union = new Map<string, CardanoClaim>();
+    for (const claim of [...stored, ...cardanoClaims(record)]) {
+      const id = `${claim.cardanoNetwork}:${claim.cardanoTxHash}`;
+      if (id > cursor && !union.has(id)) union.set(id, claim);
+    }
+    const sorted = [...union.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+    return { claims: sorted.slice(0, limit).map(([, claim]) => claim), nextCursor: sorted.length > limit ? sorted[limit - 1][0] : null };
+  } finally {
+    db?.close();
+  }
+}
+
+// This is a discovery hint, never a saved verification verdict.
+export function preferredCardanoClaim(leafHash: string): { anchorId: string; claim: CardanoClaim } | null {
+  const leaf = hexId(leafHash, "leafHash").toLowerCase();
+  const db = batchDatabase(true, 0);
+  try {
+    const row = db?.prepare("SELECT anchor_id, network, tx_hash, submitted_at FROM preferred_cardano_claims WHERE leaf_hash = ?").get(leaf) as { anchor_id: string; network: CardanoClaim["cardanoNetwork"]; tx_hash: string; submitted_at: string | null } | undefined;
+    return row ? { anchorId: row.anchor_id, claim: { cardanoNetwork: row.network, cardanoTxHash: row.tx_hash, ...(row.submitted_at === null ? {} : { cardanoSubmittedAt: row.submitted_at }) } } : null;
+  } finally {
+    db?.close();
+  }
+}
+
+export function savePreferredCardanoClaim(leafHash: string, anchorId: string, claim: CardanoClaim): void {
+  const leaf = hexId(leafHash, "leafHash").toLowerCase();
+  const key = hexId(anchorId, "anchorId").toLowerCase();
+  const checked = parseCardanoClaim(claim);
+  const db = batchDatabase(false, 0)!;
+  try {
+    db.prepare("INSERT INTO preferred_cardano_claims (leaf_hash, anchor_id, network, tx_hash, submitted_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(leaf_hash) DO UPDATE SET anchor_id=excluded.anchor_id,network=excluded.network,tx_hash=excluded.tx_hash,submitted_at=excluded.submitted_at").run(leaf, key, checked.cardanoNetwork, checked.cardanoTxHash, checked.cardanoSubmittedAt ?? null);
+  } finally {
+    db.close();
+  }
+}
+
+export interface BatchCandidatesPage {
+  candidates: object[];
+  nextCursor: string | null;
+  unreadableCandidates: string[];
+}
+
+export async function getBatchesByLeaf(leafHash: string, options: { cursor?: string; limit?: number } = {}): Promise<BatchCandidatesPage> {
+  const leaf = hexId(leafHash, "leafHash").toLowerCase();
+  const cursor = options.cursor === undefined ? "" : hexId(options.cursor, "cursor").toLowerCase();
+  const limit = options.limit ?? 64;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64) throw new BatchValidationError("Candidate page limit must be 1..64");
+  const ids = new Set<string>();
+  const db = batchDatabase(true);
+  try {
+    if (db) {
+      for (const row of db.prepare("SELECT anchor_id FROM leaf_batches WHERE leaf_hash = ? AND anchor_id > ? ORDER BY anchor_id LIMIT ?").all(leaf, cursor, limit + 1) as { anchor_id: string }[]) ids.add(row.anchor_id);
+    }
+  } finally {
+    db?.close();
+  }
+  try {
+    const id = (await readFile(join(leafIndexDir(), leaf), "utf8")).trim();
+    if (isHexId(id)) {
+      const clean = stripHexPrefix(id).toLowerCase();
+      if (clean > cursor) ids.add(clean);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const page: BatchCandidatesPage = { candidates: [], nextCursor: null, unreadableCandidates: [] };
+  const ordered = [...ids].sort();
+  let visited = 0;
+  let last = cursor;
+  let bytes = 0;
+  for (const id of ordered.slice(0, limit)) {
+    let record: object | null;
+    try {
+      record = await getBatch(id);
+    } catch (error) {
+      console.error(`[storage] unreadable batch candidate ${id}: ${error instanceof SyntaxError ? "invalid JSON" : (error as NodeJS.ErrnoException).code ?? "read failed"}`);
+      page.unreadableCandidates.push(id);
+      visited++;
+      last = id;
+      continue;
+    }
+    const leaves = (record as { leafHashes?: unknown } | null)?.leafHashes;
+    if (record && Array.isArray(leaves) && leaves.some((value) => typeof value === "string" && stripHexPrefix(value).toLowerCase() === leaf)) {
+      const candidate = { anchorId: `0x${id}`, ...record, batchKey: id, cardanoClaimsUrl: `/batches/${id}/cardano-claims` };
+      const size = Buffer.byteLength(JSON.stringify(candidate), "utf8");
+      if (page.candidates.length > 0 && bytes + size > BATCH_BYTE_BUDGET) break;
+      bytes += size;
+      page.candidates.push(candidate);
+    }
+    visited++;
+    last = id;
+  }
+  if (visited < ordered.length) page.nextCursor = last;
+  return page;
+}
+
+export async function getBatchByLeaf(leafHash: string): Promise<object | null> {
+  const { candidates: records } = await getBatchesByLeaf(leafHash);
+  return records.find((record) => typeof (record as { cardanoTxHash?: unknown }).cardanoTxHash === "string") ?? records[0] ?? null;
+}
+
+export async function getBatch(anchorId: string): Promise<object | null> {
+  hexId(anchorId, "anchorId");
+  const db = batchDatabase(true);
+  try {
+    return legacyBatch(anchorId, db);
+  } finally {
+    db?.close();
   }
 }
 
