@@ -89,3 +89,7 @@ activation, verify health, missing and wrong-network writer refusals, fresh
 publication/readback from both hosts, restart and an independent SQLite-consistent
 restore. The integration suite exercises these boundaries through real child
 processes and HTTP.
+
+The optional [bounded read RPC](midnight-read-rpc.md) uses a separate Compose
+overlay and quota volume. It stays disabled without its new explicit variables;
+the base proof-store deployment retains its existing behavior.

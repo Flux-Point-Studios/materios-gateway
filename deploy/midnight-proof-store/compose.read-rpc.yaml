@@ -1,0 +1,8 @@
+services:
+  midnight-proof-store:
+    environment:
+      MIDNIGHT_READ_PROXY_PROJECT_ID_FILE: /run/secrets/midnight-read-project-id
+      MIDNIGHT_READ_PROXY_STATE_DIR: /read-rpc-state
+    volumes:
+      - "${MIDNIGHT_READ_PROXY_PROJECT_ID_FILE:?Set a private read-only Blockfrost project file}:/run/secrets/midnight-read-project-id:ro"
+      - "${MIDNIGHT_READ_PROXY_STATE_DIR:?Set separate private quota storage}:/read-rpc-state"

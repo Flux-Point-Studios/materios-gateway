@@ -26,12 +26,13 @@ async function stop() {
   const exit = once(child, "exit"); child.kill("SIGTERM"); await exit; child = null;
 }
 afterEach(async () => { await stop(); trap.closeAllConnections(); await new Promise<void>(resolve => trap.close(() => resolve())); await rm(root, { recursive: true, force: true }); });
-async function start(storage = join(root, "data"), allow = true) {
+async function start(storage = join(root, "data"), allow = true, extra:Record<string,string> = {}) {
   const upstream = `http://127.0.0.1:${(trap.address() as { port: number }).port}`;
   child = spawn(process.execPath, ["--import", "tsx", "src/proof-store.ts"], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: {
     PATH: process.env.PATH, PORT: "0", STORAGE_PATH: storage, KEYS_FILE_PATH: join(root, "keys.json"), PROOF_STORE_BIND_ADDRESS: "127.0.0.1",
     MIDNIGHT_MAINNET_WRITER_KEY_HASHES: allow ? `${sha(writer)},${sha(disabled)}` : "", MIDNIGHT_PREPROD_WRITER_KEY_HASHES: "",
     MATERIOS_RPC_URL: upstream.replace("http:", "ws:"), CERT_DAEMON_ALICE_URL: upstream, CERT_DAEMON_BOB_URL: upstream, ANCHOR_WORKER_URL: upstream,
+    ...extra,
   } });
   let output = "";
   await new Promise<void>((resolve, reject) => {
@@ -71,4 +72,14 @@ test("keeps exact public bytes and discovery across restart and consistent indep
 
 test("an empty allowlist denies publication even for an enabled known key", async () => {
   await start(undefined, false); expect((await put(writer)).status).toBe(403); expect(connections).toBe(0);
+});
+
+test("activates read RPC only through the new explicit variables and keeps old provider fields inert",async()=>{
+  const project=join(root,"project-id");await writeFile(project,"nightmainnet"+"a".repeat(32),{mode:0o600});
+  await start(undefined,true,{MIDNIGHT_BLOCKFROST_PROJECT_ID_FILE:project,BLOCKFROST_PROJECT_ID_FILE:project});
+  const call=()=>fetch(base+"/midnight/mainnet/rpc",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method:"author_submitExtrinsic",params:["0x00"]})});
+  expect((await call()).status).toBe(404);expect(connections).toBe(0);await stop();
+  const state=join(root,"read-state");await mkdir(state,{mode:0o700});
+  await start(undefined,true,{MIDNIGHT_READ_PROXY_PROJECT_ID_FILE:project,MIDNIGHT_READ_PROXY_STATE_DIR:state});
+  expect((await call()).status).toBe(400);expect(connections).toBe(0);expect((await fetch(base+"/health")).status).toBe(200);
 });
