@@ -13,7 +13,7 @@ try {
   if (!directory.isDirectory() || directory.mode & 0o077 || (process.getuid && directory.uid !== process.getuid())) throw new Error("Proof-store directory must be private and owned by the service");
   if (!Number.isSafeInteger(config.port) || config.port < 0 || config.port > 65535) throw new Error("Invalid proof-store port");
   initQuotaDb();
-  const readRpc = openMidnightReadRpc({ projectIdFile: process.env.MIDNIGHT_READ_PROXY_PROJECT_ID_FILE, stateDir: process.env.MIDNIGHT_READ_PROXY_STATE_DIR });
+  const readRpc = openMidnightReadRpc({ projectIdFile: process.env.MIDNIGHT_READ_PROXY_PROJECT_ID_FILE, oneamSessionFile: process.env.MIDNIGHT_READ_PROXY_ONEAM_SESSION_FILE, stateDir: process.env.MIDNIGHT_READ_PROXY_STATE_DIR });
   const app = express();
   app.disable("x-powered-by");
   if (readRpc) app.use(readRpc.router);
