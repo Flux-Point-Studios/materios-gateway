@@ -34,15 +34,28 @@ function privateFile(path:string) {
   }finally{closeSync(fd);}
 }
 
-export function openMidnightReadRpc(options:{projectIdFile?:string|undefined;stateDir?:string|undefined;fetcher?:typeof fetch}) {
-  if(!options.projectIdFile)return null;
-  const token=privateFile(options.projectIdFile).trim();
-  if(!/^nightmainnet[A-Za-z0-9]{32}$/.test(token)||!options.stateDir)throw new Error("Invalid read RPC configuration");
+export function openMidnightReadRpc(options:{projectIdFile?:string|undefined;oneamSessionFile?:string|undefined;stateDir?:string|undefined;fetcher?:typeof fetch}) {
+  const oneam=options.oneamSessionFile!==undefined,provider=oneam?"oneam":"blockfrost";
+  if(oneam&&options.projectIdFile!==undefined)throw new Error("Read RPC providers are mutually exclusive");
+  if(!oneam&&!options.projectIdFile)return null;
+  let token:string;
+  if(oneam){
+    let value:unknown;try{value=JSON.parse(privateFile(options.oneamSessionFile!));}catch{throw new Error("Invalid 1AM read credential");}
+    if(!value||typeof value!=="object"||Array.isArray(value)||Object.keys(value).sort().join(",")!=="format,token"||!("format" in value)||value.format!=="orynq-oneam-read-session/v1"||!("token" in value)||typeof value.token!=="string"||!/^[A-Za-z0-9._~+/:=-]{16,4000}$/.test(value.token))throw new Error("Invalid 1AM read credential");
+    token=value.token;
+  }else{
+    token=privateFile(options.projectIdFile!).trim();
+    if(!/^nightmainnet[A-Za-z0-9]{32}$/.test(token))throw new Error("Invalid read RPC configuration");
+  }
+  if(!options.stateDir)throw new Error("Invalid read RPC configuration");
+  const upstream=oneam?"https://api.1am.xyz/rpc/midnight":"https://rpc.midnight-mainnet.blockfrost.io";
+  const credential:Record<string,string>=oneam?{"X-Session-Token":token}:{project_id:token};
   const directory=lstatSync(options.stateDir);
   if(!directory.isDirectory()||directory.mode&0o077||(process.getuid&&directory.uid!==process.getuid()))throw new Error("Read RPC state must be private and owned");
   const lock=openSync(join(options.stateDir,"read-rpc.lock"),constants.O_CREAT|constants.O_RDWR|constants.O_NOFOLLOW|constants.O_NONBLOCK,0o600);
-  const dbPath=join(options.stateDir,"read-rpc.sqlite"),guardPath=join(options.stateDir,"read-rpc-high-water.json");
+  const dbPath=join(options.stateDir,"read-rpc.sqlite"),guardPath=join(options.stateDir,"read-rpc-high-water.json"),providerPath=join(options.stateDir,"read-rpc-provider");
   const existing=existsSync(dbPath);
+  let bound=false;
   let db:Database.Database;
   try{
     const info=fstatSync(lock);
@@ -50,6 +63,8 @@ export function openMidnightReadRpc(options:{projectIdFile?:string|undefined;sta
     const ownership=spawnSync("flock",["--exclusive","--nonblock","3"],{stdio:["ignore","ignore","ignore",lock]});
     if(ownership.status!==0||ownership.error)throw new Error("Read RPC state is already owned or locking is unavailable");
     if(existing!==existsSync(guardPath))throw new Error("Read RPC quota history is incomplete");
+    bound=existsSync(providerPath);
+    if((bound&&(!existing||privateFile(providerPath)!==provider))||(oneam&&existing&&!bound))throw new Error("Read RPC provider history differs");
     const fd=openSync(dbPath,constants.O_CREAT|constants.O_RDWR|constants.O_NOFOLLOW|constants.O_NONBLOCK,0o600);
     try {const info=fstatSync(fd);if(!info.isFile()||info.mode&0o077||(process.getuid&&info.uid!==process.getuid()))throw new Error("Unsafe read RPC database");}finally{closeSync(fd);}
     db=new Database(dbPath);
@@ -83,7 +98,21 @@ export function openMidnightReadRpc(options:{projectIdFile?:string|undefined;sta
       db.exec("create table read_budget(day integer primary key,used integer not null,requests integer not null default 0);create table read_cache(key text primary key,value text not null,bytes integer not null,expires integer not null,touched integer not null)");
       const day=Math.floor(Date.now()/86_400_000);db.prepare("insert into read_budget values (?,0,0)").run(day);watermark(day,0,0);
     }
+    const identity=db.prepare("select 1 from sqlite_master where type='table' and name='read_provider'").get();
+    if(identity){
+      const saved=db.prepare("select provider from read_provider where id=1").get() as {provider:string}|undefined,count=db.prepare("select count(*) n from read_provider").get() as {n:number};
+      if(saved?.provider!==provider||count.n!==1)throw new Error("Read RPC provider database differs");
+    }else if(existing&&(oneam||bound))throw new Error("Read RPC provider database identity is missing");
     if(!reserve(0))throw new Error("Read RPC quota is unavailable");
+    if(!identity)db.transaction(()=>{
+      db.exec("create table read_provider(id integer primary key check(id=1),provider text not null check(provider in ('blockfrost','oneam')))");
+      db.prepare("insert into read_provider values (1,?)").run(provider);
+    })();
+    if(!bound){
+      writeFileSync(providerPath,provider,{mode:0o600,flag:"wx"});
+      const file=openSync(providerPath,constants.O_RDONLY|constants.O_NOFOLLOW);try{fsyncSync(file);}finally{closeSync(file);}
+      const parent=openSync(options.stateDir,constants.O_RDONLY|constants.O_DIRECTORY);try{fsyncSync(parent);}finally{closeSync(parent);}
+    }
   }catch(error){close();throw error;}
   const fetcher=options.fetcher??(patchedFetch as unknown as typeof fetch),router=Router({strict:true,caseSensitive:true});
   const pending=new Map<string,Promise<Map<string,Answer>>>();let active=0,responseBytes=0,tail=Promise.resolve();
@@ -120,7 +149,7 @@ export function openMidnightReadRpc(options:{projectIdFile?:string|undefined;sta
         const request=[...missing.values()].map((call,id)=>({...call,id}));
         try {
           await Promise.race([before,expired]);abort.signal.throwIfAborted();
-          const response=await fetcher("https://rpc.midnight-mainnet.blockfrost.io",{method:"POST",redirect:"error",signal:abort.signal,headers:{"content-type":"application/json",project_id:token},body:JSON.stringify(request.length===1?request[0]:request)});
+          const response=await fetcher(upstream,{method:"POST",redirect:"error",signal:abort.signal,headers:{"content-type":"application/json",...credential},body:JSON.stringify(request.length===1?request[0]:request)});
           abort.signal.throwIfAborted();
           if(!response.ok||!response.body)throw new Error("Read RPC upstream is unavailable");
           const chunks:Buffer[]=[];let length=0;const reader=response.body.getReader();

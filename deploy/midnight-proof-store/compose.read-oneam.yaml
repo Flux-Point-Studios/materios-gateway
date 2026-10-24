@@ -1,0 +1,8 @@
+services:
+  midnight-proof-store:
+    environment:
+      MIDNIGHT_READ_PROXY_ONEAM_SESSION_FILE: /run/secrets/midnight-read-oneam-session
+      MIDNIGHT_READ_PROXY_STATE_DIR: /read-rpc-oneam-state
+    volumes:
+      - "${MIDNIGHT_READ_PROXY_ONEAM_SESSION_FILE:?Set a private typed 1AM read session file}:/run/secrets/midnight-read-oneam-session:ro"
+      - "${MIDNIGHT_READ_PROXY_STATE_DIR:?Set separate private 1AM quota storage}:/read-rpc-oneam-state"

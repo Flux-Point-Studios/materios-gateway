@@ -83,3 +83,11 @@ test("activates read RPC only through the new explicit variables and keeps old p
   await start(undefined,true,{MIDNIGHT_READ_PROXY_PROJECT_ID_FILE:project,MIDNIGHT_READ_PROXY_STATE_DIR:state});
   expect((await call()).status).toBe(400);expect(connections).toBe(0);expect((await fetch(base+"/health")).status).toBe(200);
 });
+
+test("starts the 1AM read route only with its new explicit typed credential",async()=>{
+  const session=join(root,"oneam-session.json"),state=join(root,"oneam-read-state");
+  await writeFile(session,JSON.stringify({format:"orynq-oneam-read-session/v1",token:"fixture-oneam-read-session"}),{mode:0o600});await mkdir(state,{mode:0o700});
+  await start(undefined,true,{MIDNIGHT_READ_PROXY_ONEAM_SESSION_FILE:session,MIDNIGHT_READ_PROXY_STATE_DIR:state});
+  const response=await fetch(base+"/midnight/mainnet/rpc",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method:"author_submitExtrinsic",params:["0x00"]})});
+  expect(response.status).toBe(400);expect((await fetch(base+"/health")).status).toBe(200);expect(connections).toBe(0);
+});
