@@ -263,22 +263,37 @@ export async function resolveReceiptId(receiptId: string): Promise<string | null
 function batchDatabase(readOnly = false, timeout = 5000): Database.Database | null {
   const file = join(config.storagePath, "index", "batches.sqlite");
   if (readOnly && !existsSync(file)) return null;
-  if (!readOnly) mkdirSync(join(config.storagePath, "index"), { recursive: true });
-  const db = new Database(file, { readonly: readOnly, timeout });
-  try {
-    if (!readOnly) {
-      // Establish the file/schema under SQLite's busy handler before changing journal mode.
-      db.exec("CREATE TABLE IF NOT EXISTS leaf_batches (leaf_hash TEXT NOT NULL, anchor_id TEXT NOT NULL, PRIMARY KEY (leaf_hash, anchor_id));");
-      db.pragma("journal_mode = WAL");
-      db.exec("CREATE TABLE IF NOT EXISTS cardano_claims (anchor_id TEXT NOT NULL, network TEXT NOT NULL CHECK(network IN ('mainnet','preprod')), tx_hash TEXT NOT NULL CHECK(length(tx_hash)=64 AND tx_hash NOT GLOB '*[^0-9a-f]*'), submitted_at TEXT CHECK(submitted_at IS NULL OR (typeof(submitted_at)='text' AND length(submitted_at)<=64)), PRIMARY KEY (anchor_id, network, tx_hash))");
-      db.exec("CREATE TABLE IF NOT EXISTS preferred_cardano_claims (leaf_hash TEXT PRIMARY KEY, anchor_id TEXT NOT NULL, network TEXT NOT NULL, tx_hash TEXT NOT NULL, submitted_at TEXT)");
-      db.exec("CREATE TABLE IF NOT EXISTS legacy_batch_files (anchor_id TEXT PRIMARY KEY, file_id TEXT NOT NULL)");
+  if (readOnly) return new Database(file, { readonly: true, timeout });
+  mkdirSync(join(config.storagePath, "index"), { recursive: true });
+  const deadline = performance.now() + timeout;
+  const statements = [
+    "CREATE TABLE IF NOT EXISTS leaf_batches (leaf_hash TEXT NOT NULL, anchor_id TEXT NOT NULL, PRIMARY KEY (leaf_hash, anchor_id))",
+    "journal_mode = WAL",
+    "CREATE TABLE IF NOT EXISTS cardano_claims (anchor_id TEXT NOT NULL, network TEXT NOT NULL CHECK(network IN ('mainnet','preprod')), tx_hash TEXT NOT NULL CHECK(length(tx_hash)=64 AND tx_hash NOT GLOB '*[^0-9a-f]*'), submitted_at TEXT CHECK(submitted_at IS NULL OR (typeof(submitted_at)='text' AND length(submitted_at)<=64)), PRIMARY KEY (anchor_id, network, tx_hash))",
+    "CREATE TABLE IF NOT EXISTS preferred_cardano_claims (leaf_hash TEXT PRIMARY KEY, anchor_id TEXT NOT NULL, network TEXT NOT NULL, tx_hash TEXT NOT NULL, submitted_at TEXT)",
+    "CREATE TABLE IF NOT EXISTS legacy_batch_files (anchor_id TEXT PRIMARY KEY, file_id TEXT NOT NULL)",
+  ];
+  for (;;) {
+    let db: Database.Database | undefined;
+    try {
+      db = new Database(file, { timeout: Math.max(0, Math.floor(deadline - performance.now())) });
+      for (const statement of statements) {
+        db.pragma(`busy_timeout = ${Math.max(0, Math.floor(deadline - performance.now()))}`);
+        if (statement === "journal_mode = WAL") {
+          if (db.pragma(statement, { simple: true }) !== "wal") throw new Error("Batch database did not enter WAL mode");
+        } else db.exec(statement);
+      }
+      db.pragma(`busy_timeout = ${timeout}`);
+      return db;
+    } catch (error) {
+      db?.close();
+      const remaining = deadline - performance.now();
+      if ((error as { code?: string }).code !== "SQLITE_BUSY" || remaining <= 0) throw error;
+      // WAL lock promotion can bypass SQLite's busy handler; release all locks before retrying.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(10, remaining));
+      if (performance.now() >= deadline) throw error;
     }
-  } catch (error) {
-    db.close();
-    throw error;
   }
-  return db;
 }
 
 function legacyBatch(anchorId: string, db?: Database.Database | null): Record<string, unknown> | null {

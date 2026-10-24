@@ -4,7 +4,7 @@
     {
       "id": "blob-gateway-api",
       "name": "Blob gateway API",
-      "desc": "Content-addressed blob gateway: manifest and chunk upload, receipt locators, Merkle helpers, canonical checkpoint batch validation and atomic JSON metadata merges, paged multivalue leaf discovery, and separately admitted append-only Cardano claims with bounded indexed pagination.",
+      "desc": "Content-addressed blob gateway: manifest and chunk upload, receipt locators, Merkle helpers, canonical checkpoint batch validation and atomic JSON metadata merges, bounded lock-safe SQLite initialization across processes, paged multivalue leaf discovery, and separately admitted append-only Cardano claims with bounded indexed pagination.",
       "kind": "api",
       "paths": [
         "src/routes/blobs.ts",
