@@ -58,3 +58,34 @@ and plan bytes from retained stores, including a copy outside the runner's resto
 domain. A successful PUT alone is insufficient. This gateway provides storage;
 it does not provision that independent replica, run the standing controller,
 broadcast transactions, or authenticate landing hints.
+
+## Standalone retained copy
+
+`npm run start:proof-store` runs the same router, exact-body parser, API-key
+resolver and SQLite store with only `/health` and `/midnight/*` routes. It does
+not initialize the full gateway, connect to chains, run indexing or clean blobs.
+The storage directory must be private and owned by the service UID. New files
+use an owner-only umask. `PROOF_STORE_BIND_ADDRESS` defaults to loopback; `PORT`
+defaults to 3000. Both writer lists retain their empty defaults.
+
+The reviewed gateway image includes `dist/proof-store.js`.
+`deploy/midnight-proof-store/compose.yaml` runs it with a pinned image supplied in
+`PROOF_STORE_IMAGE`, a private `PROOF_STORE_DATA_DIR` and a read-only
+`PROOF_STORE_KEYS_FILE`. The latter contains normal hashed gateway key records,
+never plaintext publisher credentials. Register each enabled writer hash there
+and allow it only for the required Midnight network. Store the publisher's two
+credentials separately in owner-only files.
+
+Place this copy on a different physical disk and outside the runner's restore
+set. Restrict any LAN origin port to the tunnel host; expose a distinct HTTPS
+hostname through the existing tunnel configuration without restarting its live
+connections. Sharing a tunnel provides separate storage, not independent public
+availability. Use a separate persistent directory and backup policy.
+
+Back up SQLite with its online backup API or a stopped-process checkpointed
+copy; copying only a live `.sqlite` file can omit committed WAL transactions.
+Preserve owner-only modes on restore, including the backup file itself. Before
+activation, verify health, missing and wrong-network writer refusals, fresh
+publication/readback from both hosts, restart and an independent SQLite-consistent
+restore. The integration suite exercises these boundaries through real child
+processes and HTTP.

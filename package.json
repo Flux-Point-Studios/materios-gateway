@@ -16,6 +16,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "start:proof-store": "node dist/proof-store.js",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -1,0 +1,30 @@
+services:
+  midnight-proof-store:
+    image: ${PROOF_STORE_IMAGE:?Set a reviewed image digest}
+    command: ["node", "dist/proof-store.js"]
+    restart: unless-stopped
+    read_only: true
+    init: true
+    cpus: 0.5
+    mem_limit: 512m
+    pids_limit: 128
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
+    ports:
+      - "${PROOF_STORE_BIND_IP:-127.0.0.1}:${PROOF_STORE_PORT:-3012}:3000"
+    environment:
+      PORT: "3000"
+      PROOF_STORE_BIND_ADDRESS: "0.0.0.0"
+      STORAGE_PATH: /data/blobs
+      KEYS_FILE_PATH: /run/secrets/proof-store-keys.json
+      MIDNIGHT_MAINNET_WRITER_KEY_HASHES: ${MIDNIGHT_MAINNET_WRITER_KEY_HASHES:-}
+      MIDNIGHT_PREPROD_WRITER_KEY_HASHES: ${MIDNIGHT_PREPROD_WRITER_KEY_HASHES:-}
+    volumes:
+      - "${PROOF_STORE_DATA_DIR:?Set private persistent storage}:/data/blobs"
+      - "${PROOF_STORE_KEYS_FILE:?Set the hashed key records file}:/run/secrets/proof-store-keys.json:ro"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
