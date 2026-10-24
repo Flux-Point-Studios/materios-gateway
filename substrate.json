@@ -222,6 +222,22 @@
       ],
       "consumes": [],
       "status": "live"
+    },
+    {
+      "id": "midnight-proof-candidates",
+      "name": "Retained Midnight proof candidates",
+      "desc": "Isolated immutable byte-addressed checkpoint members, recovery plans and unverified Midnight set hints, with network-scoped pipeline writers, atomic retained SQLite admission, bounded seek discovery and explicit corruption diagnostics. Consumers authenticate finality and current author policy independently.",
+      "kind": "api",
+      "paths": [
+        "src/midnight-proof-store.ts",
+        "src/routes/midnight-proofs.ts",
+        "ops/midnight-proofs.md"
+      ],
+      "consumes": [
+        "checkpoint-primitives",
+        "gateway-api-tokens"
+      ],
+      "status": "experimental"
     }
   ]
 }

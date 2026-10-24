@@ -15,6 +15,8 @@ export const config = {
   // comma-separated; empty lists refuse every write.
   batchWriterAddresses: csv(process.env.BATCH_WRITER_ADDRESSES),
   batchWriterKeyHashes: csv(process.env.BATCH_WRITER_KEY_HASHES).map((h) => h.toLowerCase()),
+  midnightMainnetWriterKeyHashes: csv(process.env.MIDNIGHT_MAINNET_WRITER_KEY_HASHES).map(h => h.toLowerCase()),
+  midnightPreprodWriterKeyHashes: csv(process.env.MIDNIGHT_PREPROD_WRITER_KEY_HASHES).map(h => h.toLowerCase()),
   // Bech32 addresses of the wallets that fund the anchor workers' label-8746
   // txs. Anyone can post label-8746 metadata naming our root, so trace lineage
   // counts a Cardano anchor only when every input of its tx spends from one of

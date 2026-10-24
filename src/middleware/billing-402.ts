@@ -95,6 +95,9 @@ export function classifyEndpoint(req: Request): EndpointClass {
   if (m === "PATCH" && /^\/operators\/[^/]+\/session-keys$/.test(p)) {
     return assertEndpointClass("admin");
   }
+  if (m === "PUT" && /^\/midnight\/(mainnet|preprod)\/objects\/(members|plans|sets)\/[a-f0-9]{64}$/.test(p)) {
+    return assertEndpointClass("admin");
+  }
 
   // ----- Public reads — chain-info, locators, blobs GET, batches GET, etc. -----
   if (m === "GET") {
