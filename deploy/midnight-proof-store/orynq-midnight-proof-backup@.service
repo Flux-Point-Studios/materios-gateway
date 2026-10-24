@@ -1,0 +1,12 @@
+[Unit]
+Description=Retain a verified online Midnight proof-store snapshot (%i)
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/orynq-midnight-proof-backup/%i.env
+ExecStart=/usr/bin/python3 %h/.local/lib/orynq-midnight-proof-backup/midnight_proof_backup.py --source ${PROOF_BACKUP_SOURCE} --destination ${PROOF_BACKUP_DESTINATION}
+TimeoutStartSec=120
+Nice=10
+UMask=0077
+NoNewPrivileges=true
+
