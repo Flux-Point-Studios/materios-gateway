@@ -237,8 +237,22 @@
       ],
       "consumes": [
         "checkpoint-primitives",
-        "gateway-api-tokens"
+        "gateway-api-tokens",
+        "midnight-read-rpc"
       ],
+      "status": "experimental"
+    },
+    {
+      "id": "midnight-read-rpc",
+      "name": "Bounded Midnight read RPC",
+      "desc": "Explicitly enabled fixed-upstream mainnet chain reads for authenticated Orynq followers and public receipt verifiers, with exact method and registry admission, private provider credentials, bounded serialized exchanges and cache, and separately retained daily HTTP/subcall quota high-water state. Disabled by default; wallet provider and proof storage remain unchanged.",
+      "kind": "api",
+      "paths": [
+        "src/routes/midnight-read-rpc.ts",
+        "deploy/midnight-proof-store/compose.read-rpc.yaml",
+        "ops/midnight-read-rpc.md"
+      ],
+      "consumes": [],
       "status": "experimental"
     }
   ]
