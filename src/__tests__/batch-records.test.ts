@@ -4,6 +4,7 @@ import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { config } from "../config.js";
@@ -91,6 +92,67 @@ describe("checkpoint batch records", () => {
       } finally {
         children.forEach((value) => { if (value.child.exitCode === null) value.child.kill(); });
       }
+    }
+  });
+
+  test.each([false, true])("WAL lock upgrade contention respects deadline expiry=%s", async (expires) => {
+    await mkdir(join(directory, "index"), { recursive: true });
+    const blocker = new Database(join(directory, "index/batches.sqlite"));
+    blocker.exec("CREATE TABLE leaf_batches (leaf_hash TEXT NOT NULL, anchor_id TEXT NOT NULL, PRIMARY KEY (leaf_hash, anchor_id))");
+    const pragma = Database.prototype.pragma;
+    const clock = vi.spyOn(performance, "now");
+    const wait = expires ? vi.spyOn(Atomics, "wait").mockImplementation(() => {
+      clock.mockReturnValue(1e15);
+      return "timed-out";
+    }) : undefined;
+    let busy = 0;
+    let armed = true;
+    const interception = vi.spyOn(Database.prototype, "pragma").mockImplementation(function (this: Database.Database, source, options) {
+      if (source === "journal_mode = WAL" && armed) {
+        armed = false;
+        blocker.exec("BEGIN IMMEDIATE");
+        try {
+          return pragma.call(this, source, options);
+        } catch (error) {
+          if ((error as { code?: string }).code === "SQLITE_BUSY") busy++;
+          throw error;
+        } finally {
+          blocker.exec("ROLLBACK");
+        }
+      }
+      return pragma.call(this, source, options);
+    });
+    try {
+      const record = batch();
+      if (expires) {
+        await expect(storage.saveBatch(record.anchorId, record)).rejects.toThrow(expect.objectContaining({ code: "SQLITE_BUSY" }));
+        await expect(readFile(join(directory, "batches", `${record.anchorId}.json`))).rejects.toThrow(expect.objectContaining({ code: "ENOENT" }));
+        expect(wait).toHaveBeenCalledOnce();
+      } else {
+        await storage.saveBatch(record.anchorId, record);
+        expect(await storage.getBatch(record.anchorId)).toMatchObject(record);
+      }
+      expect(busy).toBe(1);
+    } finally {
+      interception.mockRestore();
+      wait?.mockRestore();
+      clock.mockRestore();
+      blocker.close();
+    }
+  });
+
+  test("the discovery hint does not wait or retry an unavailable initialization lock", () => {
+    mkdirSync(join(directory, "index"), { recursive: true });
+    const blocker = new Database(join(directory, "index/batches.sqlite"));
+    blocker.exec("BEGIN EXCLUSIVE; CREATE TABLE occupied (value TEXT)");
+    const started = performance.now();
+    try {
+      const record = batch();
+      expect(() => storage.savePreferredCardanoClaim(digest("leaf"), record.anchorId, { cardanoNetwork: "mainnet", cardanoTxHash: "aa".repeat(32) })).toThrow(expect.objectContaining({ code: "SQLITE_BUSY" }));
+      expect(performance.now() - started).toBeLessThan(1000);
+    } finally {
+      blocker.exec("ROLLBACK");
+      blocker.close();
     }
   });
 
