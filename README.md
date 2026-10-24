@@ -35,6 +35,8 @@ SDK / Operator  -->  Blob Gateway  -->  Disk storage (/data/blobs)
 | `GET` | `/locators/:receiptId` | Resolve receipt to blob location |
 | `GET` | `/chunks/:receiptId/:i` | Download chunk by index |
 | `GET` | `/batches/:anchorId` | Batch metadata for Merkle verification |
+| `GET` | `/batches/by-leaf/:leafHash` | Candidate batches, with `cursor` and `limit` (1–64) |
+| `GET` | `/batches/:anchorId/cardano-claims` | Untrusted Cardano claims, with stable `cursor` and `limit` (1–64) |
 | `GET` | `/api/witness-network/topology` | Witness Network live topology JSON (per-attestor city geo + trust score) |
 | `GET` | `/witness/map` | Witness Network live map UI (Leaflet + OpenStreetMap) |
 
@@ -48,6 +50,7 @@ SDK / Operator  -->  Blob Gateway  -->  Disk storage (/data/blobs)
 | `POST` | `/heartbeats` | Submit validator heartbeat (dual-mode auth) |
 | `POST` | `/batches/:anchorId` | Create batch metadata |
 | `PUT` | `/batches/:anchorId` | Update batch metadata |
+| `POST` | `/batches/:anchorId/cardano-claims` | Append a small Cardano claim using batch-writer authorization |
 
 ### Admin-only (x-admin-token)
 
@@ -171,9 +174,33 @@ Headers:
 
 A client may send both signatures. Every signature a request carries must
 verify, v2 decides, and both are spent together. Batch writes (`PUT`/`POST /batches/:anchorId`) authenticated by
-signature require v2. Each accepted v1 signature logs one
+signature require v2, including `POST /batches/:anchorId/cardano-claims`. Each accepted v1 signature logs one
 `{"log":"upload_sig_v1","address":...,"method":...,"route":...}` line so its
 retirement can be tracked.
+
+Batch writes must derive their path ID from the canonical checkpoint manifest and
+Merkle root. JSON remains the metadata authority; updates merge atomically under
+the batch SQLite write lock. Startup indexes historical files without rewriting
+their bytes. The batch database is separate from `quota.db`.
+
+Cardano claim writes accept only `cardanoNetwork` (`mainnet` or `preprod`), a
+32-byte hex `cardanoTxHash`, and optional ISO-compatible `cardanoSubmittedAt`.
+They append idempotently to a separate table, so metadata padding or earlier
+false claims cannot block a genuine claim. Missing metadata returns retryable
+404. Claims are discovery inputs and are independently verified against Cardano.
+Readers must follow `nextCursor` until null; claim cursors are
+`<network>:<lowercase tx hash>`, and candidate cursors are lowercase batch IDs.
+
+Trace HTML and JSON expose `meta.anchorSearch` with completion, diagnostics and
+continuation fields. Continue with either `anchorCursor` or `claimAnchor` plus
+optional `claimCursor`; a resumed claim batch must contain the receipt leaf.
+Each request has an eight-second verification budget and two verification
+workers. An earlier good anchor is retained as a discovery hint and fully
+reverified against current metadata and wallet policy on every request.
+
+Deploy the gateway before upgrading claim writers. Roll back writers before the
+gateway: old gateway versions can read all JSON metadata, but cannot discover
+SQL-only claims. Preserve `index/batches.sqlite` and its WAL during rollback.
 
 Every signature is accepted once: reuse is refused with 401, and used
 signatures are kept in `quota.db:used_upload_sigs` until their timestamp leaves

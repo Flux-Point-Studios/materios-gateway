@@ -19,7 +19,8 @@ import { createServer, type Server } from "http";
 import { AddressInfo } from "net";
 
 import { config } from "../../config.js";
-import { saveManifest, saveBatch } from "../../storage.js";
+import { saveLegacyBatch } from "../../__tests__/fixtures/legacy-batch.js";
+import { saveManifest } from "../../storage.js";
 import { traceRouter, __test__setFetchImpl, __test__resetFetchImpl } from "../trace.js";
 import { koiosResponder } from "../../__tests__/fixtures/l1_anchor.js";
 
@@ -152,7 +153,7 @@ browserDescribe("trace lineage page in headless Chromium", () => {
         { index: 1, sha256: "bb".repeat(32), size: 1024 },
       ],
     });
-    await saveBatch(anchorId, {
+    await saveLegacyBatch(anchorId, {
       anchorId,
       rootHash: checkpointLeaf,
       leafCount: 1,

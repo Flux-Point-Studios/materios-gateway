@@ -19,6 +19,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 
 import { config } from "../config.js";
+import { checkpointBatch } from "./fixtures/checkpoint-batch.js";
 import { blobsRouter } from "../routes/blobs.js";
 import { chunksRouter } from "../routes/chunks.js";
 import { locatorsRouter } from "../routes/locators.js";
@@ -108,6 +109,7 @@ describe("file-backed ids must be 32-byte hex", () => {
     const leaf = "cd".repeat(32);
     mkdirSync(join(tmpDir, "index", "leaf-to-anchor"), { recursive: true });
     writeFileSync(join(tmpDir, "index", "leaf-to-anchor", leaf), "../planted");
-    await expect(saveBatch("ef".repeat(32), { leafHashes: [leaf] })).resolves.toBeUndefined();
+    const batch = checkpointBatch([leaf]);
+    await expect(saveBatch(batch.anchorId, batch)).resolves.toBeUndefined();
   });
 });

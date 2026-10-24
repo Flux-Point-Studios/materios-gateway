@@ -18,8 +18,9 @@
  */
 import { Router, type Request, type Response } from "express";
 import { config } from "../config.js";
-import { createHash } from "crypto";
-import { getManifest, getBatchByLeaf } from "../storage.js";
+import { checkpointLeaf } from "@fluxpointstudios/orynq-sdk-core/checkpoint";
+import { BatchValidationError, type CardanoClaim } from "../batch-record.js";
+import { BatchStorageError, getManifest, getBatch, getBatchesByLeaf, getCardanoClaims, preferredCardanoClaim, savePreferredCardanoClaim } from "../storage.js";
 import {
   BATCH_RECORD_CHECKS,
   SETTLED_DEPTH,
@@ -35,7 +36,6 @@ export const traceRouter = Router();
 const CONTENT_HASH_RE = /^[0-9a-f]{64}$/;
 const RECEIPT_ID_RE = /^0x[0-9a-fA-F]{64}$/;
 const SS58_RE = /^[1-9A-HJ-NP-Za-km-z]{40,60}$/;
-const HEX_TX_RE = /^[0-9a-f]{64}$/;
 // Mirrors `DEFAULT_MIN_ATTESTATION_THRESHOLD` in `routes/explorer-validators.ts`.
 // If the on-chain `MinAttestationThreshold` constant changes, both routes need
 // a bump.
@@ -83,6 +83,18 @@ interface AttestorCertInfo {
   competingCerts: Array<{ certHash: string; signers: CertSigner[] }>;
 }
 
+interface AnchorSearchOptions { anchorCursor?: string; claimAnchor?: string; claimCursor?: string }
+interface AnchorSearch { complete: boolean; checked: number; remaining: number; unreadableCandidates: string[]; next: AnchorSearchOptions | null }
+
+function anchorSearchOptions(req: Request): AnchorSearchOptions {
+  const { anchorCursor, claimAnchor, claimCursor, anchorOffset } = req.query;
+  if ((anchorCursor !== undefined && (typeof anchorCursor !== "string" || !/^[0-9a-f]{64}$/.test(anchorCursor))) ||
+      (claimAnchor !== undefined && (typeof claimAnchor !== "string" || !/^[0-9a-f]{64}$/.test(claimAnchor))) ||
+      (claimCursor !== undefined && (typeof claimCursor !== "string" || !/^(mainnet|preprod):[0-9a-f]{64}$/.test(claimCursor))) ||
+      (claimCursor !== undefined && claimAnchor === undefined) || (claimAnchor !== undefined && anchorCursor !== undefined) || anchorOffset !== undefined) throw new BatchValidationError("Invalid anchor search continuation");
+  return { anchorCursor: anchorCursor as string | undefined, claimAnchor: claimAnchor as string | undefined, claimCursor: claimCursor as string | undefined };
+}
+
 interface AnchorInfo {
   found: boolean;
   record: Record<string, unknown> | null;
@@ -92,6 +104,7 @@ interface AnchorInfo {
   source: string | null;
   timestamp: string | null;
   verification: L1Verification | null;
+  search?: AnchorSearch;
 }
 
 // Sentinel thrown when chain RPC is unreachable. Surfaces as 503 on both
@@ -248,19 +261,6 @@ async function fetchGenesisHash(): Promise<string | null> {
   return genesisHash;
 }
 
-/**
- * The cert-daemon's checkpoint leaf for a certified receipt:
- * sha256("materios-checkpoint-v1" || genesis || receiptId || certHash).
- */
-function checkpointLeaf(genesis: string, receiptId: string, certHash: string): string {
-  return createHash("sha256")
-    .update(Buffer.from("materios-checkpoint-v1", "utf-8"))
-    .update(Buffer.from(genesis.replace(/^0x/, ""), "hex"))
-    .update(Buffer.from(receiptId.replace(/^0x/, ""), "hex"))
-    .update(Buffer.from(certHash.replace(/^0x/, ""), "hex"))
-    .digest("hex");
-}
-
 function emptyAnchor(): AnchorInfo {
   return {
     found: false,
@@ -274,28 +274,123 @@ function emptyAnchor(): AnchorInfo {
   };
 }
 
-async function fetchAnchorRecord(leafHash: string): Promise<AnchorInfo> {
-  const record = await getBatchByLeaf(leafHash);
-  if (!record) return emptyAnchor();
-  const r = record as Record<string, unknown>;
-  const tx =
-    typeof r.cardanoTxHash === "string" && HEX_TX_RE.test(r.cardanoTxHash.toLowerCase())
-      ? r.cardanoTxHash.toLowerCase()
-      : null;
-  const net =
-    r.cardanoNetwork === "mainnet" || r.cardanoNetwork === "preprod"
-      ? r.cardanoNetwork
-      : null;
-  return {
-    found: true,
-    record: r,
-    cardanoTxHash: tx,
-    cardanoNetwork: net,
-    anchorId: typeof r.anchorId === "string" ? r.anchorId : null,
-    source: typeof r.source === "string" ? r.source : null,
-    timestamp: typeof r.timestamp === "string" ? r.timestamp : null,
-    verification: null,
+async function fetchAnchorRecord(leafHash: string, genesis: string, options: AnchorSearchOptions): Promise<AnchorInfo> {
+  const controller = new AbortController();
+  const deadline = performance.now() + 8_000;
+  const timer = setTimeout(() => controller.abort(new Error("Anchor search budget exhausted")), 8_000);
+  const boundedFetch: FetchLike = (url, init) => fetchImpl(url, { ...init, signal: AbortSignal.any([controller.signal, ...(init?.signal ? [init.signal] : [])]) });
+  const expired = () => controller.signal.aborted || performance.now() >= deadline;
+  const search: AnchorSearch = { complete: false, checked: 0, remaining: 0, unreadableCandidates: [], next: options };
+  let best = emptyAnchor();
+  const rank = (anchor: AnchorInfo) => {
+    const result = anchor.verification;
+    return result?.status === "ok" ? (result.settled ? 5 : 4) : result?.status === "pending" ? 3 : result?.status === "unknown" ? 2 : result?.status === "failed" ? 1 : 0;
   };
+  const member = (record: Record<string, unknown>) => Array.isArray(record.leafHashes) && record.leafHashes.some((leaf) => typeof leaf === "string" && leaf.replace(/^0x/, "").toLowerCase() === leafHash);
+  const loadMember = async (key: string): Promise<Record<string, unknown>> => {
+    const record = await getBatch(key) as Record<string, unknown> | null;
+    if (!record || !member(record)) throw new BatchValidationError("Claim continuation does not contain this receipt leaf");
+    return { anchorId: `0x${key}`, ...record };
+  };
+  const candidate = (record: Record<string, unknown>, claim?: CardanoClaim): AnchorInfo => ({
+    found: true, record: claim ? { ...record, ...claim } : record,
+    cardanoTxHash: claim?.cardanoTxHash ?? null, cardanoNetwork: claim?.cardanoNetwork ?? null,
+    anchorId: typeof record.anchorId === "string" ? record.anchorId : null,
+    source: typeof record.source === "string" ? record.source : null,
+    timestamp: typeof record.timestamp === "string" ? record.timestamp : null, verification: null,
+  });
+  const verify = async (key: string, record: Record<string, unknown>, claim: CardanoClaim): Promise<boolean> => {
+    if (expired()) return false;
+    let abort!: () => void;
+    const stopped = new Promise<null>((resolve) => { abort = () => resolve(null); controller.signal.addEventListener("abort", abort, { once: true }); });
+    let result: L1Verification | null;
+    try {
+      // A shared inflight lookup may have another caller's fetch signal.
+      result = await Promise.race([verifyL1Anchor({ txHash: claim.cardanoTxHash, network: claim.cardanoNetwork, batch: record, leaf: leafHash, genesis }, boundedFetch), stopped]);
+    } finally {
+      controller.signal.removeEventListener("abort", abort);
+    }
+    if (result === null) return false;
+    search.checked++;
+    const anchor = { ...candidate(record, claim), verification: result };
+    if (!best.found || rank(anchor) > rank(best)) {
+      best = anchor;
+      if (result.status === "ok") {
+        try { savePreferredCardanoClaim(leafHash, key, claim); }
+        catch (error) { console.error(`[trace] cannot save anchor discovery hint: ${error instanceof Error ? error.name : "storage error"}`); }
+      }
+    }
+    return true;
+  };
+  try {
+    // Validate a resumed batch before consulting any hint for this leaf.
+    let record = options.claimAnchor ? await loadMember(options.claimAnchor) : null;
+    try {
+      const hint = preferredCardanoClaim(leafHash);
+      if (hint) await verify(hint.anchorId, await loadMember(hint.anchorId), hint.claim);
+    } catch (error) {
+      console.error(`[trace] ignoring unusable anchor discovery hint: ${error instanceof Error ? error.name : "storage error"}`);
+    }
+    let key = options.claimAnchor;
+    let afterBatch = options.anchorCursor;
+    let afterClaim = options.claimCursor;
+    while (!expired()) {
+      if (!record) {
+        const page = await getBatchesByLeaf(leafHash, { cursor: afterBatch, limit: 1 });
+        search.unreadableCandidates.push(...page.unreadableCandidates);
+        if (page.candidates.length === 0) {
+          if (page.nextCursor) { afterBatch = page.nextCursor; search.next = { anchorCursor: afterBatch }; continue; }
+          search.next = null;
+          search.complete = search.unreadableCandidates.length === 0;
+          break;
+        }
+        record = page.candidates[0] as Record<string, unknown>;
+        key = record.batchKey as string;
+      }
+      let page: Awaited<ReturnType<typeof getCardanoClaims>>;
+      try { page = await getCardanoClaims(key!, { cursor: afterClaim }); }
+      catch (error) {
+        if (!(error instanceof BatchStorageError)) throw error;
+        console.error(`[trace] unreadable Cardano claims for batch ${key}`);
+        search.unreadableCandidates.push(key!);
+        afterBatch = key;
+        record = null;
+        afterClaim = undefined;
+        search.next = { anchorCursor: afterBatch };
+        continue;
+      }
+      if (!best.found) best = candidate(record);
+      let next = 0;
+      const completed = page.claims.map(() => false);
+      await Promise.all(Array.from({ length: Math.min(2, page.claims.length) }, async () => {
+        while (next < page.claims.length && !expired()) {
+          const index = next++;
+          completed[index] = await verify(key!, record!, page.claims[index]);
+        }
+      }));
+      let contiguous = 0;
+      while (completed[contiguous]) contiguous++;
+      if (contiguous < page.claims.length) {
+        const last = contiguous === 0 ? afterClaim : `${page.claims[contiguous - 1].cardanoNetwork}:${page.claims[contiguous - 1].cardanoTxHash}`;
+        search.next = { claimAnchor: key!, ...(last ? { claimCursor: last } : {}) };
+        search.remaining = page.claims.length - contiguous + (page.nextCursor ? 1 : 0);
+        break;
+      }
+      if (page.nextCursor) {
+        afterClaim = page.nextCursor;
+        search.next = { claimAnchor: key!, claimCursor: afterClaim };
+      } else {
+        afterBatch = key;
+        record = null;
+        afterClaim = undefined;
+        search.next = { anchorCursor: afterBatch };
+      }
+    }
+    if (search.next && search.remaining === 0) search.remaining = 1;
+  } finally {
+    clearTimeout(timer);
+  }
+  return { ...best, search };
 }
 
 interface LoadedTrace {
@@ -309,6 +404,7 @@ interface LoadedTrace {
 async function loadTrace(
   contentHash: string,
   manifest: Record<string, unknown>,
+  options: AnchorSearchOptions = {},
 ): Promise<LoadedTrace> {
   const receipt = await fetchReceiptByContent(contentHash);
   let cert: AttestorCertInfo | null = null;
@@ -322,21 +418,9 @@ async function loadTrace(
   const genesis = certified ? await fetchGenesisHash() : null;
   const leaf =
     receipt && certified && genesis
-      ? checkpointLeaf(genesis, receipt.receiptId, receipt.availabilityCertHash)
+      ? checkpointLeaf(genesis, receipt.receiptId, receipt.availabilityCertHash).slice(2)
       : null;
-  const anchor = leaf ? await fetchAnchorRecord(leaf) : emptyAnchor();
-  if (leaf && genesis && anchor.record && anchor.cardanoTxHash && anchor.cardanoNetwork) {
-    anchor.verification = await verifyL1Anchor(
-      {
-        txHash: anchor.cardanoTxHash,
-        network: anchor.cardanoNetwork,
-        batch: anchor.record,
-        leaf,
-        genesis,
-      },
-      fetchImpl,
-    );
-  }
+  const anchor = leaf && genesis ? await fetchAnchorRecord(leaf, genesis, options) : emptyAnchor();
 
   if (receipt) {
     if (isAllZeroHex(receipt.baseManifestHash)) receipt.baseManifestHash = "";
@@ -384,6 +468,7 @@ export interface LineageResponse {
   edges: LineageEdge[];
   meta: {
     minAttestationThreshold: number;
+    anchorSearch?: AnchorSearch;
     finalized: boolean;
     note?: string;
   };
@@ -410,6 +495,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
   const edges: LineageEdge[] = [];
 
   const { contentHash, manifest, receipt, cert, anchor } = loaded;
+  const searchMeta = anchor.search ? { anchorSearch: anchor.search } : {};
 
   const traceNodeId = "trace";
   nodes.push({
@@ -448,6 +534,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
       edges,
       meta: {
         minAttestationThreshold: threshold,
+        ...searchMeta,
         finalized: false,
         note: "Manifest uploaded, receipt not yet on chain. Receipts appear ~30s after submit_receipt_v2.",
       },
@@ -492,6 +579,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
       edges,
       meta: {
         minAttestationThreshold: threshold,
+        ...searchMeta,
         finalized: false,
         note: `Receipt on chain. Awaiting attestor quorum (${threshold} of N).`,
       },
@@ -539,6 +627,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
       edges,
       meta: {
         minAttestationThreshold: threshold,
+        ...searchMeta,
         finalized: false,
         note: `Competing certs detected — ${cert.competingCerts.length} branches with disagreeing attestor sets.`,
       },
@@ -593,6 +682,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
       edges,
       meta: {
         minAttestationThreshold: threshold,
+        ...searchMeta,
         finalized: false,
         note: `${signers.length} of ${threshold} attestors agree — partial quorum.`,
       },
@@ -606,6 +696,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
       edges,
       meta: {
         minAttestationThreshold: threshold,
+        ...searchMeta,
         finalized: false,
         note: "Receipt certified. L1 anchor pending — certified receipts are checkpointed to Cardano about once an hour.",
       },
@@ -667,6 +758,7 @@ function buildLineage(loaded: LoadedTrace, threshold: number): LineageResponse {
     edges,
     meta: {
       minAttestationThreshold: threshold,
+        ...searchMeta,
       finalized,
       ...(finalized ? {} : { note: L1_NOTE[verification.status](verification) }),
     },
@@ -1226,13 +1318,17 @@ function renderLegend(): string {
 }
 
 function renderNoteBanner(lineage: LineageResponse): string {
-  if (!lineage.meta.note && !lineage.meta.finalized) return "";
+  const search = lineage.meta.anchorSearch;
+  if (!lineage.meta.note && !lineage.meta.finalized && search?.complete !== false) return "";
   const l1Failed = lineage.nodes.some((n) => n.kind === "l1" && n.status === "failed");
   const cls = lineage.meta.finalized ? "note-banner ok" : l1Failed ? "note-banner err" : "note-banner";
   const txt = lineage.meta.finalized
     ? "Trace fully attested and anchored on Cardano L1; the anchor tx was checked against the chain."
+    : search?.complete === false ? "Anchor verification is incomplete."
     : lineage.meta.note ?? "";
-  return `<div class="${cls}">${escapeHtml(txt)}</div>`;
+  const query = search?.next ? new URLSearchParams(Object.entries(search.next).map(([key, value]): [string, string] => [key, String(value)])) : null;
+  const continuation = query ? ` <a href="/trace/${lineage.contentHash}?${escapeHtml(query.toString())}">Continue anchor verification</a>` : "";
+  return `<div class="${cls}">${escapeHtml(txt)}${continuation}</div>`;
 }
 
 function renderTracePage(
@@ -1317,9 +1413,10 @@ traceRouter.get(
     }
 
     try {
-      const lineage = buildLineage(await loadTrace(raw, manifest), DEFAULT_MIN_ATTESTATION_THRESHOLD);
+      const lineage = buildLineage(await loadTrace(raw, manifest, anchorSearchOptions(req)), DEFAULT_MIN_ATTESTATION_THRESHOLD);
       res.status(200).json(lineage);
     } catch (err) {
+      if (err instanceof BatchValidationError) { res.status(400).json({ error: err.message }); return; }
       if (err instanceof ChainUnreachable) {
         res.status(503).json({
           error: `Materios chain RPC unreachable: ${err.cause}`,
@@ -1356,10 +1453,11 @@ traceRouter.get("/trace/:contentHash", async (req: Request, res: Response) => {
   }
 
   try {
-    const loaded = await loadTrace(raw, manifest);
+    const loaded = await loadTrace(raw, manifest, anchorSearchOptions(req));
     const lineage = buildLineage(loaded, DEFAULT_MIN_ATTESTATION_THRESHOLD);
     res.status(200).send(renderTracePage(loaded, lineage, DEFAULT_MIN_ATTESTATION_THRESHOLD));
   } catch (err) {
+    if (err instanceof BatchValidationError) { res.status(400).json({ error: err.message }); return; }
     if (err instanceof ChainUnreachable) {
       res.status(503).send(render503(err.cause));
       return;

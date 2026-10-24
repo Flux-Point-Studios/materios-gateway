@@ -4,7 +4,7 @@
     {
       "id": "blob-gateway-api",
       "name": "Blob gateway API",
-      "desc": "Content-addressed blob gateway: manifest and chunk upload, receipt locators served to attestors, Merkle helpers and batch metadata for multi-leaf anchors.",
+      "desc": "Content-addressed blob gateway: manifest and chunk upload, receipt locators, Merkle helpers, canonical checkpoint batch validation and atomic JSON metadata merges, paged multivalue leaf discovery, and separately admitted append-only Cardano claims with bounded indexed pagination.",
       "kind": "api",
       "paths": [
         "src/routes/blobs.ts",
@@ -12,6 +12,7 @@
         "src/routes/locators.ts",
         "src/routes/batches.ts",
         "src/storage.ts",
+        "src/batch-record.ts",
         "src/merkle.ts"
       ],
       "consumes": [
@@ -198,7 +199,7 @@
     {
       "id": "trace-lineage",
       "name": "Trace lineage",
-      "desc": "Public provenance graph for a trace (HTML and JSON): manifest, on-chain receipt, attestor quorum, certificate, checkpoint batch reached through the receipt's leaf, and the Cardano L1 anchor with its verification state.",
+      "desc": "Public trace provenance graph in HTML and JSON: receipt and certificate, candidate checkpoint batches reached through the receipt leaf, and independently verified Cardano claims. Stable leaf-bound continuations, two verification workers and an eight-second caller budget bound discovery; reverified hints preserve previously proven anchors across later pages.",
       "kind": "api",
       "paths": [
         "src/routes/trace.ts"

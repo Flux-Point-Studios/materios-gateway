@@ -23,7 +23,8 @@ import { tmpdir } from "os";
 import { join } from "path";
 
 import { config } from "../../config.js";
-import { saveManifest, saveBatch } from "../../storage.js";
+import { saveLegacyBatch } from "../../__tests__/fixtures/legacy-batch.js";
+import { saveManifest } from "../../storage.js";
 import { traceRouter, __test__setFetchImpl, __test__resetFetchImpl } from "../trace.js";
 import { koiosResponder } from "../../__tests__/fixtures/l1_anchor.js";
 
@@ -225,7 +226,7 @@ describe("GET /trace/:contentHash", () => {
     const checkpointLeaf = "a920d75239e81ee8dacf7c67ee60cebf8a6c7ef4cf65bbd1922c9e8ef0b47ff6";
     const anchorId = "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
     const cardanoTx = "1f14de860adc83cfdc344a5a19a6fe324e3dc555d25b2cdde30932afdd7e0a28";
-    await saveBatch(anchorId, {
+    await saveLegacyBatch(anchorId, {
       anchorId,
       rootHash: checkpointLeaf,
       leafCount: 1,
