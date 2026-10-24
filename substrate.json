@@ -226,12 +226,13 @@
     {
       "id": "midnight-proof-candidates",
       "name": "Retained Midnight proof candidates",
-      "desc": "Isolated immutable byte-addressed checkpoint members, recovery plans and unverified Midnight set hints, with network-scoped pipeline writers, atomic retained SQLite admission, bounded seek discovery and explicit corruption diagnostics. A standalone private-storage process serves only health and proof routes without connecting to chains or starting gateway background services. Consumers authenticate finality and current author policy independently.",
+      "desc": "Isolated immutable byte-addressed checkpoint members, recovery plans and unverified Midnight set hints, with network-scoped pipeline writers, atomic retained SQLite admission, bounded seek discovery and explicit corruption diagnostics. A standalone private-storage process serves only health and proof routes without connecting to chains or starting gateway background services. Private online SQLite backups preserve committed WAL data and indexed objects, verify content and retain 48 immutable snapshots outside live storage; read-RPC quota databases are refused. Consumers authenticate finality and current author policy independently.",
       "kind": "api",
       "paths": [
         "src/midnight-proof-store.ts",
         "src/proof-store.ts",
         "src/routes/midnight-proofs.ts",
+        "scripts/midnight_proof_backup.py",
         "deploy/midnight-proof-store",
         "ops/midnight-proofs.md"
       ],

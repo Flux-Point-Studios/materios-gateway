@@ -93,3 +93,32 @@ processes and HTTP.
 The optional [bounded read RPC](midnight-read-rpc.md) uses a separate Compose
 overlay and quota volume. It stays disabled without its new explicit variables;
 the base proof-store deployment retains its existing behavior.
+
+## Scheduled online snapshots
+
+`scripts/midnight_proof_backup.py` opens an existing private proof database read-only,
+copies a consistent SQLite snapshot including committed WAL records, checks schema,
+integrity, object hashes and all three tables against the captured source snapshot,
+then fsyncs and publishes a new immutable backup. It retains the current backup and
+the newest 47 older snapshots. It does not initialize missing source files, accept a
+read-RPC quota database, modify live data or delete unrelated files. A process lock
+prevents overlapping backups of one destination. SQLite work has a thirty-second
+deadline; the supplied unit also bounds its whole process to two minutes.
+
+Install the reviewed script at
+`~/.local/lib/orynq-midnight-proof-backup/midnight_proof_backup.py`, and the supplied
+`orynq-midnight-proof-backup@.service` and timer as user units. Each host uses its own
+instance (`a` or `b`) and private
+`~/.config/orynq-midnight-proof-backup/INSTANCE.env` containing only
+`PROOF_BACKUP_SOURCE` (absolute `objects.sqlite` path) and
+`PROOF_BACKUP_DESTINATION` (existing owner-only snapshot directory). Place that
+directory outside the live proof volume and runner restore set. Enable the timer
+after a successful manual service run and verify its next trigger. This does not
+change the proof-store process or enable the optional RPC overlay.
+
+After the first snapshot and periodically thereafter, restore a selected snapshot
+to a disposable private directory and verify the actual proof routes against its
+retained object hashes. Two hosts provide separate storage; periodic snapshots on
+each host also protect against accidental local deletion. They do not provide a
+third failure domain. Read-RPC quota and high-water state remain separate and must
+never be reset or restored as part of proof-store recovery.

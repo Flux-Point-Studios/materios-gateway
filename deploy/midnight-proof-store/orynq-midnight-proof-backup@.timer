@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up the Midnight proof store every thirty minutes (%i)
+
+[Timer]
+OnBootSec=120
+OnUnitInactiveSec=30min
+AccuracySec=30
+Unit=orynq-midnight-proof-backup@%i.service
+
+[Install]
+WantedBy=timers.target
