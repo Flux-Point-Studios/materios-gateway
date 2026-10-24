@@ -350,6 +350,8 @@ kubectl rollout restart deployment materios-gateway -n materios
 
 ## Operational Notes
 
+- **Midnight proof candidates** — [retained objects, discovery and writer scope](ops/midnight-proofs.md).
+
 - **Single replica only** -- SQLite does not support concurrent writes from multiple pods.
 - **NodePort 30300** -- accessible within the cluster Tailscale network.
 - **Heartbeat auth** -- heartbeats use dual-mode auth (signature-based with registry lookup; API key optional). Rate limited to 6 req/min per IP at the Nginx layer.

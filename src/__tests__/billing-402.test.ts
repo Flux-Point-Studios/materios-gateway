@@ -52,6 +52,12 @@ beforeEach(() => {
 import { billing402Middleware, __test__ } from "../middleware/billing-402.js";
 import type { BillingMiddlewareDeps } from "../middleware/billing-402.js";
 
+test("retained Midnight proof publication is explicitly unmetered pipeline traffic", () => {
+  for (const network of ["mainnet", "preprod"]) for (const kind of ["members", "plans", "sets"]) {
+    expect(__test__.classifyEndpoint({ method: "PUT", path: `/midnight/${network}/objects/${kind}/${"aa".repeat(32)}` } as express.Request)).toBe("admin");
+  }
+});
+
 type Phase = "off" | "measurement" | "live";
 
 async function withPhase<T>(

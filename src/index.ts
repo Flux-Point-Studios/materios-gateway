@@ -10,6 +10,7 @@ import { blobsRouter } from "./routes/blobs.js";
 import { locatorsRouter } from "./routes/locators.js";
 import { chunksRouter } from "./routes/chunks.js";
 import { batchesRouter } from "./routes/batches.js";
+import { midnightProofsRouter } from "./routes/midnight-proofs.js";
 import { statusRouter } from "./routes/status.js";
 import { heartbeatsRouter } from "./routes/heartbeats.js";
 import { operatorsRouter, initOperatorsDb, getOperatorsDb } from "./routes/operators.js";
@@ -122,6 +123,7 @@ app.use(blobsRouter);       // Manifest/chunk: sig or API key. Status: public.
 app.use(locatorsRouter);    // Public (read-only resolution)
 app.use(chunksRouter);      // Public (content-addressed, SHA-256 verified)
 app.use(batchesRouter);     // Write: resolveAuth(). Read: public.
+app.use(midnightProofsRouter);
 app.use(heartbeatsRouter);  // Handles own dual-mode auth (Phase 2)
 app.use(operatorsRouter);   // Invite-only operator registration
 app.use(chainInfoRouter);   // Public: /chain-info — used by flux1 explorer + cert-daemon auto-discovery
