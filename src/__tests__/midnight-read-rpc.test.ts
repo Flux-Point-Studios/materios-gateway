@@ -141,6 +141,20 @@ it("keeps set-end proofs for days so repeated verifier walks stop costing quota"
   const setEnds=ends.filter(n=>kind(n)>1).length;expect(setEnds).toBe(16);const proofs=upstreamMethods(f).filter(method=>method==="grandpa_proveFinality").length;
   expect(proofs).toBe(32+2*(32-setEnds));expect(upstreamMethods(f).filter(method=>method==="chain_getHeader")).toHaveLength(32);
 });
+const scheduled="01"+"04"+"11".repeat(32)+"0100000000000000"+"00000000";
+it.each([
+ ["a forced change","0x0446524e4b"+"c8"+"02"+"07000000"+scheduled.slice(2)],
+ ["a forced change whose median bytes read as a seat count","0x0446524e4b"+"b8"+"02"+scheduled.slice(2)],
+ ["a scheduled change with a trailing byte","0x0446524e4b"+"bc"+scheduled+"00"],
+ ["a scheduled change under an overstated outer length","0x0446524e4b"+"bc"+scheduled],
+])("keeps a proof only briefly when its block's header carries %s",async(_label,log)=>{
+  let now=Date.now();vi.spyOn(Date,"now").mockImplementation(()=>now);
+  const reply=(entry:any)=>({jsonrpc:"2.0",id:entry.id,result:entry.method==="grandpa_proveFinality"?blockHashAt(7)+"00":headerWith([log])});
+  const f=await fixture(body=>Array.isArray(body)?body.map(reply):reply(body)),proof=request("grandpa_proveFinality",[7]);
+  for(const body of [proof,request("chain_getHeader",[blockHashAt(7)]),proof])expect((await f.call(body)).status).toBe(200);
+  now+=60_001;expect((await f.call(proof)).status).toBe(200);
+  expect(upstreamMethods(f)).toEqual(["grandpa_proveFinality","chain_getHeader","grandpa_proveFinality"]);
+});
 it("keeps a block without justifications only briefly",async()=>{
   let now=Date.now(),turn=0;vi.spyOn(Date,"now").mockImplementation(()=>now);
   const f=await fixture(entry=>({jsonrpc:"2.0",id:(entry as any).id,result:{block:{},justifications:++turn===1?null:[["FRNK","0x01"]]}})),body=request("chain_getBlock",[hash]);
