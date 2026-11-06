@@ -118,15 +118,20 @@ export function openMidnightReadRpc(options:{projectIdFile?:string|undefined;one
   const pending=new Map<string,Promise<Map<string,Answer>>>();let active=0,responseBytes=0,tail=Promise.resolve();
   const rate=new Map<string,{at:number;count:number}>();
   const key=(call:Call)=>JSON.stringify([call.method,call.params]);
-  const cached=(id:string):Answer|undefined=>{
-    const row=db.prepare("select value from read_cache where key=? and expires>?").get(id,Date.now()) as {value:string}|undefined;
+  // Height-keyed answers can change: a block hash until its height is final, and a
+  // proveFinality proof for the current authority set as newer justifications land.
+  const lifetime=(call:Call)=>call.method==="chain_getFinalizedHead"?3000:call.method==="chain_getBlockHash"||call.method==="grandpa_proveFinality"?0:7*86_400_000;
+  const cached=(call:Call):Answer|undefined=>{
+    if(!lifetime(call))return undefined;
+    const row=db.prepare("select value from read_cache where key=? and expires>?").get(key(call),Date.now()) as {value:string}|undefined;
     if(!row)return undefined;return {result:JSON.parse(row.value)};
   };
   const put=(call:Call,value:unknown)=>{
-    if(value===null)return;
+    const ttl=lifetime(call);
+    if(value===null||!ttl)return;
     const encoded=JSON.stringify(value),bytes=Buffer.byteLength(encoded);
     if(bytes>256*1024)return;
-    const now=Date.now(),ttl=call.method==="chain_getFinalizedHead"?3000:call.method==="chain_getBlockHash"?5000:7*86_400_000;
+    const now=Date.now();
     db.transaction(()=>{
       db.prepare("insert or replace into read_cache values (?,?,?,?,?)").run(key(call),encoded,bytes,now+ttl,now);
       db.prepare("delete from read_cache where expires<=?").run(now);
@@ -137,7 +142,7 @@ export function openMidnightReadRpc(options:{projectIdFile?:string|undefined;one
   };
   async function read(calls:Call[]):Promise<Map<string,Answer>> {
     const answers=new Map<string,Answer>(),missing=new Map<string,Call>();
-    for(const call of calls){const id=key(call),value=cached(id);if(value)answers.set(id,value);else missing.set(id,call);}
+    for(const call of calls){const id=key(call),value=cached(call);if(value)answers.set(id,value);else missing.set(id,call);}
     if(!missing.size)return answers;
     const group=[...missing.keys()].sort().join("|");let job=pending.get(group);
     if(!job){

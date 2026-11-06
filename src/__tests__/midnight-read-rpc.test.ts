@@ -113,6 +113,32 @@ it("uses a fixed credential header and rewrites cached response IDs",async()=>{
   const [url,options]=f.upstream.mock.calls[0]!;expect(url).toBe("https://rpc.midnight-mainnet.blockfrost.io");
   expect((options!.headers as Record<string,string>).project_id).toBe(token);expect(options!.redirect).toBe("error");
 });
+it.each([
+ ["a current-set finality proof whose target advances",request("grandpa_proveFinality",[3342386])],
+ ["a block hash at a height that may still reorg",request("chain_getBlockHash",[3342687])],
+])("never serves %s from cache",async(_label,body)=>{
+  let turn=0;const f=await fixture(entry=>({jsonrpc:"2.0",id:(entry as any).id,result:`0x${String(++turn).padStart(2,"0")}`}));
+  expect((await (await f.call(body)).json()).result).toBe("0x01");
+  expect((await (await f.call(body)).json()).result).toBe("0x02");expect(f.upstream).toHaveBeenCalledTimes(2);
+});
+it("ignores finality proofs and height lookups left in the cache by an earlier gateway",async()=>{
+  const f=await fixture(body=>(body as any[]).map(entry=>({jsonrpc:"2.0",id:entry.id,result:"0xfresh"})));f.service.close();closers.pop();
+  const db=new Database(join(f.root,"read-rpc.sqlite")),now=Date.now(),insert=db.prepare("insert into read_cache values (?,?,?,?,?)");
+  for(const [method,params] of [["grandpa_proveFinality",[3342386]],["chain_getBlockHash",[3342687]]] as const)insert.run(JSON.stringify([method,params]),JSON.stringify("0xstale"),8,now+7*86_400_000,now);
+  db.close();
+  const service=openMidnightReadRpc({projectIdFile:join(f.root,"project-id"),stateDir:f.root,fetcher:f.upstream as typeof fetch});if(!service)throw new Error("Missing reopened proxy");closers.push(service.close);
+  const app=express();app.use(service.router);const server=app.listen(0,"127.0.0.1");servers.push(server);await new Promise<void>(resolve=>server.once("listening",resolve));
+  const port=(server.address() as {port:number}).port;
+  const reply=await clientFetch(`http://127.0.0.1:${port}/midnight/mainnet/rpc`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify([request("grandpa_proveFinality",[3342386],1),request("chain_getBlockHash",[3342687],2)])});
+  expect((await reply.json()).map((row:any)=>row.result)).toEqual(["0xfresh","0xfresh"]);expect(f.upstream).toHaveBeenCalledTimes(1);
+});
+it("expires the finalized head within seconds while hash-pinned reads stay cached",async()=>{
+  let now=Date.now();vi.spyOn(Date,"now").mockImplementation(()=>now);const f=await fixture();
+  for(const body of [request("chain_getFinalizedHead",[]),request("chain_getHeader",[hash])])expect((await f.call(body)).status).toBe(200);
+  now+=3001;
+  for(const body of [request("chain_getFinalizedHead",[]),request("chain_getHeader",[hash])])expect((await f.call(body)).status).toBe(200);
+  expect(f.upstream.mock.calls.map(([,options])=>JSON.parse(String(options?.body)).method)).toEqual(["chain_getFinalizedHead","chain_getHeader","chain_getFinalizedHead"]);
+});
 it("preserves numeric RPC error codes while suppressing all upstream text and echoed tokens",async()=>{
   const f=await fixture(body=>({jsonrpc:"2.0",id:(body as any).id,error:{code:-32602,message:token,data:{private:token}}}));
   const response=await f.call(request("midnight_contractState",[registry,hash]));expect(response.status).toBe(200);
