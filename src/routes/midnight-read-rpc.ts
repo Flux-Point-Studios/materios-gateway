@@ -25,6 +25,27 @@ function parse(value:unknown):Call {
     call.method==="state_getReadProof"?p.length===2&&hash(p[1])&&(JSON.stringify(p[0])===JSON.stringify(["0x3a636f646500"])||JSON.stringify(p[0])===JSON.stringify([EVENTS,TIMESTAMP])):false;
   if(!valid)throw new Error("RPC read is not allowed");return call;
 }
+const SHORT_TTL=60_000,LONG_TTL=7*86_400_000;
+const methodKey=(method:string)=>JSON.stringify([method]).slice(0,-1)+",";
+const PROOF_KEY=methodKey("grandpa_proveFinality");
+function compact(bytes:Buffer,at:number):{value:number;next:number}|null {
+  if(at>=bytes.length)return null;
+  const mode=bytes[at]!&3,width=[1,2,4][mode];
+  if(width===undefined||at+width>bytes.length)return null;
+  return {value:bytes.readUIntLE(at,width)>>>2,next:at+width};
+}
+// A GRANDPA set ends at the block whose header schedules the next set with no delay: a FRNK
+// consensus digest holding ScheduledChange(authorities, delay 0).
+function endsSet(header:unknown) {
+  const logs=(header as {digest?:{logs?:unknown}}|undefined)?.digest?.logs;
+  return Array.isArray(logs)&&logs.some(log=>{
+    if(typeof log!=="string"||!/^0x0446524e4b(?:[0-9a-f]{2})+$/.test(log))return false;
+    const bytes=Buffer.from(log.slice(2),"hex"),payload=compact(bytes,5);
+    if(!payload||payload.next+payload.value!==bytes.length||bytes[payload.next]!==1)return false;
+    const seats=compact(bytes,payload.next+1);
+    return !!seats&&seats.next+40*seats.value+4===bytes.length&&bytes.readUInt32LE(bytes.length-4)===0;
+  });
+}
 function privateFile(path:string) {
   const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
   try {
@@ -104,6 +125,7 @@ export function openMidnightReadRpc(options:{projectIdFile?:string|undefined;one
       if(saved?.provider!==provider||count.n!==1)throw new Error("Read RPC provider database differs");
     }else if(existing&&(oneam||bound))throw new Error("Read RPC provider database identity is missing");
     if(!reserve(0))throw new Error("Read RPC quota is unavailable");
+    db.prepare("delete from read_cache where instr(key,?)=1 or instr(key,?)=1 or (instr(key,?)=1 and json_type(value,'$.justifications')='null')").run(PROOF_KEY,methodKey("chain_getBlockHash"),methodKey("chain_getBlock"));
     if(!identity)db.transaction(()=>{
       db.exec("create table read_provider(id integer primary key check(id=1),provider text not null check(provider in ('blockfrost','oneam')))");
       db.prepare("insert into read_provider values (1,?)").run(provider);
@@ -117,18 +139,30 @@ export function openMidnightReadRpc(options:{projectIdFile?:string|undefined;one
   const fetcher=options.fetcher??(patchedFetch as unknown as typeof fetch),router=Router({strict:true,caseSensitive:true});
   const pending=new Map<string,Promise<Map<string,Answer>>>();let active=0,responseBytes=0,tail=Promise.resolve();
   const rate=new Map<string,{at:number;count:number}>();
-  const key=(call:Call)=>JSON.stringify([call.method,call.params]);
-  const cached=(id:string):Answer|undefined=>{
-    const row=db.prepare("select value from read_cache where key=? and expires>?").get(id,Date.now()) as {value:string}|undefined;
+  const key=(call:Pick<Call,"method"|"params">)=>JSON.stringify([call.method,call.params]);
+  const cached=(call:Pick<Call,"method"|"params">):{result:unknown}|undefined=>{
+    const row=db.prepare("select value from read_cache where key=? and expires>?").get(key(call),Date.now()) as {value:string}|undefined;
     if(!row)return undefined;return {result:JSON.parse(row.value)};
   };
+  // A block hash can change until its height is final, a current-set proveFinality proof as newer
+  // justifications land, and a block's justifications until it is justified. A proof naming a
+  // set-end block (the proof's first 32 bytes) is fixed.
+  const lifetime=(call:Call,value:unknown)=>{
+    if(call.method==="chain_getBlockHash")return 0;
+    if(call.method==="chain_getFinalizedHead")return 3000;
+    if(call.method==="chain_getBlock"&&(value as {justifications?:unknown}).justifications===null)return SHORT_TTL;
+    if(call.method==="grandpa_proveFinality"){const block=typeof value==="string"?value.slice(0,66):"";return hash(block)&&endsSet(cached({method:"chain_getHeader",params:[block]})?.result)?LONG_TTL:SHORT_TTL;}
+    return LONG_TTL;
+  };
   const put=(call:Call,value:unknown)=>{
-    if(value===null)return;
+    const ttl=value===null?0:lifetime(call,value);
+    if(!ttl)return;
     const encoded=JSON.stringify(value),bytes=Buffer.byteLength(encoded);
     if(bytes>256*1024)return;
-    const now=Date.now(),ttl=call.method==="chain_getFinalizedHead"?3000:call.method==="chain_getBlockHash"?5000:7*86_400_000;
+    const now=Date.now();
     db.transaction(()=>{
       db.prepare("insert or replace into read_cache values (?,?,?,?,?)").run(key(call),encoded,bytes,now+ttl,now);
+      if(call.method==="chain_getHeader"&&endsSet(value))db.prepare("update read_cache set expires=? where instr(key,?)=1 and instr(value,?)=1 and expires>?").run(now+LONG_TTL,PROOF_KEY,JSON.stringify(call.params[0]).slice(0,-1),now);
       db.prepare("delete from read_cache where expires<=?").run(now);
       while(Number((db.prepare("select coalesce(sum(bytes),0) total from read_cache").get() as {total:number}).total)>MAXIMUM_CACHE||Number((db.prepare("select count(*) total from read_cache").get() as {total:number}).total)>8192){
         db.exec("delete from read_cache where key in (select key from read_cache order by touched limit 32)");
@@ -137,7 +171,7 @@ export function openMidnightReadRpc(options:{projectIdFile?:string|undefined;one
   };
   async function read(calls:Call[]):Promise<Map<string,Answer>> {
     const answers=new Map<string,Answer>(),missing=new Map<string,Call>();
-    for(const call of calls){const id=key(call),value=cached(id);if(value)answers.set(id,value);else missing.set(id,call);}
+    for(const call of calls){const id=key(call),value=cached(call);if(value)answers.set(id,value);else missing.set(id,call);}
     if(!missing.size)return answers;
     const group=[...missing.keys()].sort().join("|");let job=pending.get(group);
     if(!job){
