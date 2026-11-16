@@ -1,5 +1,5 @@
 import { config } from "../../config.js";
-import { saveBatch, saveCardanoClaim } from "../../storage.js";
+import { saveBatch, saveCardanoClaim } from "./store.js";
 
 process.once("message", (job: { directory: string; record: { anchorId: string }; index: number }) => {
   config.storagePath = job.directory;

@@ -4,7 +4,7 @@
  * Directory layout under STORAGE_PATH:
  *   receipts/{contentHash}/
  *     manifest.json
- *     receipt.meta.json
+ *     receipt.meta.json    # timestamps; under the tenant-only profile also the owning tenant and the manifest digest
  *     chunks/0.bin, 1.bin, ...
  *     .complete            # sentinel file when all chunks uploaded
  *   batches/{anchorId}.json
@@ -14,7 +14,7 @@
  *     l1-verified/{cardanoTxHash}.json    -> chain facts of a verified, final anchor tx
  */
 
-import { mkdir, readFile, writeFile, access, readdir, rename } from "fs/promises";
+import { mkdir, readFile, writeFile, access, readdir, rename, link, open, rm } from "fs/promises";
 import { join } from "path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, renameSync, rmSync, statSync } from "node:fs";
 import Database from "better-sqlite3";
@@ -22,6 +22,8 @@ import { BatchCapacityError, BatchNotFoundError, BatchValidationError, BATCH_BYT
 import { createHash, randomBytes } from "crypto";
 import { config } from "./config.js";
 import { notifyDaemon } from "./notify.js";
+import { chargeTenantUpload, type QuotaCheckResult } from "./quota.js";
+import { assertWriteGrant, type Tenant, type WriteGrant } from "./tenant.js";
 
 /**
  * Strip "0x" prefix from a hex string if present.
@@ -93,34 +95,158 @@ function l1VerifiedFile(txHash: string): string {
 const LEAF_RE = /^[0-9a-f]{64}$/;
 const BATCH_FILE_RE = /^[0-9a-fA-F]{64}\.json$/;
 
+export interface ManifestWrite {
+  contentHash: string;
+  manifest: object;
+  /** The chunk bytes the manifest declares, charged with it to a tenant. */
+  declaredChunkBytes?: number;
+  uploaderAddress?: string;
+  /**
+   * The exact bytes whose SHA-256 is the content hash, kept as raw.bin so a
+   * verifier can re-hash them. The caller has checked the hash; the store
+   * does not.
+   */
+  rawBytes?: Uint8Array;
+}
+
+export type ManifestOutcome =
+  | { status: "created" | "unchanged" | "conflict" }
+  | { status: "over_quota"; quota: QuotaCheckResult };
+
+/** Thrown when a tenant writes into an upload another tenant owns. */
+export class NotManifestOwnerError extends Error {}
+
 /**
- * Save manifest.json for a content hash.
- * Also writes receipt-to-content index file and receipt.meta.json.
+ * The one way a manifest reaches the store, with its receipt index entry, its
+ * receipt.meta.json and, when given, its raw bytes.
+ *
+ * On the preprod profile the manifest is written over whatever is stored.
+ *
+ * For a tenant the upload is charged to the tenant's daily quota and stored
+ * once: "created" the first time, "unchanged" when the owning tenant stores
+ * the same manifest again, "conflict" for anything else, "over_quota" when
+ * the tenant's cap refuses it. Nothing is written or charged unless "created".
  */
-export async function saveManifest(contentHash: string, manifest: object): Promise<void> {
-  const dir = receiptsDir(contentHash);
+export async function storeManifest(grant: WriteGrant, write: ManifestWrite): Promise<ManifestOutcome> {
+  assertWriteGrant(grant);
+  if (grant.tenant) return storeTenantManifest(grant.tenant, write);
+
+  const dir = receiptsDir(write.contentHash);
   await ensureDir(dir);
-  await ensureDir(chunksDir(contentHash));
-  await writeFile(join(dir, "manifest.json"), JSON.stringify(manifest));
+  await ensureDir(chunksDir(write.contentHash));
+  await writeFile(join(dir, "manifest.json"), JSON.stringify(write.manifest));
+  await writeReceiptIndex(write.contentHash);
+  await writeFile(join(dir, "receipt.meta.json"), JSON.stringify(freshMeta(write.uploaderAddress), null, 2));
+  if (write.rawBytes) await writeFile(join(dir, "raw.bin"), Buffer.from(write.rawBytes));
+  return { status: "created" };
+}
 
-  // Compute receiptId and write index
-  const receiptId = computeReceiptId(contentHash);
-  const idxDir = indexDir();
-  await ensureDir(idxDir);
-  const receiptIdClean = stripHexPrefix(receiptId);
-  await writeFile(join(idxDir, `${receiptIdClean}.txt`), stripHexPrefix(contentHash));
-
-  // Write metadata for TTL cleanup
-  const metaPath = join(dir, "receipt.meta.json");
-  const meta = {
+function freshMeta(uploaderAddress = "") {
+  return {
     createdAt: new Date().toISOString(),
     certifiedAt: null,
     keyName: "",
-    uploaderAddress: "",
+    uploaderAddress,
     lastReceiptCheck: null,
     receiptOnChain: null,
   };
-  await writeFile(metaPath, JSON.stringify(meta, null, 2));
+}
+
+async function writeReceiptIndex(contentHash: string): Promise<void> {
+  const idxDir = indexDir();
+  await ensureDir(idxDir);
+  await writeFile(join(idxDir, `${stripHexPrefix(computeReceiptId(contentHash))}.txt`), stripHexPrefix(contentHash));
+}
+
+/**
+ * Create `path` holding `data` unless something is already there; false when
+ * something is. The link is the exclusive step, so the file appears complete
+ * or not at all, whatever process got there first.
+ */
+async function createExclusive(path: string, data: string | Uint8Array): Promise<boolean> {
+  const temporary = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    const handle = await open(temporary, "wx");
+    try {
+      await handle.writeFile(data);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await link(temporary, path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw err;
+    }
+    return true;
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+/** Replace `path` with `data` in one step, so a reader never sees it half written. */
+async function replaceFile(path: string, data: string): Promise<void> {
+  const temporary = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  await writeFile(temporary, data);
+  await rename(temporary, path);
+}
+
+interface ManifestClaim {
+  owner?: unknown;
+  manifestSha256?: unknown;
+}
+
+/** The claim on a content hash: who stores it and which manifest. Null when unclaimed. */
+async function readClaim(contentHash: string): Promise<ManifestClaim | null> {
+  try {
+    return JSON.parse(await readFile(join(receiptsDir(contentHash), "receipt.meta.json"), "utf-8")) as ManifestClaim;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/**
+ * receipt.meta.json is created first, exclusively, and names the tenant and
+ * the manifest's digest: that is the claim, and the charge is kept only by the
+ * post whose claim it is. manifest.json is created second, exclusively. A stop
+ * between the two leaves a claim its owner finishes by posting the same
+ * manifest again, with no second charge.
+ */
+async function storeTenantManifest(tenant: Tenant, write: ManifestWrite): Promise<ManifestOutcome> {
+  const { contentHash } = write;
+  if (/[A-F]/.test(contentHash)) throw new Error("contentHash must be lowercase hex");
+  const dir = receiptsDir(contentHash);
+  const manifestPath = join(dir, "manifest.json");
+  const body = JSON.stringify(write.manifest);
+  const digest = createHash("sha256").update(body).digest("hex");
+
+  // The manifest is looked for before the claim: one stored by this path
+  // always has its claim by then.
+  const stored = existsSync(manifestPath);
+  let claim = await readClaim(contentHash);
+  if (claim === null) {
+    if (stored) return { status: "conflict" };
+    const bytes = Buffer.byteLength(body) + (write.declaredChunkBytes ?? 0) + (write.rawBytes?.length ?? 0);
+    const quota = chargeTenantUpload(tenant, bytes);
+    if (!quota.allowed) return { status: "over_quota", quota };
+    await ensureDir(chunksDir(contentHash));
+    const mine = { ...freshMeta(write.uploaderAddress), owner: tenant.id, manifestSha256: digest };
+    if (await createExclusive(join(dir, "receipt.meta.json"), JSON.stringify(mine, null, 2))) {
+      claim = mine;
+    } else {
+      quota.refund();
+      claim = (await readClaim(contentHash)) ?? {};
+    }
+  }
+  if (claim.owner !== tenant.id || claim.manifestSha256 !== digest) return { status: "conflict" };
+  if (stored) return { status: "unchanged" };
+
+  if (write.rawBytes) await writeFile(join(dir, "raw.bin"), Buffer.from(write.rawBytes));
+  if (!(await createExclusive(manifestPath, body))) return { status: "unchanged" };
+  await writeReceiptIndex(contentHash);
+  return { status: "created" };
 }
 
 /**
@@ -134,43 +260,6 @@ export async function getManifest(contentHash: string): Promise<object | null> {
   } catch {
     return null;
   }
-}
-
-/**
- * The account recorded as a stored manifest's uploader: null when no manifest
- * is stored, "" when it was not stored under an account signature.
- */
-export async function getManifestUploader(contentHash: string): Promise<string | null> {
-  const dir = receiptsDir(contentHash);
-  if (!existsSync(join(dir, "manifest.json"))) return null;
-  let raw: string;
-  try {
-    raw = await readFile(join(dir, "receipt.meta.json"), "utf-8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
-    throw err;
-  }
-  const uploader = (JSON.parse(raw) as { uploaderAddress?: unknown }).uploaderAddress;
-  return typeof uploader === "string" ? uploader : "";
-}
-
-/**
- * Persist the canonical pre-image bytes (the exact bytes whose SHA-256 is the
- * content_hash) at `receipts/{contentHash}/raw.bin`. Used by self-rooted
- * single-blob schemas (e.g. ai_capability_observation_v1) so the daemon-side
- * verifier can re-fetch and re-hash without re-running schema-specific
- * canonicalization.
- *
- * Callers MUST hash the bytes themselves and pass a matching contentHash;
- * the storage layer does not re-verify.
- */
-export async function saveRawBytes(
-  contentHash: string,
-  bytes: Uint8Array,
-): Promise<void> {
-  const dir = receiptsDir(contentHash);
-  await ensureDir(dir);
-  await writeFile(join(dir, "raw.bin"), Buffer.from(bytes));
 }
 
 /**
@@ -192,7 +281,11 @@ export async function getRawBytes(contentHash: string): Promise<Buffer | null> {
  * Save a chunk binary. After saving, checks completeness and writes .complete sentinel.
  * Notifies daemon when upload is complete.
  */
-export async function saveChunk(contentHash: string, chunkIndex: number, data: Buffer): Promise<void> {
+export async function saveChunk(grant: WriteGrant, contentHash: string, chunkIndex: number, data: Buffer): Promise<void> {
+  assertWriteGrant(grant);
+  if (grant.tenant && (await readClaim(contentHash))?.owner !== grant.tenant.id) {
+    throw new NotManifestOwnerError("Only the tenant that stored a manifest may upload its chunks");
+  }
   const dir = chunksDir(contentHash);
   await ensureDir(dir);
   await writeFile(join(dir, `${chunkIndex}.bin`), data);
@@ -347,7 +440,8 @@ function indexBatchLeaves(db: Database.Database, anchorId: string, metadata: obj
 
 // The database write lock serializes JSON merges across gateway processes.
 // A crash after rename but before index commit is repaired by startup backfill.
-export async function saveBatch(anchorId: string, metadata: object): Promise<void> {
+export async function saveBatch(grant: WriteGrant, anchorId: string, metadata: object): Promise<void> {
+  assertWriteGrant(grant);
   const key = hexId(anchorId, "anchorId").toLowerCase();
   if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) throw new BatchValidationError("Batch metadata must be an object");
   const db = batchDatabase()!;
@@ -420,7 +514,8 @@ export async function indexExistingBatches(): Promise<{ batches: number; leaves:
   return { batches, leaves, skipped };
 }
 
-export async function saveCardanoClaim(anchorId: string, value: unknown): Promise<void> {
+export async function saveCardanoClaim(grant: WriteGrant, anchorId: string, value: unknown): Promise<void> {
+  assertWriteGrant(grant);
   const key = hexId(anchorId, "anchorId").toLowerCase();
   const claim = parseCardanoClaim(value);
   const db = batchDatabase()!;
@@ -587,22 +682,20 @@ export async function getL1Verified(txHash: string): Promise<object | null> {
 export async function saveL1Verified(txHash: string, record: object): Promise<void> {
   const file = l1VerifiedFile(txHash);
   await ensureDir(join(file, ".."));
-  // Concurrent saves of one tx each write their own temp file.
-  const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-  await writeFile(tmp, JSON.stringify(record, null, 2));
-  await rename(tmp, file);
+  await replaceFile(file, JSON.stringify(record, null, 2));
 }
 
 /**
  * Mark a receipt as certified — sets certifiedAt in receipt.meta.json.
  */
-export async function markCertified(contentHash: string): Promise<boolean> {
+export async function markCertified(grant: WriteGrant, contentHash: string): Promise<boolean> {
+  assertWriteGrant(grant);
   const metaPath = join(receiptsDir(contentHash), "receipt.meta.json");
   try {
     const raw = await readFile(metaPath, "utf-8");
     const meta = JSON.parse(raw);
     meta.certifiedAt = new Date().toISOString();
-    await writeFile(metaPath, JSON.stringify(meta, null, 2));
+    await replaceFile(metaPath, JSON.stringify(meta, null, 2));
     return true;
   } catch {
     return false;
@@ -627,7 +720,7 @@ export async function updateReceiptMeta(
     const raw = await readFile(metaPath, "utf-8");
     const meta = JSON.parse(raw);
     Object.assign(meta, updates);
-    await writeFile(metaPath, JSON.stringify(meta, null, 2));
+    await replaceFile(metaPath, JSON.stringify(meta, null, 2));
     return true;
   } catch {
     return false;

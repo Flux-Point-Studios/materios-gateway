@@ -17,7 +17,7 @@ import { createHash } from "node:crypto";
 
 import { config } from "../../config.js";
 import { observationsRouter } from "../observations.js";
-import { saveManifest, saveRawBytes } from "../../storage.js";
+import { saveManifest, saveRawBytes } from "../../__tests__/fixtures/store.js";
 
 interface Ctx {
   app: express.Express;

@@ -219,7 +219,7 @@ describe("chunkless manifest bytes", () => {
   test("leave a chunked upload's slot for the same hash alone", async () => {
     const pair = new Keyring({ type: "sr25519" }).addFromUri("//SlotRacer");
     const contentHash = contentHashFor(0);
-    expect(startAccountUpload(pair.address, contentHash, 0).allowed).toBe(true);
+    expect(startAccountUpload(pair.address, contentHash).allowed).toBe(true);
 
     expect(await postManifest(contentHash, sigHeaders("//SlotRacer", contentHash))).toBe(201);
 
@@ -286,7 +286,7 @@ describe("finalize over the daily receipt cap", () => {
       .run(address, day, config.sigOnlyMaxReceiptsPerDay);
     const contentHash = contentHashFor(0);
 
-    expect(startAccountUpload(address, contentHash, 0).allowed).toBe(true);
+    expect(startAccountUpload(address, contentHash).allowed).toBe(true);
     expect(finalizeAccountUpload(address, contentHash).allowed).toBe(false);
 
     const row = quotaDb

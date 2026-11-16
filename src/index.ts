@@ -255,7 +255,8 @@ async function start(): Promise<void> {
     console.log(`[blob-gateway] Service started on port ${config.port}`);
     console.log(`[blob-gateway] Storage path: ${config.storagePath}`);
     console.log(
-      `[blob-gateway] Network: ${config.network} (faucet ${config.faucetEnabled ? "on" : "off"}, upload gate ${config.uploadGate})`,
+      `[blob-gateway] Network: ${config.network} (faucet ${config.faucetEnabled ? "on" : "off"}, writes ` +
+        (config.tenantOnly ? `from tenants only, ${config.tenantAddresses.length} account(s) on TENANT_ADDRESSES)` : "balance-gated)"),
     );
     console.log(`[blob-gateway] Health: http://localhost:${config.port}/health`);
     console.log(`[blob-gateway] Status: http://localhost:${config.port}/status`);

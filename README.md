@@ -126,6 +126,9 @@ your own fetch call that sends `Authorization: Bearer ...`.
 3. Restart the client, confirm it works.
 4. Revoke the old token: `curl -X DELETE .../auth/token/<old-hash> -H "x-admin-token: ..."`.
 
+On the mainnet profile a tier only says how the caller was recognised. Who may
+write is decided separately: see [Network profiles](#network-profiles).
+
 ### An address is not an API key
 
 An account address is public, so `x-api-key: <address>` authenticates nothing.
@@ -252,21 +255,126 @@ Expected response:
 
 The submitter is a separate service (not provided by this repo today) that holds the operator signing keys and turns the notification into an on-chain receipt. Signing infra never touches the gateway process. When the URL is unset (default), the hook is a no-op and non-sponsored sig-only flows with their own signers are unaffected.
 
+## Network profiles
+
+`MATERIOS_NETWORK` selects one of two profiles. `preprod` is the default and
+behaves as described in the rest of this document.
+
+### Mainnet is tenant-only
+
+Materios mainnet has no transferable MATRA, so there is no faucet and no
+balance to gate uploads on. The mainnet profile is closed by default: **only a
+tenant writes, and with no tenant configured nothing can be written.**
+
+A tenant is one of:
+
+- **An API key with an enabled row in `api_keys`.** Every such key is a
+  tenant, including a key issued through operator registration and the legacy
+  `BLOB_GATEWAY_API_KEY`.
+- **An account listed in `TENANT_ADDRESSES`.** It authenticates with an upload
+  signature, or with a Bearer token issued for that account. All spellings of
+  an address are one account.
+
+Being a registered validator does not make an account a tenant. A registered
+validator's signed upload is accepted only when its account is also in
+`TENANT_ADDRESSES`. A signature from any other account gets
+`403 {"code":"tenant_required"}`. The request is refused every time it is
+sent, and its signature is not recorded as used.
+
+**Routes that need a tenant**
+
+| Route | Also required |
+|-------|---------------|
+| `POST /blobs/:contentHash/manifest` | |
+| `PUT /blobs/:contentHash/chunks/:i` | The tenant that stored the manifest. A chunk leg without credentials gets 401. |
+| `PATCH /blobs/:contentHash/certified` | |
+| `POST`, `PUT /batches/:anchorId`, `POST /batches/:anchorId/cardano-claims` | The batch writer lists, as on preprod. |
+| `POST /metering/submit` | The tenant is the request's API key or Bearer token when it carries one, otherwise the account of the worker key that signed the record. |
+| `POST /api/observations/submit` (and `/observations/submit`) | |
+
+The gateway's own writers are tenants like any other. The cert-daemon that
+marks blobs certified and the anchor worker that writes batch records each need
+an API key or an entry in `TENANT_ADDRESSES`.
+
+**What stays open: reads.** Blob status, locators, chunk downloads, batch
+records, trace lineage, observations and the explorer APIs are served as on
+preprod. `GET /blobs/:contentHash/manifest` still needs credentials: any valid
+API key or Bearer token, a tenant's signature, or a registered validator's
+signature (so a cert-daemon can read what it certifies without being able to
+write).
+
+**Adding a tenant**
+
+- *API key.* Add an entry to the keys file (`KEYS_FILE_PATH`) and restart:
+
+  ```json
+  { "keyHash": "<sha256 hex of the key>", "name": "tenant-name",
+    "maxReceiptsPerDay": 100, "maxBytesPerDay": 1073741824 }
+  ```
+
+  The key itself is never stored. `printf %s "$KEY" | sha256sum` gives the
+  hash. Setting `"enabled": false` removes the tenant.
+- *Account.* Add its address to `TENANT_ADDRESSES` and restart. To let the
+  account use a Bearer token instead of signing, mint one with
+  `POST /auth/token`.
+
+The startup line `Network: mainnet (faucet off, writes from tenants only, N
+account(s) on TENANT_ADDRESSES)` confirms the profile.
+
+**Quota.** Each tenant has a daily cap (UTC day) on uploads and on bytes: the
+caps of its `api_keys` row for an API key, `SIG_ONLY_MAX_RECEIPTS_PER_DAY` and
+`SIG_ONLY_MAX_BYTES_PER_DAY` for an account. An upload is charged once, when
+its manifest is accepted: one upload, plus the manifest's own bytes, plus the
+chunk sizes it declares (plus the raw record for an observation). So:
+
+- every chunk must declare a positive integer `size`, and a chunk larger than
+  its declared size is refused;
+- chunk legs are not charged again, whatever credentials they carry;
+- a metering record and an observation each count as one upload;
+- past the cap the answer is 429, and nothing is stored or charged;
+- a cap that is not a whole number refuses uploads instead of lifting the
+  limit, and a malformed `SIG_ONLY_MAX_*` value stops the gateway at startup.
+
+The preprod concurrency limits do not apply: the bytes are charged up front.
+
+**A manifest is stored once.** The content hash in the URL must be lowercase
+hex (with or without `0x`). The first tenant to store a manifest for a hash
+owns it:
+
+- the owner posting the same manifest again gets 200; nothing is written or
+  charged, so a retry after a partial upload finishes on the original charge;
+- any other manifest post for that hash gets 409, from the owner or from
+  another tenant, and charges nothing.
+
+This holds for every route that stores a manifest and for any number of
+gateway processes sharing one `STORAGE_PATH`: the metadata file that records
+the owner, then the manifest, are each created with an exclusive create, and
+the charge is kept only by the post whose create succeeded. If the gateway
+stops between the two, the owner finishes the upload by posting the same
+manifest again, with no second charge. A directory left without its metadata
+file accepts no writes and is removed by cleanup after `RECEIPT_GRACE_HOURS`.
+
+Give the mainnet profile a storage directory of its own. Data written under
+the preprod profile does not carry the ownership record the mainnet profile
+keeps, so under the mainnet profile it can be read but cannot be posted again
+or added to.
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `3000` | HTTP listen port |
 | `STORAGE_PATH` | `/data/blobs` | Blob storage directory |
-| `MATERIOS_NETWORK` | `preprod` | Network profile, `preprod` or `mainnet`; any other value stops the gateway at startup. `preprod` serves the MATRA faucet and admits a signed upload only from an account holding `MIN_UPLOAD_BALANCE` free MATRA. `mainnet` has no transferable MATRA: `/faucet/*` answers 410 and a signed upload from any account is admitted up to its `SIG_ONLY_MAX_RECEIPTS_PER_DAY` uploads and `SIG_ONLY_MAX_BYTES_PER_DAY` bytes per UTC day, each upload charged when its manifest is accepted, for the manifest's own bytes plus its declared chunk sizes. On mainnet every chunk must declare a positive integer `size`, a chunk larger than its declared size is refused, the content hash in the manifest URL must be lowercase hex, and a stored manifest is never replaced: the account recorded as its uploader may post the same manifest again (200, nothing written or charged), and any other manifest post for that hash gets 409. `GET /blobs/:h/manifest` and `PATCH /blobs/:h/certified` accept a signature only from a registered validator. |
+| `MATERIOS_NETWORK` | `preprod` | Network profile, `preprod` or `mainnet`; any other value stops the gateway at startup. `preprod` serves the MATRA faucet and admits a signed upload only from an account holding `MIN_UPLOAD_BALANCE` free MATRA. `mainnet` has no transferable MATRA: `/faucet/*` answers 410 and only tenants write. See [Network profiles](#network-profiles). |
+| `TENANT_ADDRESSES` | `""` (no account writes) | Mainnet profile only. Comma-separated account addresses that may write, in any spelling (SS58 of any prefix, or `0x` public key). A malformed entry stops the gateway at startup. API-key tenants need no entry. |
 | `MATERIOS_RPC_URL` | `ws://materios-rpc.materios.svc.cluster.local:9945` | Substrate RPC endpoint |
 | `CARDANO_ANCHOR_WALLETS` | `""` (no anchor verifies) | Comma-separated bech32 addresses of the wallets that fund the label-8746 anchor txs. Trace lineage marks a Cardano anchor verified only when the tx is in a block, its materios-anchor-v2 record matches the batch (root, leaves, blocks, chain) and every input spends from one of these. Production: `addr1v8jk9tqygmwd7xvf86pkz2033ahf0zrzdeesz0wy25my7xqgduf4l,addr1qx2h3pcsp6l9lxc0nujfdrczrmmstvju024xxvjcu2ywptslud3z94x5tgw8p0aefdjm8wxwrt0j49y384nuxgsjd9xq89stdk` (the anchor-worker-materios checkpoint wallet, then the second label-8746 worker). |
 | `MIN_UPLOAD_BALANCE` | `1000000` (1 MATRA at 6-dec) | Minimum balance for sig-only uploads (preprod profile) |
 | `BALANCE_CACHE_TTL_MS` | `300000` (5 min) | Balance check cache duration |
 | `UPLOAD_SIG_MAX_AGE_SEC` | `120` | Max signature age |
-| `SIG_ONLY_MAX_RECEIPTS_PER_DAY` | `10` | Sig-only daily receipt limit |
-| `SIG_ONLY_MAX_BYTES_PER_DAY` | `268435456` (256 MB) | Sig-only daily byte limit |
-| `SIG_ONLY_MAX_CONCURRENT_UPLOADS` | `3` | Sig-only concurrent upload limit |
+| `SIG_ONLY_MAX_RECEIPTS_PER_DAY` | `10` | Sig-only daily receipt limit. On mainnet: the daily upload cap of each account tenant; must be a whole number in plain digits or the gateway does not start. |
+| `SIG_ONLY_MAX_BYTES_PER_DAY` | `268435456` (256 MB) | Sig-only daily byte limit. On mainnet: the daily byte cap of each account tenant, under the same rule. |
+| `SIG_ONLY_MAX_CONCURRENT_UPLOADS` | `3` | Sig-only concurrent upload limit (preprod profile) |
 | `RECEIPT_GRACE_HOURS` | `24` | Hours before orphan blobs are eligible for cleanup |
 | `BLOB_TTL_AFTER_CERT_DAYS` | `30` | Days to retain blobs after certification |
 | `BLOB_TTL_MAX_DAYS` | `90` | Maximum blob retention |
@@ -289,8 +397,9 @@ src/
   api-tokens.ts       Issue/verify/revoke/list Bearer tokens (sha256 at rest)
   upload-auth.ts      verifyUploadSig() for sr25519 signatures
   rpc-client.ts       Lazy @polkadot/api singleton, checkFunded(), checkReceiptStatus()
+  tenant.ts           Write grants: who may write to the blob store on each network profile
   quota.ts            API key + account quota management (SQLite)
-  storage.ts          Blob storage (manifest + chunks on disk)
+  storage.ts          Blob storage (manifest + chunks on disk); every write takes a write grant
   cleanup.ts          TTL cleanup + deferred orphan cleanup
   config.ts           Environment variable parsing
   health.ts           Health check logic

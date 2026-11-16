@@ -73,6 +73,15 @@ async function startFakeSubmitter(): Promise<FakeSubmitter> {
   };
 }
 
+/** The hook from freshly loaded modules, called under a preprod write grant. */
+async function loadNotify() {
+  const { notifySponsoredReceiptSubmitter } = await import("../sponsored-receipts.js");
+  const { grantWrite } = await import("../tenant.js");
+  const grant = grantWrite({})!;
+  return (payload: Parameters<typeof notifySponsoredReceiptSubmitter>[1]) =>
+    notifySponsoredReceiptSubmitter(grant, payload);
+}
+
 describe("sponsored-receipts notify hook", () => {
   let fake: FakeSubmitter;
 
@@ -90,7 +99,7 @@ describe("sponsored-receipts notify hook", () => {
 
   test("notify_disabled_when_url_unset", async () => {
     // No URL env → the helper is a no-op and must not hit the network.
-    const { notifySponsoredReceiptSubmitter } = await import("../sponsored-receipts.js");
+    const notifySponsoredReceiptSubmitter = await loadNotify();
     await notifySponsoredReceiptSubmitter({
       contentHash: "a".repeat(64),
       operator: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
@@ -101,7 +110,7 @@ describe("sponsored-receipts notify hook", () => {
 
   test("notify_posts_payload_and_source_to_submitter", async () => {
     process.env.SPONSORED_RECEIPT_SUBMITTER_URL = `http://127.0.0.1:${fake.port}/submit`;
-    const { notifySponsoredReceiptSubmitter } = await import("../sponsored-receipts.js");
+    const notifySponsoredReceiptSubmitter = await loadNotify();
 
     await notifySponsoredReceiptSubmitter({
       contentHash: "a".repeat(64),
@@ -130,7 +139,7 @@ describe("sponsored-receipts notify hook", () => {
   test("notify_includes_authorization_bearer_when_token_set", async () => {
     process.env.SPONSORED_RECEIPT_SUBMITTER_URL = `http://127.0.0.1:${fake.port}/submit`;
     process.env.SPONSORED_RECEIPT_SUBMITTER_TOKEN = "test-shared-secret-abc123";
-    const { notifySponsoredReceiptSubmitter } = await import("../sponsored-receipts.js");
+    const notifySponsoredReceiptSubmitter = await loadNotify();
 
     await notifySponsoredReceiptSubmitter({
       contentHash: "a".repeat(64),
@@ -146,7 +155,7 @@ describe("sponsored-receipts notify hook", () => {
 
   test("notify_omits_authorization_header_when_token_empty", async () => {
     process.env.SPONSORED_RECEIPT_SUBMITTER_URL = `http://127.0.0.1:${fake.port}/submit`;
-    const { notifySponsoredReceiptSubmitter } = await import("../sponsored-receipts.js");
+    const notifySponsoredReceiptSubmitter = await loadNotify();
 
     await notifySponsoredReceiptSubmitter({
       contentHash: "a".repeat(64),
@@ -162,7 +171,7 @@ describe("sponsored-receipts notify hook", () => {
     process.env.SPONSORED_RECEIPT_SUBMITTER_URL = `http://127.0.0.1:${fake.port}/submit`;
     fake.setStatus(500, '{"error":"intentional"}');
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const { notifySponsoredReceiptSubmitter } = await import("../sponsored-receipts.js");
+    const notifySponsoredReceiptSubmitter = await loadNotify();
 
     // Must NOT throw.
     await expect(
@@ -186,7 +195,7 @@ describe("sponsored-receipts notify hook", () => {
     await fake.stop();
     process.env.SPONSORED_RECEIPT_SUBMITTER_URL = `http://127.0.0.1:${fake.port}/submit`;
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const { notifySponsoredReceiptSubmitter } = await import("../sponsored-receipts.js");
+    const notifySponsoredReceiptSubmitter = await loadNotify();
 
     await expect(
       notifySponsoredReceiptSubmitter({
@@ -209,7 +218,7 @@ describe("sponsored-receipts notify hook", () => {
     process.env.SPONSORED_RECEIPT_NOTIFY_TIMEOUT_MS = "200";
     fake.setDelay(2000); // submitter is intentionally slow
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const { notifySponsoredReceiptSubmitter } = await import("../sponsored-receipts.js");
+    const notifySponsoredReceiptSubmitter = await loadNotify();
 
     const t0 = Date.now();
     await notifySponsoredReceiptSubmitter({
@@ -227,9 +236,7 @@ describe("sponsored-receipts notify hook", () => {
 
   test("notify_propagates_schemaHash_when_set_omits_when_unset", async () => {
     process.env.SPONSORED_RECEIPT_SUBMITTER_URL = `http://127.0.0.1:${fake.port}/submit`;
-    const { notifySponsoredReceiptSubmitter } = await import(
-      "../sponsored-receipts.js"
-    );
+    const notifySponsoredReceiptSubmitter = await loadNotify();
 
     // schemaHash unset → field not present (legacy manifest flow shape).
     await notifySponsoredReceiptSubmitter({

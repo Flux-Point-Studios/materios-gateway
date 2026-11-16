@@ -31,6 +31,7 @@
  *               RECEIPT_GRACE_HOURS if no on-chain receipt appears.
  */
 import { config } from "./config.js";
+import { assertWriteGrant, type WriteGrant } from "./tenant.js";
 
 export interface SponsoredReceiptPayload {
   contentHash: string;
@@ -61,11 +62,18 @@ export interface SponsoredReceiptPayload {
 /**
  * Fire-and-forget notification. Resolves when the POST completes OR the
  * configured timeout elapses OR the submitter responds, whichever comes
- * first. Never throws — all errors become warn-log lines.
+ * first. The returned promise never rejects — all errors become warn-log
+ * lines. A call without a write grant throws before any promise exists.
  */
-export async function notifySponsoredReceiptSubmitter(
+export function notifySponsoredReceiptSubmitter(
+  grant: WriteGrant,
   payload: SponsoredReceiptPayload,
 ): Promise<void> {
+  assertWriteGrant(grant);
+  return postToSubmitter(payload);
+}
+
+async function postToSubmitter(payload: SponsoredReceiptPayload): Promise<void> {
   const url = config.sponsoredReceiptSubmitterUrl;
   if (!url) return;
 

@@ -12,7 +12,7 @@
 import { describe, test, expect, beforeEach, afterEach, beforeAll } from "vitest";
 import express from "express";
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { createServer, type IncomingMessage, type Server } from "node:http";
@@ -24,6 +24,7 @@ import { u8aToHex } from "@polkadot/util";
 
 import { config } from "../../config.js";
 import { observationsSubmitRouter } from "../observations_submit.js";
+import { initQuotaDb } from "../../quota.js";
 import {
   initApiTokensDb,
   setApiTokensDb,
@@ -145,6 +146,7 @@ async function fetchJson(
   path: string,
   body: unknown,
   bearer?: string,
+  extraHeaders: Record<string, string> = {},
 ): Promise<FetchResult> {
   return await new Promise((resolve, reject) => {
     const server = app.listen(0, () => {
@@ -157,6 +159,7 @@ async function fetchJson(
       const url = `http://127.0.0.1:${addr.port}${path}`;
       const headers: Record<string, string> = {
         "content-type": "application/json",
+        ...extraHeaders,
       };
       if (bearer) headers["authorization"] = `Bearer ${bearer}`;
       fetch(url, { method: "POST", headers, body: JSON.stringify(body) })
@@ -667,5 +670,115 @@ describe("POST submit — canonical path, legacy alias, raw persistence", () => 
     expect(result.locatorUrl).toContain("/raw");
     // The chain-of-custody assertion that everything in this PR exists for:
     expect(result.rawSha256).toBe(built.contentHash);
+  });
+});
+
+describe("POST /api/observations/submit — mainnet profile admits tenants only", () => {
+  let ctx: Ctx;
+  let quotaDb: Database.Database;
+  const saved = {
+    tenantOnly: config.tenantOnly,
+    tenantAddresses: config.tenantAddresses,
+    sigOnlyMaxReceiptsPerDay: config.sigOnlyMaxReceiptsPerDay,
+  };
+
+  beforeEach(async () => {
+    ctx = await setupApp();
+    initQuotaDb();
+    quotaDb = new Database(join(ctx.storage, "quota.db"));
+    config.tenantOnly = true;
+    config.tenantAddresses = [];
+  });
+  afterEach(async () => {
+    Object.assign(config, saved);
+    quotaDb.close();
+    await teardown(ctx);
+  });
+
+  const wireBody = (built: ReturnType<typeof buildSignedRecord>) => ({
+    schema_version: SCHEMA_VERSION,
+    schema_hash: SCHEMA_HASH_HEX,
+    record: built.record,
+    content_hash: built.contentHash,
+    observer_pubkey: built.observerPubkeyHex,
+    observer_signature: built.observerSignatureHex,
+  });
+  const submit = (built: ReturnType<typeof buildSignedRecord>, bearer?: string, headers: Record<string, string> = {}) =>
+    fetchJson(ctx.app, "/api/observations/submit", wireBody(built), bearer, headers);
+  const storedHashes = () => (existsSync(join(ctx.storage, "receipts")) ? readdirSync(join(ctx.storage, "receipts")) : []);
+  const fileOf = (contentHash: string, name: string) => join(ctx.storage, "receipts", contentHash, name);
+  const accountCharges = () => quotaDb.prepare("SELECT address, receipts, bytes FROM account_quotas_daily").all();
+  function addApiKey(key: string): string {
+    const keyHash = createHash("sha256").update(key).digest("hex");
+    quotaDb.prepare("INSERT INTO api_keys (key_hash, name, enabled) VALUES (?, ?, 1)").run(keyHash, `tenant-${key}`);
+    return keyHash;
+  }
+
+  test.each(["/api/observations/submit", "/observations/submit"])(
+    "%s: a Bearer token whose account is not a tenant is refused and nothing is kept",
+    async (path) => {
+      const res = await fetchJson(ctx.app, path, wireBody(buildSignedRecord()), ctx.bearerToken);
+
+      expect(res.status).toBe(403);
+      expect((res.body as { code: string }).code).toBe("tenant_required");
+      await new Promise((r) => setTimeout(r, 100));
+      expect(storedHashes()).toEqual([]);
+      expect(ctx.fake.captured).toHaveLength(0);
+      expect(accountCharges()).toEqual([]);
+    },
+  );
+
+  test("an allowlisted account's observation is stored once, owned by and charged to it", async () => {
+    config.tenantAddresses = [ctx.operatorSs58];
+    const built = buildSignedRecord();
+
+    const first = await submit(built, ctx.bearerToken);
+    expect(first.status).toBe(200);
+    expect(first.body).toMatchObject({ status: "accepted" });
+    const charged = accountCharges();
+    expect(charged).toEqual([{
+      address: ctx.operatorSs58,
+      receipts: 1,
+      bytes: statSync(fileOf(built.contentHash, "manifest.json")).size + statSync(fileOf(built.contentHash, "raw.bin")).size,
+    }]);
+    expect(JSON.parse(readFileSync(fileOf(built.contentHash, "receipt.meta.json"), "utf-8")).owner).toBe(ctx.operatorSs58);
+    expect(createHash("sha256").update(readFileSync(fileOf(built.contentHash, "raw.bin"))).digest("hex")).toBe(built.contentHash);
+
+    const writeTimes = () =>
+      ["manifest.json", "raw.bin", "receipt.meta.json"].map((name) => statSync(fileOf(built.contentHash, name), { bigint: true }).mtimeNs);
+    const written = writeTimes();
+    const replay = await submit(built, ctx.bearerToken);
+    expect(replay.status).toBe(200);
+    expect(replay.body).toMatchObject({ status: "replay" });
+    expect(accountCharges()).toEqual(charged);
+    expect(writeTimes()).toEqual(written);
+  });
+
+  test("an API key is a tenant; another tenant cannot take over what it stored", async () => {
+    const keyHash = addApiKey("observer-key");
+    config.tenantAddresses = [ctx.operatorSs58];
+    const built = buildSignedRecord();
+
+    expect((await submit(built, undefined, { "x-api-key": "observer-key" })).status).toBe(200);
+    const stored = readFileSync(fileOf(built.contentHash, "manifest.json"), "utf-8");
+
+    const taken = await submit(built, ctx.bearerToken);
+    expect(taken.status).toBe(409);
+    expect((taken.body as { code: string }).code).toBe("CONTENT_HASH_TAKEN");
+    expect(readFileSync(fileOf(built.contentHash, "manifest.json"), "utf-8")).toBe(stored);
+    expect(JSON.parse(readFileSync(fileOf(built.contentHash, "receipt.meta.json"), "utf-8")).owner).toBe(`key:${keyHash}`);
+    expect(accountCharges().filter((row) => (row as { receipts: number }).receipts > 0)).toEqual([]);
+  });
+
+  test("an observation past the tenant's daily cap gets 429 and is not stored", async () => {
+    config.tenantAddresses = [ctx.operatorSs58];
+    config.sigOnlyMaxReceiptsPerDay = 1;
+    expect((await submit(buildSignedRecord(), ctx.bearerToken)).status).toBe(200);
+
+    const over = await submit(buildSignedRecord({ context: "a second observation" }), ctx.bearerToken);
+
+    expect(over.status).toBe(429);
+    expect((over.body as { code: string }).code).toBe("QUOTA_EXCEEDED");
+    expect(storedHashes()).toHaveLength(1);
   });
 });

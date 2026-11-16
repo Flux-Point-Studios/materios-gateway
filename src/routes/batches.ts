@@ -8,6 +8,7 @@ import { Router, type Request, type Response } from "express";
 import { saveBatch, getBatch, getBatchesByLeaf, saveCardanoClaim, getCardanoClaims } from "../storage.js";
 import { BatchCapacityError, BatchNotFoundError, BatchValidationError } from "../batch-record.js";
 import { resolveAuth, type AuthResult } from "../auth.js";
+import { grantWrite, principalOf, refuseNonTenant, type WriteGrant } from "../tenant.js";
 import { config } from "../config.js";
 import { requireHexId } from "./id-param.js";
 
@@ -27,21 +28,28 @@ function mayWriteBatches(auth: AuthResult): boolean {
 batchesRouter.param("anchorId", requireHexId("anchorId"));
 batchesRouter.param("leaf", requireHexId("leaf"));
 
-async function authorizeBatchWrite(req: Request, res: Response): Promise<boolean> {
-  const auth = await resolveAuth(req, req.params.anchorId, { callerBoundsSigner: true });
+/** The grant for a batch write, or null once the request has been answered with a refusal. */
+async function authorizeBatchWrite(req: Request, res: Response): Promise<WriteGrant | null> {
+  const auth = await resolveAuth(req, req.params.anchorId);
   if (!auth.authenticated) {
-    res.status(401).json({ error: auth.error });
-    return false;
+    if (auth.tenantRequired) refuseNonTenant(res);
+    else res.status(401).json({ error: auth.error });
+    return null;
+  }
+  const grant = grantWrite(principalOf(auth));
+  if (!grant) {
+    refuseNonTenant(res);
+    return null;
   }
   if (SIGNATURE_TIERS.includes(auth.tier) && auth.sigVersion !== 2) {
     res.status(401).json({ error: "Batch writes signed by an address require x-upload-sig-v2, which covers the body" });
-    return false;
+    return null;
   }
   if (!mayWriteBatches(auth)) {
     res.status(403).json({ error: "Only the anchoring pipeline may write batch records" });
-    return false;
+    return null;
   }
-  return true;
+  return grant;
 }
 
 function batchError(res: Response, error: unknown, read = false): void {
@@ -59,13 +67,15 @@ function batchError(res: Response, error: unknown, read = false): void {
  * Idempotent upsert of batch metadata JSON.
  * Requires a v2 upload signature (bound to this request's body) from an
  * address in BATCH_WRITER_ADDRESSES, or an API key whose sha256 is in
- * BATCH_WRITER_KEY_HASHES.
+ * BATCH_WRITER_KEY_HASHES. Under the tenant-only profile the writer must be a
+ * tenant as well.
  */
 async function upsertBatch(req: Request, res: Response): Promise<void> {
   try {
     const { anchorId } = req.params;
 
-    if (!await authorizeBatchWrite(req, res)) return;
+    const grant = await authorizeBatchWrite(req, res);
+    if (!grant) return;
 
     const metadata = req.body;
 
@@ -74,7 +84,7 @@ async function upsertBatch(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    await saveBatch(anchorId, metadata);
+    await saveBatch(grant, anchorId, metadata);
     res.status(200).json({ status: "ok", anchorId });
   } catch (error) {
     batchError(res, error);
@@ -101,8 +111,9 @@ batchesRouter.get("/batches/by-leaf/:leaf", async (req: Request, res: Response) 
 
 batchesRouter.post("/batches/:anchorId/cardano-claims", async (req: Request, res: Response) => {
   try {
-    if (!await authorizeBatchWrite(req, res)) return;
-    await saveCardanoClaim(req.params.anchorId, req.body);
+    const grant = await authorizeBatchWrite(req, res);
+    if (!grant) return;
+    await saveCardanoClaim(grant, req.params.anchorId, req.body);
     res.json({ status: "ok", anchorId: req.params.anchorId });
   } catch (error) {
     batchError(res, error);

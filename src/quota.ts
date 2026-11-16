@@ -10,6 +10,7 @@ import { createHash, randomBytes } from "crypto";
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { config } from "./config.js";
+import type { Tenant } from "./tenant.js";
 
 let db: Database.Database;
 
@@ -760,12 +761,9 @@ function cleanStaleAccountInflight(address: string): void {
 }
 
 /**
- * Check and record upload start for sig-only uploader. Under the quota gate the
- * upload and its declared bytes (the manifest and every chunk) are charged
- * here, so a chunk leg needs no signature to stay inside the account's daily
- * byte quota.
+ * Check and record upload start for sig-only uploader.
  */
-export function startAccountUpload(address: string, contentHash: string, declaredBytes: number): QuotaCheckResult {
+export function startAccountUpload(address: string, contentHash: string): QuotaCheckResult {
   const txn = db.transaction(() => {
     cleanStaleAccountInflight(address);
 
@@ -782,11 +780,6 @@ export function startAccountUpload(address: string, contentHash: string, declare
       } as QuotaCheckResult;
     }
 
-    if (config.uploadGate === "quota") {
-      const admitted = chargeAccountDaily(address, declaredBytes, 1);
-      if (!admitted.allowed) return admitted;
-    }
-
     db.prepare(
       "INSERT OR REPLACE INTO account_uploads_inflight (upload_id, address, started_at, bytes, status) VALUES (?, ?, ?, 0, 'active')",
     ).run(contentHash, address, new Date().toISOString());
@@ -797,28 +790,17 @@ export function startAccountUpload(address: string, contentHash: string, declare
   return txn();
 }
 
-/**
- * Charges bytes and receipts to the account's daily quota, all or nothing.
- * Call inside a transaction.
- */
-function chargeAccountDaily(address: string, bytes: number, receipts: 0 | 1): QuotaCheckResult {
+/** Charges bytes to the account's daily byte quota. Call inside a transaction. */
+function chargeAccountDailyBytes(address: string, bytes: number): QuotaCheckResult {
   const d = today();
   db.prepare(
     "INSERT OR IGNORE INTO account_quotas_daily (address, day, receipts, bytes) VALUES (?, ?, 0, 0)",
   ).run(address, d);
 
   const daily = db.prepare(
-    "SELECT receipts, bytes FROM account_quotas_daily WHERE address = ? AND day = ?",
-  ).get(address, d) as { receipts: number; bytes: number };
+    "SELECT bytes FROM account_quotas_daily WHERE address = ? AND day = ?",
+  ).get(address, d) as { bytes: number };
 
-  if (receipts && daily.receipts >= config.sigOnlyMaxReceiptsPerDay) {
-    return {
-      allowed: false,
-      error: "Daily receipt quota exceeded",
-      limit: config.sigOnlyMaxReceiptsPerDay,
-      current: daily.receipts,
-    } as QuotaCheckResult;
-  }
   if (daily.bytes + bytes > config.sigOnlyMaxBytesPerDay) {
     return {
       allowed: false,
@@ -829,18 +811,17 @@ function chargeAccountDaily(address: string, bytes: number, receipts: 0 | 1): Qu
   }
 
   db.prepare(
-    "UPDATE account_quotas_daily SET receipts = receipts + ?, bytes = bytes + ? WHERE address = ? AND day = ?",
-  ).run(receipts, bytes, address, d);
+    "UPDATE account_quotas_daily SET bytes = bytes + ? WHERE address = ? AND day = ?",
+  ).run(bytes, address, d);
   return { allowed: true } as QuotaCheckResult;
 }
 
 /**
- * Record chunk bytes for sig-only uploader. Under the quota gate they were
- * charged when the upload was admitted.
+ * Record chunk bytes for sig-only uploader.
  */
 export function recordAccountChunkBytes(address: string, contentHash: string, chunkBytes: number): QuotaCheckResult {
   const txn = db.transaction(() => {
-    const charged = chargeAccountDaily(address, config.uploadGate === "quota" ? 0 : chunkBytes, 0);
+    const charged = chargeAccountDailyBytes(address, chunkBytes);
     if (!charged.allowed) return charged;
 
     db.prepare(
@@ -854,13 +835,85 @@ export function recordAccountChunkBytes(address: string, contentHash: string, ch
 }
 
 /**
- * Charge a sig-only account for a chunkless manifest's stored bytes, and under
- * the quota gate for the upload itself. It never touches the inflight table: a
- * chunked upload of the same hash keeps its slot.
+ * Charge a sig-only account for a chunkless manifest's stored bytes. It never
+ * touches the inflight table: a chunked upload of the same hash keeps its slot.
  */
 export function chargeAccountManifestBytes(address: string, bytes: number): QuotaCheckResult {
-  const receipts = config.uploadGate === "quota" ? 1 : 0;
-  return db.transaction(() => chargeAccountDaily(address, bytes, receipts))();
+  return db.transaction(() => chargeAccountDailyBytes(address, bytes))();
+}
+
+// ---------------------------------------------------------------------------
+// Tenant quotas (tenant-only profile): one daily cap on uploads and bytes per
+// tenant, charged when a manifest is accepted.
+// ---------------------------------------------------------------------------
+
+/** Where a tenant's daily usage is kept, and its caps. */
+function tenantLedger(tenant: Tenant) {
+  return tenant.keyInfo
+    ? {
+        table: "quota_daily",
+        column: "key_hash",
+        key: tenant.keyInfo.keyHash,
+        maxReceipts: tenant.keyInfo.maxReceiptsPerDay,
+        maxBytes: tenant.keyInfo.maxBytesPerDay,
+      }
+    : {
+        table: "account_quotas_daily",
+        column: "address",
+        key: tenant.id,
+        maxReceipts: config.sigOnlyMaxReceiptsPerDay,
+        maxBytes: config.sigOnlyMaxBytesPerDay,
+      };
+}
+
+const isCount = (n: unknown): n is number => Number.isSafeInteger(n) && (n as number) >= 0;
+
+export type TenantCharge =
+  | (QuotaCheckResult & { allowed: false })
+  | {
+      allowed: true;
+      /** Takes the charge back, for an upload another post claimed first. */
+      refund: () => void;
+    };
+
+/**
+ * Charge one upload of `bytes` to the tenant's day, all or nothing. A cap or
+ * a byte count that is not a whole number refuses the upload: compared as NaN
+ * it would never be reached.
+ */
+export function chargeTenantUpload(tenant: Tenant, bytes: number): TenantCharge {
+  const ledger = tenantLedger(tenant);
+  if (!isCount(ledger.maxReceipts) || !isCount(ledger.maxBytes) || !isCount(bytes)) {
+    return { allowed: false, error: "The tenant's daily quota is not a whole number; the upload is refused" };
+  }
+  const d = today();
+  const charge = db.transaction((): TenantCharge => {
+    db.prepare(
+      `INSERT OR IGNORE INTO ${ledger.table} (${ledger.column}, day, receipts, bytes) VALUES (?, ?, 0, 0)`,
+    ).run(ledger.key, d);
+    const daily = db.prepare(
+      `SELECT receipts, bytes FROM ${ledger.table} WHERE ${ledger.column} = ? AND day = ?`,
+    ).get(ledger.key, d) as { receipts: number; bytes: number };
+
+    if (daily.receipts >= ledger.maxReceipts) {
+      return { allowed: false, error: "Daily receipt quota exceeded", limit: ledger.maxReceipts, current: daily.receipts };
+    }
+    if (daily.bytes + bytes > ledger.maxBytes) {
+      return { allowed: false, error: "Daily byte quota exceeded", limit: ledger.maxBytes, current: daily.bytes };
+    }
+    db.prepare(
+      `UPDATE ${ledger.table} SET receipts = receipts + 1, bytes = bytes + ? WHERE ${ledger.column} = ? AND day = ?`,
+    ).run(bytes, ledger.key, d);
+    return {
+      allowed: true,
+      refund: () => {
+        db.prepare(
+          `UPDATE ${ledger.table} SET receipts = receipts - 1, bytes = bytes - ? WHERE ${ledger.column} = ? AND day = ?`,
+        ).run(bytes, ledger.key, d);
+      },
+    };
+  });
+  return charge.immediate();
 }
 
 // ---------------------------------------------------------------------------
@@ -985,18 +1038,37 @@ export function getDailyUsage(
 
 /**
  * Finalize upload for sig-only uploader: frees the concurrency slot, then
- * counts the receipt unless the daily cap is already reached. Under the quota
- * gate the receipt was counted when the upload was admitted.
+ * counts the receipt unless the daily cap is already reached.
  */
 export function finalizeAccountUpload(address: string, contentHash: string): QuotaCheckResult {
+  const d = today();
   const txn = db.transaction(() => {
+    db.prepare(
+      "INSERT OR IGNORE INTO account_quotas_daily (address, day, receipts, bytes) VALUES (?, ?, 0, 0)",
+    ).run(address, d);
+
     db.prepare(
       "UPDATE account_uploads_inflight SET status = 'complete' WHERE upload_id = ? AND address = ?",
     ).run(contentHash, address);
 
-    return config.uploadGate === "quota"
-      ? ({ allowed: true } as QuotaCheckResult)
-      : chargeAccountDaily(address, 0, 1);
+    const daily = db.prepare(
+      "SELECT receipts FROM account_quotas_daily WHERE address = ? AND day = ?",
+    ).get(address, d) as { receipts: number };
+
+    if (daily.receipts >= config.sigOnlyMaxReceiptsPerDay) {
+      return {
+        allowed: false,
+        error: "Daily receipt quota exceeded",
+        limit: config.sigOnlyMaxReceiptsPerDay,
+        current: daily.receipts,
+      } as QuotaCheckResult;
+    }
+
+    db.prepare(
+      "UPDATE account_quotas_daily SET receipts = receipts + 1 WHERE address = ? AND day = ?",
+    ).run(address, d);
+
+    return { allowed: true } as QuotaCheckResult;
   });
 
   return txn();

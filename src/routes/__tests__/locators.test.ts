@@ -17,7 +17,8 @@ import { join } from "path";
 
 import { config } from "../../config.js";
 import { locatorsRouter } from "../locators.js";
-import { saveManifest, saveRawBytes, computeReceiptId } from "../../storage.js";
+import { computeReceiptId } from "../../storage.js";
+import { saveManifest, saveRawBytes } from "../../__tests__/fixtures/store.js";
 
 interface Ctx {
   app: express.Express;

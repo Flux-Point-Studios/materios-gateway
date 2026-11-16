@@ -48,8 +48,10 @@ import {
   isReplayedContent,
 } from "../worker_bounds.js";
 import { notifySponsoredReceiptSubmitter } from "../sponsored-receipts.js";
-import { saveManifest, updateReceiptMeta } from "../storage.js";
-import { handleV2Submit } from "./metering_v2.js";
+import { storeManifest } from "../storage.js";
+import { grantSignedRecordWrite } from "../auth.js";
+import { refuseNonTenant } from "../tenant.js";
+import { handleV2Submit, refuseUnstoredRecord } from "./metering_v2.js";
 
 export const meteringRouter = Router();
 
@@ -157,6 +159,16 @@ meteringRouter.post(
 
       const { record, content_hash, schema_hash } = result;
 
+      // Derive the operator SS58 from the worker pubkey. The upstream
+      // sponsored-receipt-submitter uses this as the receipt's `operator`.
+      const operatorSs58 = workerPubkeyToSs58(record.worker_pubkey);
+
+      const grant = await grantSignedRecordWrite(req, operatorSs58);
+      if (!grant) {
+        refuseNonTenant(res);
+        return;
+      }
+
       // Replay short-circuit: if this is the EXACT same content the worker
       // last submitted, return 200 without re-firing the submitter. This is
       // a friendly retry path — the canonical anti-replay is on-chain
@@ -173,10 +185,6 @@ meteringRouter.post(
         return;
       }
 
-      // Derive the operator SS58 from the worker pubkey. The upstream
-      // sponsored-receipt-submitter uses this as the receipt's `operator`.
-      const operatorSs58 = workerPubkeyToSs58(record.worker_pubkey);
-
       // Persist a "manifest" so the existing cleanup/TTL/index machinery
       // sees this receipt the same way it sees blob receipts. The manifest
       // body is the validated record + a synthetic `chunks: []` (no blob
@@ -189,8 +197,8 @@ meteringRouter.post(
         chunks: [],
         rootHash: content_hash,
       };
-      await saveManifest(content_hash, manifest);
-      await updateReceiptMeta(content_hash, { uploaderAddress: operatorSs58 });
+      const stored = await storeManifest(grant, { contentHash: content_hash, manifest, uploaderAddress: operatorSs58 });
+      if (refuseUnstoredRecord(res, stored)) return;
 
       // Mark this submission in worker_state. Order matters: do this BEFORE
       // firing notify so a same-second retry hits the replay shortcut.
@@ -218,7 +226,7 @@ meteringRouter.post(
       // submitter can pass it through to `submit_receipt_v2(schema_hash=...)`.
       // `authTier: "bearer"` is a placeholder in the existing submitter
       // contract — the real attribution comes from `operator + schemaHash`.
-      void notifySponsoredReceiptSubmitter({
+      void notifySponsoredReceiptSubmitter(grant, {
         contentHash: content_hash,
         operator: operatorSs58,
         authTier: "bearer",

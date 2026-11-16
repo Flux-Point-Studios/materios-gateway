@@ -32,17 +32,19 @@
 import { describe, test, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import express from "express";
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { AddressInfo } from "node:net";
+import { createHash } from "node:crypto";
 import { Keyring } from "@polkadot/api";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { u8aToHex } from "@polkadot/util";
 
 import { config } from "../config.js";
 import { meteringRouter } from "../routes/metering.js";
+import { initQuotaDb } from "../quota.js";
 import {
   initWorkerBoundsDb,
   setWorkerBoundsDbForTests,
@@ -285,6 +287,7 @@ async function postJson(
   app: express.Express,
   path: string,
   body: unknown,
+  headers: Record<string, string> = {},
 ): Promise<{ status: number; body: unknown }> {
   return await new Promise((resolve, reject) => {
     const server = app.listen(0, () => {
@@ -297,7 +300,7 @@ async function postJson(
       const url = `http://127.0.0.1:${addr.port}${path}`;
       fetch(url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...headers },
         body: JSON.stringify(body),
       })
         .then(async (res) => {
@@ -317,6 +320,26 @@ async function postJson(
         });
     });
   });
+}
+
+/** A fully-signed valid v1 record. */
+function buildV1(uri: string, worker_id: string, period_end = Date.now() - 5_000) {
+  const pair = keyring.addFromUri(uri);
+  const v1Body = {
+    schema_version: SCHEMA_VERSION_V1,
+    worker_id,
+    tenant_id: "v1-tenant",
+    period_start: period_end - 3_600_000,
+    period_end,
+    cpu_seconds: 30,
+    ram_gb_hours: 0.5,
+    disk_gb_hours: 1,
+    net_bytes_in: 1024,
+    net_bytes_out: 512,
+    gpu_seconds: 0,
+    worker_pubkey: u8aToHex(pair.publicKey, undefined, false),
+  };
+  return { ...v1Body, worker_signature: u8aToHex(pair.sign(canonicalBodyV1(v1Body)), undefined, false) };
 }
 
 async function waitFor(
@@ -951,26 +974,7 @@ describe("POST /metering/submit v2 dispatcher — v1 backward compat", () => {
   });
 
   test("v1_record_with_v1_schema_version_uses_v1_path_unchanged", async () => {
-    const pair = keyring.addFromUri("//ComputeWorkerLegacy");
-    const now = Date.now();
-    const period_end = now - 5_000;
-    const period_start = period_end - 3_600_000;
-    const v1Body = {
-      schema_version: SCHEMA_VERSION_V1,
-      worker_id: "v1-worker-001",
-      tenant_id: "v1-tenant",
-      period_start,
-      period_end,
-      cpu_seconds: 30,
-      ram_gb_hours: 0.5,
-      disk_gb_hours: 1,
-      net_bytes_in: 1024,
-      net_bytes_out: 512,
-      gpu_seconds: 0,
-      worker_pubkey: u8aToHex(pair.publicKey, undefined, false),
-    };
-    const sig = u8aToHex(pair.sign(canonicalBodyV1(v1Body)), undefined, false);
-    const v1Record = { ...v1Body, worker_signature: sig };
+    const v1Record = buildV1("//ComputeWorkerLegacy", "v1-worker-001");
     const res = await postJson(ctx.app, "/metering/submit", v1Record);
     expect(res.status).toBe(200);
     const body = res.body as Record<string, unknown>;
@@ -1043,5 +1047,133 @@ describe("POST /metering/submit v2 — audit logs", () => {
     } finally {
       console.warn = orig;
     }
+  });
+});
+
+// ===========================================================================
+// Mainnet profile: only a tenant's record is stored
+// ===========================================================================
+
+describe("POST /metering/submit — mainnet profile admits tenants only", () => {
+  let ctx: Ctx;
+  let quotaDb: Database.Database;
+  const saved = {
+    tenantOnly: config.tenantOnly,
+    tenantAddresses: config.tenantAddresses,
+    sigOnlyMaxReceiptsPerDay: config.sigOnlyMaxReceiptsPerDay,
+  };
+
+  beforeEach(async () => {
+    ctx = await setupApp();
+    initQuotaDb();
+    quotaDb = new Database(join(ctx.storage, "quota.db"));
+    config.tenantOnly = true;
+    config.tenantAddresses = [];
+  });
+  afterEach(async () => {
+    Object.assign(config, saved);
+    quotaDb.close();
+    await teardown(ctx);
+  });
+
+  const addressOf = (uri: string) => keyring.addFromUri(uri).address;
+  const records: Array<[string, (uri: string, workerId: string, periodEnd?: number) => { worker_id: string }]> = [
+    ["v2", (uri, worker_id, period_end_ms) => buildV2({ workerUri: uri, worker_id, period_end_ms })],
+    ["v1", (uri, worker_id, periodEnd) => buildV1(uri, worker_id, periodEnd)],
+  ];
+  const storedHashes = () => (existsSync(join(ctx.storage, "receipts")) ? readdirSync(join(ctx.storage, "receipts")) : []);
+  const metaOf = (contentHash: string) =>
+    JSON.parse(readFileSync(join(ctx.storage, "receipts", contentHash, "receipt.meta.json"), "utf-8"));
+  const rows = (db: Database.Database, table: string) =>
+    (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+  function addApiKey(key: string): string {
+    const keyHash = createHash("sha256").update(key).digest("hex");
+    quotaDb.prepare("INSERT INTO api_keys (key_hash, name, enabled) VALUES (?, ?, 1)").run(keyHash, `tenant-${key}`);
+    return keyHash;
+  }
+
+  test.each(records)("a %s record signed by a worker that is not a tenant is refused and nothing is kept", async (_v, build) => {
+    config.tenantAddresses = [addressOf("//SomeOtherTenant")];
+
+    const res = await postJson(ctx.app, "/metering/submit", build("//OffListWorker", "wkr-off-list"));
+
+    expect(res.status).toBe(403);
+    expect((res.body as { code: string }).code).toBe("tenant_required");
+    await new Promise((r) => setTimeout(r, 100));
+    expect(storedHashes()).toEqual([]);
+    expect(ctx.fake.captured).toHaveLength(0);
+    expect(rows(ctx.workerBoundsDb, "metering_submissions")).toBe(0);
+    expect(rows(ctx.workerBoundsDb, "worker_state")).toBe(0);
+    expect(rows(quotaDb, "account_quotas_daily")).toBe(0);
+  });
+
+  test.each(records)("a %s record signed by an allowlisted worker is stored, owned by and charged to that account", async (_v, build) => {
+    const worker = addressOf("//TenantWorker");
+    config.tenantAddresses = [worker];
+
+    const res = await postJson(ctx.app, "/metering/submit", build("//TenantWorker", "wkr-tenant"));
+
+    expect(res.status).toBe(200);
+    const { content_hash } = res.body as { content_hash: string };
+    expect(metaOf(content_hash)).toMatchObject({ owner: worker, uploaderAddress: worker });
+    expect(quotaDb.prepare("SELECT address, receipts, bytes FROM account_quotas_daily").all()).toEqual([
+      { address: worker, receipts: 1, bytes: statSync(join(ctx.storage, "receipts", content_hash, "manifest.json")).size },
+    ]);
+    await waitFor(() => ctx.fake.captured.length === 1, { deadlineMs: 2000, what: "submitter notified" });
+  });
+
+  test("an API key stores a record for a worker that is not on the allowlist; an unknown key does not", async () => {
+    const keyHash = addApiKey("fleet-key");
+
+    const refused = await postJson(ctx.app, "/metering/submit", buildV2({ workerUri: "//FleetWorker", worker_id: "wkr-fleet" }), { "x-api-key": "not-a-key" });
+    expect(refused.status).toBe(403);
+    expect(storedHashes()).toEqual([]);
+
+    config.tenantAddresses = [addressOf("//ListedWorker")];
+    const masked = await postJson(ctx.app, "/metering/submit", buildV2({ workerUri: "//ListedWorker", worker_id: "wkr-listed" }), { "x-api-key": "not-a-key" });
+    expect(masked.status).toBe(403);
+    expect(storedHashes()).toEqual([]);
+
+    const res = await postJson(ctx.app, "/metering/submit", buildV2({ workerUri: "//FleetWorker", worker_id: "wkr-fleet" }), { "x-api-key": "fleet-key" });
+    expect(res.status).toBe(200);
+    expect(metaOf((res.body as { content_hash: string }).content_hash).owner).toBe(`key:${keyHash}`);
+    expect(quotaDb.prepare("SELECT key_hash, receipts FROM quota_daily").all()).toEqual([{ key_hash: keyHash, receipts: 1 }]);
+  });
+
+  test.each(records)("a %s record past the tenant's daily cap gets 429 and can be sent again once there is room", async (_v, build) => {
+    config.tenantAddresses = [addressOf("//CappedWorker")];
+    config.sigOnlyMaxReceiptsPerDay = 1;
+    const end = Date.now() - 5_000;
+    const first = build("//CappedWorker", "wkr-capped", end - 3_600_000);
+    const second = build("//CappedWorker", "wkr-capped", end);
+
+    expect((await postJson(ctx.app, "/metering/submit", first)).status).toBe(200);
+    const over = await postJson(ctx.app, "/metering/submit", second);
+    expect(over.status).toBe(429);
+    expect((over.body as { code: string }).code).toBe("QUOTA_EXCEEDED");
+    expect(storedHashes()).toHaveLength(1);
+    expect(rows(ctx.workerBoundsDb, "metering_submissions")).toBe(1);
+
+    config.sigOnlyMaxReceiptsPerDay = 2;
+    expect((await postJson(ctx.app, "/metering/submit", second)).status).toBe(200);
+    expect(storedHashes()).toHaveLength(2);
+  });
+
+  test("a record another tenant already stored is refused with 409 and stays the first tenant's", async () => {
+    const first = addApiKey("first-key");
+    addApiKey("second-key");
+    const record = buildV2({ workerUri: "//SharedWorker", worker_id: "wkr-shared" });
+    const stored = await postJson(ctx.app, "/metering/submit", record, { "x-api-key": "first-key" });
+    expect(stored.status).toBe(200);
+    const { content_hash } = stored.body as { content_hash: string };
+    ctx.workerBoundsDb.prepare("DELETE FROM worker_state").run();
+
+    const res = await postJson(ctx.app, "/metering/submit", record, { "x-api-key": "second-key" });
+
+    expect(res.status).toBe(409);
+    expect((res.body as { code: string }).code).toBe("CONTENT_HASH_TAKEN");
+    expect(metaOf(content_hash).owner).toBe(`key:${first}`);
+    expect(quotaDb.prepare("SELECT key_hash FROM quota_daily WHERE receipts > 0").all()).toEqual([{ key_hash: first }]);
+    expect(rows(ctx.workerBoundsDb, "worker_state")).toBe(0);
   });
 });

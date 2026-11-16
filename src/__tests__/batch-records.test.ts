@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { config } from "../config.js";
 import * as storage from "../storage.js";
 import { checkpointBatch } from "./fixtures/checkpoint-batch.js";
+import * as store from "./fixtures/store.js";
 
 const digest = (input: string | Buffer) => createHash("sha256").update(input).digest("hex");
 function batch(seed = "leaf", height = 100) {
@@ -33,8 +34,8 @@ describe("checkpoint batch records", () => {
   test("a daemon retry preserves the worker's Cardano anchor", async () => {
     const record = batch();
     const cardano = { cardanoTxHash: "ab".repeat(32), cardanoNetwork: "mainnet", cardanoSubmittedAt: "2026-10-23T00:00:01Z" };
-    await storage.saveBatch(record.anchorId, { ...record, ...cardano });
-    await storage.saveBatch(record.anchorId, record);
+    await store.saveBatch(record.anchorId, { ...record, ...cardano });
+    await store.saveBatch(record.anchorId, record);
     expect(await storage.getBatch(record.anchorId)).toMatchObject(cardano);
   });
 
@@ -47,9 +48,9 @@ describe("checkpoint batch records", () => {
     ["identifier", { anchorId: "cd".repeat(32) }],
   ])("refuses non-deriving %s before it can preempt the real daemon", async (_name, delta) => {
     const record = batch();
-    await expect(storage.saveBatch(record.anchorId, { ...record, ...delta })).rejects.toThrow(/batch|root|count|manifest|anchor|leaf|range/i);
+    await expect(store.saveBatch(record.anchorId, { ...record, ...delta })).rejects.toThrow(/batch|root|count|manifest|anchor|leaf|range/i);
     expect(await storage.getBatch(record.anchorId)).toBeNull();
-    await storage.saveBatch(record.anchorId, record);
+    await store.saveBatch(record.anchorId, record);
     expect(await storage.getBatch(record.anchorId)).toMatchObject(record);
   });
 
@@ -57,14 +58,14 @@ describe("checkpoint batch records", () => {
     const record = batch();
     const falseClaim = { cardanoNetwork: "mainnet", cardanoTxHash: "aa".repeat(32) };
     const realClaim = { cardanoNetwork: "mainnet", cardanoTxHash: "bb".repeat(32) };
-    await storage.saveBatch(record.anchorId, { ...record, ...falseClaim });
-    await storage.saveBatch(record.anchorId, { ...record, ...realClaim });
+    await store.saveBatch(record.anchorId, { ...record, ...falseClaim });
+    await store.saveBatch(record.anchorId, { ...record, ...realClaim });
     expect(await storage.getBatch(record.anchorId)).toMatchObject({ cardanoClaims: expect.arrayContaining([falseClaim, realClaim]) });
   });
 
   test("concurrent enrichments do not erase one another", async () => {
     const record = batch();
-    await Promise.all(Array.from({ length: 16 }, (_, i) => storage.saveBatch(record.anchorId, { ...record, [`field${i}`]: i })));
+    await Promise.all(Array.from({ length: 16 }, (_, i) => store.saveBatch(record.anchorId, { ...record, [`field${i}`]: i })));
     const stored = await storage.getBatch(record.anchorId);
     expect(stored).toMatchObject(Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`field${i}`, i])));
   });
@@ -125,11 +126,11 @@ describe("checkpoint batch records", () => {
     try {
       const record = batch();
       if (expires) {
-        await expect(storage.saveBatch(record.anchorId, record)).rejects.toThrow(expect.objectContaining({ code: "SQLITE_BUSY" }));
+        await expect(store.saveBatch(record.anchorId, record)).rejects.toThrow(expect.objectContaining({ code: "SQLITE_BUSY" }));
         await expect(readFile(join(directory, "batches", `${record.anchorId}.json`))).rejects.toThrow(expect.objectContaining({ code: "ENOENT" }));
         expect(wait).toHaveBeenCalledOnce();
       } else {
-        await storage.saveBatch(record.anchorId, record);
+        await store.saveBatch(record.anchorId, record);
         expect(await storage.getBatch(record.anchorId)).toMatchObject(record);
       }
       expect(busy).toBe(1);
@@ -158,7 +159,7 @@ describe("checkpoint batch records", () => {
 
   test("malformed stored claim rows cannot falsely exhaust discovery", async () => {
     const record = batch();
-    await storage.saveBatch(record.anchorId, record);
+    await store.saveBatch(record.anchorId, record);
     const db = new Database(join(directory, "index/batches.sqlite"));
     try {
       db.pragma("ignore_check_constraints = ON");
@@ -171,7 +172,7 @@ describe("checkpoint batch records", () => {
 
   test.each(["AB".repeat(32), `0x${"ab".repeat(32)}`])("stored transaction aliases cannot change cursor ordering: %s", async (alias) => {
     const record = batch();
-    await storage.saveBatch(record.anchorId, record);
+    await store.saveBatch(record.anchorId, record);
     const db = new Database(join(directory, "index/batches.sqlite"));
     try {
       db.pragma("ignore_check_constraints = ON");
@@ -188,7 +189,7 @@ describe("checkpoint batch records", () => {
     const original = ` ${JSON.stringify(record)}\n\n`;
     await writeFile(file, original);
     await storage.indexExistingBatches();
-    await storage.saveBatch(batch("other").anchorId, batch("other"));
+    await store.saveBatch(batch("other").anchorId, batch("other"));
     expect(await readFile(file, "utf8")).toBe(original);
     expect(await storage.getBatch(record.anchorId)).toEqual(record);
   });
@@ -198,41 +199,41 @@ describe("checkpoint batch records", () => {
     const cardano = { cardanoNetwork: "mainnet", cardanoTxHash: "ab".repeat(32) };
     await mkdir(join(directory, "batches"), { recursive: true });
     await writeFile(join(directory, "batches", `${record.anchorId}.json`), JSON.stringify({ ...record, ...cardano }));
-    await storage.saveBatch(record.anchorId, record);
+    await store.saveBatch(record.anchorId, record);
     expect(await storage.getBatch(record.anchorId)).toMatchObject(cardano);
   });
 
   test("the predecessor can read new batches and its later writes remain authoritative", async () => {
     const record = batch();
-    await storage.saveBatch(record.anchorId, record);
+    await store.saveBatch(record.anchorId, record);
     const file = join(directory, "batches", `${record.anchorId}.json`);
     expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject(record);
     const cardano = { cardanoNetwork: "mainnet", cardanoTxHash: "ab".repeat(32) };
     await writeFile(file, JSON.stringify({ ...record, ...cardano }));
     expect(await storage.getBatch(record.anchorId)).toMatchObject(cardano);
-    await storage.saveBatch(record.anchorId, record);
+    await store.saveBatch(record.anchorId, record);
     expect(await storage.getBatch(record.anchorId)).toMatchObject(cardano);
   });
 
   test("rejects cumulative metadata growth atomically", async () => {
     const record = batch();
     const first = { ...record, first: "a".repeat(1_100_000) };
-    await storage.saveBatch(record.anchorId, first);
-    await expect(storage.saveBatch(record.anchorId, { ...record, second: "b".repeat(1_100_000) })).rejects.toThrow(/capacity|size|budget|large/i);
+    await store.saveBatch(record.anchorId, first);
+    await expect(store.saveBatch(record.anchorId, { ...record, second: "b".repeat(1_100_000) })).rejects.toThrow(/capacity|size|budget|large/i);
     expect(await storage.getBatch(record.anchorId)).toEqual(first);
   });
 
   test("rejects excessive distinct claims without losing existing claims", async () => {
     const record = batch();
     const cardanoClaims = Array.from({ length: 32 }, (_, i) => ({ cardanoNetwork: "mainnet", cardanoTxHash: digest(`claim-${i}`) }));
-    await storage.saveBatch(record.anchorId, { ...record, cardanoClaims });
-    await expect(storage.saveBatch(record.anchorId, { ...record, cardanoNetwork: "mainnet", cardanoTxHash: digest("overflow") })).rejects.toThrow(/claims|capacity|budget/i);
+    await store.saveBatch(record.anchorId, { ...record, cardanoClaims });
+    await expect(store.saveBatch(record.anchorId, { ...record, cardanoNetwork: "mainnet", cardanoTxHash: digest("overflow") })).rejects.toThrow(/claims|capacity|budget/i);
     expect((await storage.getBatch(record.anchorId) as { cardanoClaims: unknown[] }).cardanoClaims).toHaveLength(32);
   });
 
   test("candidate pages cover every batch without duplication", async () => {
     const records = Array.from({ length: 12 }, (_, i) => batch("shared", 100 + i));
-    for (const record of records) await storage.saveBatch(record.anchorId, record);
+    for (const record of records) await store.saveBatch(record.anchorId, record);
     const found: string[] = [];
     let cursor: string | undefined;
     do {
@@ -246,9 +247,9 @@ describe("checkpoint batch records", () => {
 
   test("deep claim pages seek directly past the cursor in the index", async () => {
     const record = batch();
-    await storage.saveBatch(record.anchorId, record);
+    await store.saveBatch(record.anchorId, record);
     const hash = (i: number) => i.toString(16).padStart(64, "0");
-    for (let i = 0; i < 160; i++) await storage.saveCardanoClaim(record.anchorId, { cardanoNetwork: "mainnet", cardanoTxHash: hash(i) });
+    for (let i = 0; i < 160; i++) await store.saveCardanoClaim(record.anchorId, { cardanoNetwork: "mainnet", cardanoTxHash: hash(i) });
     const prepare = Database.prototype.prepare;
     const plans: string[] = [];
     const spy = vi.spyOn(Database.prototype, "prepare").mockImplementation(function (this: Database.Database, sql: string) {
@@ -271,7 +272,7 @@ describe("checkpoint batch records", () => {
 
   test("discovery bounds aggregate bytes while retaining a continuation", async () => {
     const records = Array.from({ length: 6 }, (_, i) => ({ ...batch("shared", 100 + i), payload: "x".repeat(600_000) }));
-    for (const record of records) await storage.saveBatch(record.anchorId, record);
+    for (const record of records) await store.saveBatch(record.anchorId, record);
     const first = await storage.getBatchesByLeaf(records[0].rootHash);
     expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(2 * 1024 * 1024 + 1024);
     expect(first.nextCursor).not.toBeNull();
@@ -281,7 +282,7 @@ describe("checkpoint batch records", () => {
 
   test("a corrupt historical candidate cannot hide a valid batch", async () => {
     const record = batch();
-    await storage.saveBatch(record.anchorId, record);
+    await store.saveBatch(record.anchorId, record);
     const corruptId = "00".repeat(32);
     await writeFile(join(directory, "batches", `${corruptId}.json`), "{broken");
     await mkdir(join(directory, "index", "leaf-to-anchor"), { recursive: true });

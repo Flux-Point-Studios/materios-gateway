@@ -187,7 +187,7 @@ async function lookupV2Manifest(contentHashHex: string): Promise<
 
 /**
  * Resolve a receipt_id → content_hash by reading the index file written by
- * `saveManifest()` at `index/receipt-to-content/{receiptIdClean}.txt`.
+ * `storeManifest()` at `index/receipt-to-content/{receiptIdClean}.txt`.
  * Returns null when the index file is missing (receipt unknown).
  */
 async function lookupContentHashForReceiptId(

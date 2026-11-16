@@ -5,8 +5,12 @@
  * - bearer: `Authorization: Bearer matra_<token>` — opaque random token (preferred)
  * - api-key: Backwards-compatible API key auth (highest quotas)
  * - registered-validator: sr25519 sig from registered committee member (API-key-level quotas)
- * - sig-only: sr25519 sig from a funded account, or under the quota upload gate
- *   from any account on a route that bounds the signer itself (default quotas)
+ * - sig-only: sr25519 sig from any funded account (default quotas)
+ *
+ * Under the tenant-only profile there is no balance to check: a signature
+ * authenticates a registered validator (who may read) or an account on the
+ * tenant allowlist, and nobody else. Whether the caller may write is decided
+ * by grantWrite() in tenant.ts, for every tier.
  */
 
 import type { Request } from "express";
@@ -15,6 +19,7 @@ import { verifyUploadSig, spendUploadSig, hasUploadSignature } from "./upload-au
 import { checkFunded } from "./rpc-client.js";
 import { config } from "./config.js";
 import { isAccountAddress } from "./ss58.js";
+import { accountTenant, grantWrite, principalOf, type WriteGrant } from "./tenant.js";
 import {
   getApiTokensDb,
   verifyToken,
@@ -35,6 +40,8 @@ export interface AuthResult {
   /** The upload-signature scheme that authenticated a signature tier. */
   sigVersion?: 1 | 2;
   error?: string;
+  /** The signature is valid, but the tenant-only profile does not admit its signer. */
+  tenantRequired?: boolean;
 }
 
 const ADDRESS_AS_KEY_ERROR =
@@ -44,16 +51,8 @@ const ADDRESS_AS_KEY_ERROR =
 /**
  * Resolve auth for any request.
  * @param contentHash — required for upload sig verification (manifest/chunk/batch routes)
- * @param options.callerBoundsSigner — the route bounds a sig-only signer itself
- *   (an upload quota charged at admission, a writer allowlist). Under the quota
- *   upload gate there is no balance to check, so only such routes admit an
- *   unregistered signer; every other route admits registered validators alone.
  */
-export async function resolveAuth(
-  req: Request,
-  contentHash?: string,
-  options: { callerBoundsSigner?: boolean } = {},
-): Promise<AuthResult> {
+export async function resolveAuth(req: Request, contentHash?: string): Promise<AuthResult> {
   // Priority 0: Bearer token (preferred, opaque, revocable, hashed-at-rest)
   const authHeader = (req.headers.authorization || (req.headers as Record<string, unknown>)[
     "Authorization"
@@ -109,19 +108,15 @@ export async function resolveAuth(
   if (contentHash) {
     const sig = verifyUploadSig(req, contentHash);
     if (!sig.valid) return { authenticated: false, error: sig.error };
-    const quotaGate = config.uploadGate === "quota";
     const tier: AuthTier | undefined = lookupUploadEligibleValidator(sig.address)
       ? "registered-validator"
-      : (quotaGate ? options.callerBoundsSigner === true : await checkFunded(sig.address))
+      : (config.tenantOnly ? accountTenant(sig.address) !== null : await checkFunded(sig.address))
         ? "sig-only"
         : undefined;
     if (!tier) {
-      return {
-        authenticated: false,
-        error: quotaGate
-          ? "Only a registered validator or an API credential may use this route"
-          : "Account below minimum balance",
-      };
+      return config.tenantOnly
+        ? { authenticated: false, tenantRequired: true, error: "Signer is not a tenant" }
+        : { authenticated: false, error: "Account below minimum balance" };
     }
     if (!spendUploadSig(req, sig)) {
       return { authenticated: false, error: "Upload signature already used; sign each request afresh" };
@@ -130,4 +125,17 @@ export async function resolveAuth(
   }
 
   return { authenticated: false, error: "No authentication provided" };
+}
+
+/**
+ * The write grant for a record its signer has already been verified on, as the
+ * metering routes do. The request's own API credential names the tenant when
+ * it carries one; otherwise the record's signer does.
+ */
+export async function grantSignedRecordWrite(req: Request, signer: string): Promise<WriteGrant | null> {
+  const credentialed =
+    typeof req.headers.authorization === "string" || typeof req.headers["x-api-key"] === "string";
+  if (!config.tenantOnly || !credentialed) return grantWrite({ account: signer });
+  const auth = await resolveAuth(req);
+  return auth.authenticated ? grantWrite(principalOf(auth)) : null;
 }
