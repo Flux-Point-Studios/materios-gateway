@@ -5,13 +5,15 @@
  * - bearer: `Authorization: Bearer matra_<token>` — opaque random token (preferred)
  * - api-key: Backwards-compatible API key auth (highest quotas)
  * - registered-validator: sr25519 sig from registered committee member (API-key-level quotas)
- * - sig-only: sr25519 sig from any funded account (default quotas)
+ * - sig-only: sr25519 sig from a funded account, or from any account under the
+ *   quota upload gate (default quotas)
  */
 
 import type { Request } from "express";
 import { resolveKey, resolveKeyByAccount, lookupUploadEligibleValidator, type KeyInfo } from "./quota.js";
 import { verifyUploadSig, spendUploadSig, hasUploadSignature } from "./upload-auth.js";
 import { checkFunded } from "./rpc-client.js";
+import { config } from "./config.js";
 import { isAccountAddress } from "./ss58.js";
 import {
   getApiTokensDb,
@@ -101,7 +103,7 @@ export async function resolveAuth(req: Request, contentHash?: string): Promise<A
     if (!sig.valid) return { authenticated: false, error: sig.error };
     const tier: AuthTier | undefined = lookupUploadEligibleValidator(sig.address)
       ? "registered-validator"
-      : (await checkFunded(sig.address))
+      : config.uploadGate === "quota" || (await checkFunded(sig.address))
         ? "sig-only"
         : undefined;
     if (!tier) return { authenticated: false, error: "Account below minimum balance" };

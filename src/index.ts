@@ -134,7 +134,7 @@ app.use(explorerSpoJourneyRouter); // SPO journey: JSON at /preprod-explorer/api
 app.use(traceRouter);       // GET /trace/:contentHash (HTML lineage graph) + GET /trace/api/lineage/:contentHash (JSON).
 app.use(observationsRouter); // GET /api/observations + GET /api/observations/:contentHash — filtered view of ai_capability_observation_v1 receipts.
 app.use(observationsSubmitRouter); // POST /observations/submit — orynq-observe SDK ingress (sponsored Bearer-token tier).
-app.use(faucetRouter);      // Public: /faucet/drip — operator onboarding (MATRA + MOTRA bootstrap). Volume-mounted overrides accepted; see ops compose templates.
+app.use(faucetRouter);      // Public: /faucet/drip — operator onboarding (MATRA + MOTRA bootstrap); 410 when the network profile has no faucet. Volume-mounted overrides accepted; see ops compose templates.
 app.use(meteringRouter);    // Task #109: POST /metering/submit — compute_metering_v1 ingestion + sponsored-receipt forwarding.
 app.use(billingRouter);     // Task #112: GET /billing/usage — verifiable compute-metering billing query.
 app.use(attestationEvidenceRouter); // Wave 3 Phase 2: POST /v2/attestation_evidence — TEE-attestor evidence sink (worker bearer auth).
@@ -254,6 +254,9 @@ async function start(): Promise<void> {
   app.listen(config.port, () => {
     console.log(`[blob-gateway] Service started on port ${config.port}`);
     console.log(`[blob-gateway] Storage path: ${config.storagePath}`);
+    console.log(
+      `[blob-gateway] Network: ${config.network} (faucet ${config.faucetEnabled ? "on" : "off"}, upload gate ${config.uploadGate})`,
+    );
     console.log(`[blob-gateway] Health: http://localhost:${config.port}/health`);
     console.log(`[blob-gateway] Status: http://localhost:${config.port}/status`);
     console.log(`[blob-gateway] Heartbeats: http://localhost:${config.port}/heartbeats/status`);

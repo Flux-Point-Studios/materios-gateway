@@ -99,7 +99,8 @@ interface Manifest {
  *
  * Auth (unified via resolveAuth): Bearer → x-api-key → sr25519 upload signature. The Bearer and api-key tiers are pre-funded
  * (operators authorised by admin); sig-only tier is balance-gated inside
- * resolveAuth() via checkFunded().
+ * resolveAuth() via checkFunded() under the balance upload gate, and bounded by
+ * the account quota alone under the quota gate.
  */
 blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Response) => {
   try {
@@ -299,7 +300,8 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
  *      an operator), and quota tracking does not apply (read-only).
  *   2. unified resolveAuth — mirrors POST /blobs/:contentHash/manifest:
  *      Bearer → x-api-key → sr25519 upload signature.
- *      Sig-only requests are balance-gated inside resolveAuth().
+ *      Sig-only requests are balance-gated inside resolveAuth() under the
+ *      balance upload gate.
  *
  * Returns:
  *   200 + JSON manifest body if found

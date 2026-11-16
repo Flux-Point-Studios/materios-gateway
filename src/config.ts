@@ -5,7 +5,25 @@
 const csv = (value: string | undefined): string[] =>
   (value || "").split(",").map((s) => s.trim()).filter(Boolean);
 
+// Mainnet has no transferable MATRA, so it has no faucet and a signed upload
+// is gated by the account's daily quota (uploads and bytes) alone.
+const NETWORK_PROFILES = {
+  preprod: { faucetEnabled: true, uploadGate: "balance" },
+  mainnet: { faucetEnabled: false, uploadGate: "quota" },
+} as const;
+
+const network = (() => {
+  const raw = (process.env.MATERIOS_NETWORK || "preprod").trim().toLowerCase();
+  if (raw !== "preprod" && raw !== "mainnet") {
+    throw new Error(`MATERIOS_NETWORK must be "preprod" or "mainnet", got ${JSON.stringify(raw)}`);
+  }
+  return raw;
+})();
+
 export const config = {
+  network,
+  faucetEnabled: NETWORK_PROFILES[network].faucetEnabled as boolean,
+  uploadGate: NETWORK_PROFILES[network].uploadGate as "balance" | "quota",
   port: parseInt(process.env.PORT || "3000"),
   storagePath: process.env.STORAGE_PATH || "/data/blobs",
   // Who may write batch records, which carry the Cardano tx trace lineage shows
@@ -55,7 +73,9 @@ export const config = {
   balanceCacheTtlMs: parseInt(process.env.BALANCE_CACHE_TTL_MS || "300000"), // 5 min
   // Upload sig clock skew tolerance
   uploadSigMaxAgeSec: parseInt(process.env.UPLOAD_SIG_MAX_AGE_SEC || "120"),
-  // Default quotas for sig-only uploaders (no API key)
+  // Default quotas for sig-only uploaders (no API key), per UTC day. Under the
+  // balance gate the receipt count is charged when an upload completes; under
+  // the quota gate it is charged, and enforced, when the upload is admitted.
   sigOnlyMaxReceiptsPerDay: parseInt(process.env.SIG_ONLY_MAX_RECEIPTS_PER_DAY || "10"),
   sigOnlyMaxBytesPerDay: parseInt(process.env.SIG_ONLY_MAX_BYTES_PER_DAY || String(256 * 1024 * 1024)),
   sigOnlyMaxConcurrentUploads: parseInt(process.env.SIG_ONLY_MAX_CONCURRENT_UPLOADS || "3"),
