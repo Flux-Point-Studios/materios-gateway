@@ -100,7 +100,9 @@ import {
   isReplayedContent,
 } from "../worker_bounds.js";
 import { notifySponsoredReceiptSubmitter } from "../sponsored-receipts.js";
-import { saveManifest, updateReceiptMeta } from "../storage.js";
+import { storeManifest, type ManifestOutcome } from "../storage.js";
+import { grantSignedRecordWrite } from "../auth.js";
+import { refuseNonTenant } from "../tenant.js";
 
 /** Source tag emitted to the sponsored-receipt-submitter for v2 records. */
 export const METERING_V2_SOURCE = "compute-metering-v2" as const;
@@ -215,12 +217,29 @@ function statusForStructuralCode(code: ValidateErrorCode): number {
 }
 
 /**
+ * Answers a metering submit whose record the store did not take: 429 when the
+ * tenant's daily quota refused it, 409 when the content hash already holds
+ * another tenant's record. Returns false, and answers nothing, when it did.
+ */
+export function refuseUnstoredRecord(res: Response, stored: ManifestOutcome): boolean {
+  if (stored.status === "over_quota") {
+    res.status(429).json({ ok: false, code: "QUOTA_EXCEEDED", message: stored.quota.error });
+    return true;
+  }
+  if (stored.status === "conflict") {
+    res.status(409).json({ ok: false, code: "CONTENT_HASH_TAKEN", message: "this content hash is already stored by another tenant" });
+    return true;
+  }
+  return false;
+}
+
+/**
  * The v2 dispatcher. Called from `routes/metering.ts` when the inbound record
  * carries `schema_version: "compute_metering_v2"`. Splitting it into its own
  * module keeps the v1 path untouched.
  */
 export async function handleV2Submit(
-  _req: Request,
+  req: Request,
   res: Response,
   raw: unknown,
 ): Promise<void> {
@@ -334,6 +353,14 @@ export async function handleV2Submit(
     }
   }
 
+  const operatorSs58 = workerPubkeyToSs58(record.worker_pubkey);
+
+  const grant = await grantSignedRecordWrite(req, operatorSs58);
+  if (!grant) {
+    refuseNonTenant(res);
+    return;
+  }
+
   // Replay shortcut — same record submitted twice in a row → 200 status:replay.
   // We use the same per-worker single-slot dedup as v1 (cheap, off the chain
   // anti-replay). This catches an immediate retry of the SAME content_hash.
@@ -366,16 +393,14 @@ export async function handleV2Submit(
 
   // ---------- ACCEPTED — persist, update state, notify ----------
 
-  const operatorSs58 = workerPubkeyToSs58(record.worker_pubkey);
-
   const manifest = {
     schema: SCHEMA_VERSION,
     record,
     chunks: [],
     rootHash: content_hash,
   };
-  await saveManifest(content_hash, manifest);
-  await updateReceiptMeta(content_hash, { uploaderAddress: operatorSs58 });
+  const stored = await storeManifest(grant, { contentHash: content_hash, manifest, uploaderAddress: operatorSs58 });
+  if (refuseUnstoredRecord(res, stored)) return;
 
   recordWorkerSubmission(record.worker_id, record.period_start_ms, content_hash);
 
@@ -399,7 +424,7 @@ export async function handleV2Submit(
   // when its manifest fetch fails AND the notification has no rootHash, so
   // we MUST surface the root explicitly here — same contract the blob path
   // already honours (src/routes/blobs.ts).
-  void notifySponsoredReceiptSubmitter({
+  void notifySponsoredReceiptSubmitter(grant, {
     contentHash: content_hash,
     operator: operatorSs58,
     authTier: "bearer",

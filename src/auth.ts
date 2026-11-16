@@ -6,13 +6,20 @@
  * - api-key: Backwards-compatible API key auth (highest quotas)
  * - registered-validator: sr25519 sig from registered committee member (API-key-level quotas)
  * - sig-only: sr25519 sig from any funded account (default quotas)
+ *
+ * Under the tenant-only profile there is no balance to check: a signature
+ * authenticates a registered validator (who may read) or an account on the
+ * tenant allowlist, and nobody else. Whether the caller may write is decided
+ * by grantWrite() in tenant.ts, for every tier.
  */
 
 import type { Request } from "express";
 import { resolveKey, resolveKeyByAccount, lookupUploadEligibleValidator, type KeyInfo } from "./quota.js";
 import { verifyUploadSig, spendUploadSig, hasUploadSignature } from "./upload-auth.js";
 import { checkFunded } from "./rpc-client.js";
+import { config } from "./config.js";
 import { isAccountAddress } from "./ss58.js";
+import { accountTenant, grantWrite, principalOf, type WriteGrant } from "./tenant.js";
 import {
   getApiTokensDb,
   verifyToken,
@@ -33,6 +40,8 @@ export interface AuthResult {
   /** The upload-signature scheme that authenticated a signature tier. */
   sigVersion?: 1 | 2;
   error?: string;
+  /** The signature is valid, but the tenant-only profile does not admit its signer. */
+  tenantRequired?: boolean;
 }
 
 const ADDRESS_AS_KEY_ERROR =
@@ -101,10 +110,14 @@ export async function resolveAuth(req: Request, contentHash?: string): Promise<A
     if (!sig.valid) return { authenticated: false, error: sig.error };
     const tier: AuthTier | undefined = lookupUploadEligibleValidator(sig.address)
       ? "registered-validator"
-      : (await checkFunded(sig.address))
+      : (config.tenantOnly ? accountTenant(sig.address) !== null : await checkFunded(sig.address))
         ? "sig-only"
         : undefined;
-    if (!tier) return { authenticated: false, error: "Account below minimum balance" };
+    if (!tier) {
+      return config.tenantOnly
+        ? { authenticated: false, tenantRequired: true, error: "Signer is not a tenant" }
+        : { authenticated: false, error: "Account below minimum balance" };
+    }
     if (!spendUploadSig(req, sig)) {
       return { authenticated: false, error: "Upload signature already used; sign each request afresh" };
     }
@@ -112,4 +125,17 @@ export async function resolveAuth(req: Request, contentHash?: string): Promise<A
   }
 
   return { authenticated: false, error: "No authentication provided" };
+}
+
+/**
+ * The write grant for a record its signer has already been verified on, as the
+ * metering routes do. The request's own API credential names the tenant when
+ * it carries one; otherwise the record's signer does.
+ */
+export async function grantSignedRecordWrite(req: Request, signer: string): Promise<WriteGrant | null> {
+  const credentialed =
+    typeof req.headers.authorization === "string" || typeof req.headers["x-api-key"] === "string";
+  if (!config.tenantOnly || !credentialed) return grantWrite({ account: signer });
+  const auth = await resolveAuth(req);
+  return auth.authenticated ? grantWrite(principalOf(auth)) : null;
 }

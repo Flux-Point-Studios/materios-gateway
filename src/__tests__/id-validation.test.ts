@@ -23,7 +23,8 @@ import { checkpointBatch } from "./fixtures/checkpoint-batch.js";
 import { blobsRouter } from "../routes/blobs.js";
 import { chunksRouter } from "../routes/chunks.js";
 import { locatorsRouter } from "../routes/locators.js";
-import { saveBatch, saveManifest, getBatchByLeaf } from "../storage.js";
+import { getBatchByLeaf } from "../storage.js";
+import { saveBatch, saveManifest } from "./fixtures/store.js";
 
 async function status(app: express.Express, method: string, path: string): Promise<number> {
   return new Promise((resolve, reject) => {

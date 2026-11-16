@@ -4,7 +4,7 @@
     {
       "id": "blob-gateway-api",
       "name": "Blob gateway API",
-      "desc": "Content-addressed blob gateway: manifest and chunk upload, receipt locators, Merkle helpers, canonical checkpoint batch validation and atomic JSON metadata merges, bounded lock-safe SQLite initialization across processes, paged multivalue leaf discovery, and separately admitted append-only Cardano claims with bounded indexed pagination.",
+      "desc": "Content-addressed blob gateway: manifest and chunk upload through one store write path that takes a write grant (under the mainnet network profile a manifest is created exclusively, once, by the tenant that owns it, across routes and processes), receipt locators, Merkle helpers, canonical checkpoint batch validation and atomic JSON metadata merges, bounded lock-safe SQLite initialization across processes, paged multivalue leaf discovery, and separately admitted append-only Cardano claims with bounded indexed pagination.",
       "kind": "api",
       "paths": [
         "src/routes/blobs.ts",
@@ -23,12 +23,13 @@
     {
       "id": "gateway-api-tokens",
       "name": "Gateway auth and tokens",
-      "desc": "Three-tier upload auth \u2014 tenant-scoped bearer tokens, legacy api-keys, sr25519 upload signatures with balance gating \u2014 plus the admin token lifecycle.",
+      "desc": "Three-tier upload auth \u2014 tenant-scoped bearer tokens, legacy api-keys, sr25519 upload signatures gated by a MATRA balance on preprod \u2014 plus write grants: on mainnet (MATERIOS_NETWORK profile) only a tenant writes (an api_keys row or an account on TENANT_ADDRESSES), inside a per-tenant daily upload and byte quota charged once per stored manifest \u2014 plus the admin token lifecycle.",
       "kind": "api",
       "paths": [
         "src/api-tokens.ts",
         "src/routes/tokens.ts",
         "src/auth.ts",
+        "src/tenant.ts",
         "src/bearer-auth.ts",
         "src/upload-auth.ts",
         "src/raw-body.ts"
@@ -41,7 +42,7 @@
     {
       "id": "gateway-faucet",
       "name": "Gateway faucet",
-      "desc": "Public one-drip-per-address MATRA faucet with IP cooldown, genesis-namespaced ledger and optional operator identity capture.",
+      "desc": "Public one-drip-per-address MATRA faucet with IP cooldown, genesis-namespaced ledger and optional operator identity capture; answers 410 under the mainnet network profile, which has no transferable MATRA.",
       "kind": "api",
       "paths": [
         "src/routes/faucet.ts"

@@ -10,6 +10,7 @@ import { createHash, randomBytes } from "crypto";
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { config } from "./config.js";
+import type { Tenant } from "./tenant.js";
 
 let db: Database.Database;
 
@@ -839,6 +840,80 @@ export function recordAccountChunkBytes(address: string, contentHash: string, ch
  */
 export function chargeAccountManifestBytes(address: string, bytes: number): QuotaCheckResult {
   return db.transaction(() => chargeAccountDailyBytes(address, bytes))();
+}
+
+// ---------------------------------------------------------------------------
+// Tenant quotas (tenant-only profile): one daily cap on uploads and bytes per
+// tenant, charged when a manifest is accepted.
+// ---------------------------------------------------------------------------
+
+/** Where a tenant's daily usage is kept, and its caps. */
+function tenantLedger(tenant: Tenant) {
+  return tenant.keyInfo
+    ? {
+        table: "quota_daily",
+        column: "key_hash",
+        key: tenant.keyInfo.keyHash,
+        maxReceipts: tenant.keyInfo.maxReceiptsPerDay,
+        maxBytes: tenant.keyInfo.maxBytesPerDay,
+      }
+    : {
+        table: "account_quotas_daily",
+        column: "address",
+        key: tenant.id,
+        maxReceipts: config.sigOnlyMaxReceiptsPerDay,
+        maxBytes: config.sigOnlyMaxBytesPerDay,
+      };
+}
+
+const isCount = (n: unknown): n is number => Number.isSafeInteger(n) && (n as number) >= 0;
+
+export type TenantCharge =
+  | (QuotaCheckResult & { allowed: false })
+  | {
+      allowed: true;
+      /** Takes the charge back, for an upload another post claimed first. */
+      refund: () => void;
+    };
+
+/**
+ * Charge one upload of `bytes` to the tenant's day, all or nothing. A cap or
+ * a byte count that is not a whole number refuses the upload: compared as NaN
+ * it would never be reached.
+ */
+export function chargeTenantUpload(tenant: Tenant, bytes: number): TenantCharge {
+  const ledger = tenantLedger(tenant);
+  if (!isCount(ledger.maxReceipts) || !isCount(ledger.maxBytes) || !isCount(bytes)) {
+    return { allowed: false, error: "The tenant's daily quota is not a whole number; the upload is refused" };
+  }
+  const d = today();
+  const charge = db.transaction((): TenantCharge => {
+    db.prepare(
+      `INSERT OR IGNORE INTO ${ledger.table} (${ledger.column}, day, receipts, bytes) VALUES (?, ?, 0, 0)`,
+    ).run(ledger.key, d);
+    const daily = db.prepare(
+      `SELECT receipts, bytes FROM ${ledger.table} WHERE ${ledger.column} = ? AND day = ?`,
+    ).get(ledger.key, d) as { receipts: number; bytes: number };
+
+    if (daily.receipts >= ledger.maxReceipts) {
+      return { allowed: false, error: "Daily receipt quota exceeded", limit: ledger.maxReceipts, current: daily.receipts };
+    }
+    if (daily.bytes + bytes > ledger.maxBytes) {
+      return { allowed: false, error: "Daily byte quota exceeded", limit: ledger.maxBytes, current: daily.bytes };
+    }
+    db.prepare(
+      `UPDATE ${ledger.table} SET receipts = receipts + 1, bytes = bytes + ? WHERE ${ledger.column} = ? AND day = ?`,
+    ).run(bytes, ledger.key, d);
+    return {
+      allowed: true,
+      refund: () => {
+        db.prepare(
+          `UPDATE ${ledger.table} SET receipts = receipts - 1, bytes = bytes - ? WHERE ${ledger.column} = ? AND day = ?`,
+        ).run(bytes, ledger.key, d);
+      },
+    };
+  });
+  return charge.immediate();
 }
 
 // ---------------------------------------------------------------------------

@@ -63,7 +63,8 @@ import {
   attestationEvidenceHash,
   type EvidenceType,
 } from "../schemas/compute_metering_v2.js";
-import { saveManifest, computeReceiptId } from "../storage.js";
+import { computeReceiptId } from "../storage.js";
+import { saveManifest } from "./fixtures/store.js";
 
 let keyring: Keyring;
 

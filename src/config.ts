@@ -2,10 +2,56 @@
  * Environment configuration for Materios blob gateway.
  */
 
+import { normalizeSs58 } from "./ss58.js";
+
 const csv = (value: string | undefined): string[] =>
   (value || "").split(",").map((s) => s.trim()).filter(Boolean);
 
+// Mainnet has no transferable MATRA, so it has no faucet and no balance to gate
+// writes on: only a tenant writes (an API key with an api_keys row, or an
+// account on TENANT_ADDRESSES), inside its daily cap on uploads and bytes.
+const NETWORK_PROFILES = {
+  preprod: { faucetEnabled: true, tenantOnly: false },
+  mainnet: { faucetEnabled: false, tenantOnly: true },
+} as const;
+
+const network = (() => {
+  const raw = (process.env.MATERIOS_NETWORK || "preprod").trim().toLowerCase();
+  if (raw !== "preprod" && raw !== "mainnet") {
+    throw new Error(`MATERIOS_NETWORK must be "preprod" or "mainnet", got ${JSON.stringify(raw)}`);
+  }
+  return raw;
+})();
+const { faucetEnabled, tenantOnly } = NETWORK_PROFILES[network];
+
+// A cap that parses to NaN compares false with every count, which lifts the
+// cap. Where the cap is the gate, anything but plain digits stops the gateway.
+function dailyCap(name: string, fallback: number): number {
+  const raw = process.env[name] || String(fallback);
+  if (tenantOnly && !(/^[0-9]+$/.test(raw) && Number.isSafeInteger(Number(raw)))) {
+    throw new Error(`${name} must be a whole number written in plain digits, got ${JSON.stringify(raw)}`);
+  }
+  return parseInt(raw);
+}
+
+function tenantAddresses(): string[] {
+  if (!tenantOnly) return [];
+  return csv(process.env.TENANT_ADDRESSES).map((entry) => {
+    try {
+      return normalizeSs58(entry);
+    } catch {
+      throw new Error(`TENANT_ADDRESSES holds ${JSON.stringify(entry)}, which is not an account address`);
+    }
+  });
+}
+
 export const config = {
+  network,
+  faucetEnabled: faucetEnabled as boolean,
+  tenantOnly: tenantOnly as boolean,
+  // Accounts that may write under the tenant-only profile, in canonical form.
+  // Empty admits no account; API-key tenants need no entry here.
+  tenantAddresses: tenantAddresses(),
   port: parseInt(process.env.PORT || "3000"),
   storagePath: process.env.STORAGE_PATH || "/data/blobs",
   // Who may write batch records, which carry the Cardano tx trace lineage shows
@@ -55,9 +101,11 @@ export const config = {
   balanceCacheTtlMs: parseInt(process.env.BALANCE_CACHE_TTL_MS || "300000"), // 5 min
   // Upload sig clock skew tolerance
   uploadSigMaxAgeSec: parseInt(process.env.UPLOAD_SIG_MAX_AGE_SEC || "120"),
-  // Default quotas for sig-only uploaders (no API key)
-  sigOnlyMaxReceiptsPerDay: parseInt(process.env.SIG_ONLY_MAX_RECEIPTS_PER_DAY || "10"),
-  sigOnlyMaxBytesPerDay: parseInt(process.env.SIG_ONLY_MAX_BYTES_PER_DAY || String(256 * 1024 * 1024)),
+  // Default quotas for sig-only uploaders (no API key), per UTC day. Under the
+  // tenant-only profile they are the daily cap of each account tenant, charged
+  // and enforced when a manifest is accepted.
+  sigOnlyMaxReceiptsPerDay: dailyCap("SIG_ONLY_MAX_RECEIPTS_PER_DAY", 10),
+  sigOnlyMaxBytesPerDay: dailyCap("SIG_ONLY_MAX_BYTES_PER_DAY", 256 * 1024 * 1024),
   sigOnlyMaxConcurrentUploads: parseInt(process.env.SIG_ONLY_MAX_CONCURRENT_UPLOADS || "3"),
   // Grace period before orphaned blobs (no on-chain receipt) get cleaned up
   receiptGraceHours: parseInt(process.env.RECEIPT_GRACE_HOURS || "24"),

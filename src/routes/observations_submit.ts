@@ -44,12 +44,8 @@ import {
   type ValidateErrorCode,
 } from "../schemas/ai_capability_observation_v1.js";
 import { notifySponsoredReceiptSubmitter } from "../sponsored-receipts.js";
-import {
-  saveManifest,
-  saveRawBytes,
-  updateReceiptMeta,
-  getManifest,
-} from "../storage.js";
+import { storeManifest, getManifest, type ManifestOutcome } from "../storage.js";
+import { grantWrite, refuseNonTenant } from "../tenant.js";
 import { legacyObservationsSubmitPathTotal } from "../metrics.js";
 
 export const observationsSubmitRouter = Router();
@@ -67,6 +63,8 @@ export type SubmitErrorCode =
   | "CONTENT_HASH_MISMATCH"
   | "OBSERVER_PUBKEY_MISMATCH"
   | "OBSERVER_SIG_INVALID"
+  | "QUOTA_EXCEEDED"
+  | "CONTENT_HASH_TAKEN"
   | "INTERNAL";
 
 interface SubmitRejectBody {
@@ -226,6 +224,11 @@ async function handleSubmit(req: Request, res: Response): Promise<void> {
     reject(res, 401, "OBSERVER_SIG_INVALID", "sponsored tier required");
     return;
   }
+  const grant = grantWrite(authTier === "api-key" ? { keyInfo: r.keyInfo } : { account: operator });
+  if (!grant) {
+    refuseNonTenant(res);
+    return;
+  }
 
   const body = (req.body ?? {}) as SubmitWireBody;
   if (typeof body !== "object" || body === null) {
@@ -355,7 +358,9 @@ async function handleSubmit(req: Request, res: Response): Promise<void> {
   // We always re-save the manifest AND the canonical CBOR bytes, even on
   // replay: the SDK signature has already cleared, the bytes are
   // deterministic from `record`, so an idempotent rewrite is safe AND lets
-  // us self-heal a corrupted manifest without an operator stepping in. The
+  // us self-heal a corrupted manifest without an operator stepping in.
+  // (Under the tenant-only profile a stored manifest is written once, and
+  // its owner's replay stores nothing.) The
   // notify-submitter side IS short-circuited on replay (see below) — the
   // chain-side idempotency lives in the receipt-submitter's content_hash
   // dedup ledger.
@@ -367,16 +372,23 @@ async function handleSubmit(req: Request, res: Response): Promise<void> {
   const isReplay = existing !== null;
   const nowMs = Date.now();
   const manifest = buildRegistryManifest(record, nowMs);
+  let stored: ManifestOutcome;
   try {
-    await saveManifest(contentHash, manifest);
-    await saveRawBytes(contentHash, preImage);
-    await updateReceiptMeta(contentHash, { uploaderAddress: operator });
+    stored = await storeManifest(grant, { contentHash, manifest, rawBytes: preImage, uploaderAddress: operator });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(
       `[blob-gateway] observations_submit storage error content=${contentHash} err=${msg}`,
     );
     reject(res, 500, "INTERNAL", `manifest persistence failed: ${msg}`);
+    return;
+  }
+  if (stored.status === "over_quota") {
+    reject(res, 429, "QUOTA_EXCEEDED", stored.quota.error ?? "daily quota exceeded");
+    return;
+  }
+  if (stored.status === "conflict") {
+    reject(res, 409, "CONTENT_HASH_TAKEN", "this content hash is already stored by another tenant", "content_hash");
     return;
   }
 
@@ -392,7 +404,7 @@ async function handleSubmit(req: Request, res: Response): Promise<void> {
   }
 
   // -------------------- notify --------------------
-  void notifySponsoredReceiptSubmitter({
+  void notifySponsoredReceiptSubmitter(grant, {
     contentHash,
     operator,
     authTier,

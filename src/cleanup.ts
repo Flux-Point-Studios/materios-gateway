@@ -5,7 +5,7 @@
  * Two-phase deletion with .deleting sentinel for crash safety.
  */
 
-import { readdir, readFile, writeFile, rm, access } from "fs/promises";
+import { readdir, readFile, writeFile, rm, access, stat } from "fs/promises";
 import { join } from "path";
 import { config } from "./config.js";
 import { checkReceiptStatus } from "./rpc-client.js";
@@ -68,7 +68,15 @@ export async function runCleanup(): Promise<void> {
         const raw = await readFile(metaPath, "utf-8");
         meta = JSON.parse(raw);
       } catch {
-        // No meta.json — skip (legacy receipt or in-progress upload)
+        // No meta.json — skip (legacy receipt or in-progress upload). Under
+        // the tenant-only profile the metadata file is written first and is
+        // the claim on the hash, so a directory without one can never be
+        // written to again: it goes once the grace period has passed.
+        if (config.tenantOnly && now - (await stat(receiptDir)).mtimeMs > config.receiptGraceHours * 3600_000) {
+          await writeFile(deletingPath, "");
+          bytesFreed += await deleteReceipt(receiptDir, contentHash, indexPath);
+          deleted++;
+        }
         continue;
       }
 

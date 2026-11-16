@@ -20,7 +20,7 @@ import { AddressInfo } from "net";
 
 import { config } from "../../config.js";
 import { saveLegacyBatch } from "../../__tests__/fixtures/legacy-batch.js";
-import { saveManifest } from "../../storage.js";
+import { saveManifest } from "../../__tests__/fixtures/store.js";
 import { traceRouter, __test__setFetchImpl, __test__resetFetchImpl } from "../trace.js";
 import { koiosResponder } from "../../__tests__/fixtures/l1_anchor.js";
 

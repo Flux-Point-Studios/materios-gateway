@@ -33,6 +33,16 @@ import { ensureFaucetApiKey, unguessableKeyHash } from "../quota.js";
 
 export const faucetRouter = Router();
 
+faucetRouter.use("/faucet", (_req: Request, res: Response, next) => {
+  if (config.faucetEnabled) {
+    next();
+    return;
+  }
+  res.status(410).json({
+    error: `The MATRA faucet is disabled on Materios ${config.network}: it has no transferable MATRA.`,
+  });
+});
+
 // Bumped 2026-04-24 from 1_000_000_000 (exactly BondRequirement) to 1_001_000_000
 // to work around the dust bug: bond(BondRequirement) from an account with exactly
 // BondRequirement free leaves post-reserve free=0, below existential deposit (500
