@@ -27,7 +27,7 @@ vi.mock("@polkadot/api", async (importOriginal) => {
 import express from "express";
 import Database from "better-sqlite3";
 import { createHash, randomBytes } from "crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
@@ -195,6 +195,31 @@ function quotaRow(address: string): { receipts: number; bytes: number } | undefi
   return quotaDb
     .prepare("SELECT receipts, bytes FROM account_quotas_daily WHERE address = ?")
     .get(address) as { receipts: number; bytes: number } | undefined;
+}
+
+/** What a chunked upload is charged at admission: its declared chunk bytes and its stored manifest. */
+function admissionBytes(contentHash: string, declaredChunkBytes: number): number {
+  return declaredChunkBytes + statSync(storedFile(contentHash, "manifest.json")).size;
+}
+
+function chunkEntry(index: number, data: Buffer): { index: number; size: number; sha256: string } {
+  return { index, size: data.length, sha256: createHash("sha256").update(data).digest("hex") };
+}
+
+async function putChunk(contentHash: string, index: number, data: Buffer): Promise<number> {
+  return (await send(blobsRouter, "PUT", `/blobs/${contentHash}/chunks/${index}`, {}, data)).status;
+}
+
+/** Everything a re-post could disturb: the manifest, its timestamps and uploader, the receipt index, and the account's quota. */
+function storedState(contentHash: string, address: string) {
+  const indexDir = join(tmpStorage, "index", "receipt-to-content");
+  return {
+    manifest: readFileSync(storedFile(contentHash, "manifest.json"), "utf-8"),
+    meta: readFileSync(storedFile(contentHash, "receipt.meta.json"), "utf-8"),
+    receipts: readdirSync(join(tmpStorage, "receipts")),
+    index: readdirSync(indexDir).map((name) => [name, readFileSync(join(indexDir, name), "utf-8")]),
+    quota: quotaRow(address),
+  };
 }
 
 describe("MATERIOS_NETWORK", () => {
@@ -404,15 +429,6 @@ describe("mainnet signature reach", () => {
     expect(storedManifest(contentHash)).toEqual(before);
     expect(quotaRow(signer("//Griefer").address)?.receipts ?? 0).toBe(0);
   });
-
-  test("the uploader may replace its own manifest", async () => {
-    useProfile("mainnet");
-    const contentHash = contentHashFor("own");
-    expect(await postManifest("//Owner", contentHash, [{ index: 0, size: 4, sha256: "11".repeat(32) }])).toBe(201);
-
-    expect(await postManifest("//Owner", contentHash, [{ index: 0, size: 4, sha256: "33".repeat(32) }])).toBe(201);
-    expect(storedManifest(contentHash).chunks).toEqual([{ index: 0, size: 4, sha256: "33".repeat(32) }]);
-  });
 });
 
 describe("mainnet byte quota", () => {
@@ -424,8 +440,28 @@ describe("mainnet byte quota", () => {
     expect(await postManifest("//BigDeclared", contentHashFor("big"), [{ index: 0, size: 5000 }])).toBe(429);
     expect(quotaRow(address)).toEqual({ receipts: 0, bytes: 0 });
 
-    expect(await postManifest("//BigDeclared", contentHashFor("fits"), [{ index: 0, size: 600 }])).toBe(201);
-    expect(quotaRow(address)).toEqual({ receipts: 1, bytes: 600 });
+    const fits = contentHashFor("fits");
+    expect(await postManifest("//BigDeclared", fits, [{ index: 0, size: 600 }])).toBe(201);
+    expect(quotaRow(address)).toEqual({ receipts: 1, bytes: admissionBytes(fits, 600) });
+  });
+
+  test("a chunked manifest's own stored bytes are charged too", async () => {
+    useProfile("mainnet");
+    config.sigOnlyMaxBytesPerDay = 1000;
+    const address = signer("//WideManifest").address;
+    const post = (contentHash: string, note: string) =>
+      send(blobsRouter, "POST", `/blobs/${contentHash}/manifest`, sigHeaders("//WideManifest", contentHash), {
+        rootHash: contentHash,
+        note,
+        chunks: [{ index: 0, size: 1 }],
+      });
+
+    expect((await post(contentHashFor("wide"), "x".repeat(5000))).status).toBe(429);
+    expect(quotaRow(address)).toEqual({ receipts: 0, bytes: 0 });
+
+    const stored = contentHashFor("narrow");
+    expect((await post(stored, "x")).status).toBe(201);
+    expect(quotaRow(address)).toEqual({ receipts: 1, bytes: admissionBytes(stored, 1) });
   });
 
   test("a chunk without a positive integer size is refused at admission", async () => {
@@ -459,6 +495,229 @@ describe("mainnet byte quota", () => {
     const res = await send(blobsRouter, "PUT", `/blobs/${contentHash}/chunks/0`, sigHeaders("//ChunkSigner", contentHash), data);
 
     expect(res.status).toBe(200);
-    expect(quotaRow(signer("//ChunkSigner").address)).toEqual({ receipts: 1, bytes: 4 });
+    expect(quotaRow(signer("//ChunkSigner").address)).toEqual({ receipts: 1, bytes: admissionBytes(contentHash, 4) });
+  });
+});
+
+describe("mainnet stored manifest", () => {
+  const parts = [randomBytes(600), randomBytes(400)];
+  const chunks = parts.map((data, index) => chunkEntry(index, data));
+  const owner = () => signer("//Owner").address;
+
+  async function markCertified(contentHash: string): Promise<void> {
+    registerValidator(signer("//CertDaemon").address);
+    const res = await send(blobsRouter, "PATCH", `/blobs/${contentHash}/certified`, sigHeaders("//CertDaemon", contentHash));
+    expect(res.status).toBe(200);
+  }
+
+  test("the uploader cannot replace a complete, certified upload with a smaller manifest", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("shrink");
+    expect(await postManifest("//Owner", contentHash, chunks)).toBe(201);
+    for (const [index, data] of parts.entries()) expect(await putChunk(contentHash, index, data)).toBe(200);
+    await markCertified(contentHash);
+    const before = storedState(contentHash, owner());
+    expect(before.quota).toEqual({ receipts: 1, bytes: admissionBytes(contentHash, 1000) });
+    expect(JSON.parse(before.meta).certifiedAt).not.toBeNull();
+
+    const status = await postManifest("//Owner", contentHash, [{ index: 0, size: 1, sha256: "55".repeat(32) }]);
+
+    expect(status).toBe(409);
+    expect(storedState(contentHash, owner())).toEqual(before);
+  });
+
+  test.each([
+    ["different chunk sizes", [{ ...chunks[0], size: 400 }, { ...chunks[1], size: 600 }]],
+    ["a different chunk count with the same total", [{ index: 0, size: 1000, sha256: chunks[0].sha256 }]],
+    ["a different chunk digest", [chunks[0], { ...chunks[1], sha256: "66".repeat(32) }]],
+    ["more chunks", [...chunks, { index: 2, size: 1, sha256: "77".repeat(32) }]],
+    ["no chunks", []],
+  ])("a re-post with %s is refused and charges nothing", async (_label, reposted) => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("variant");
+    expect(await postManifest("//Owner", contentHash, chunks)).toBe(201);
+    const before = storedState(contentHash, owner());
+
+    expect(await postManifest("//Owner", contentHash, reposted)).toBe(409);
+    expect(storedState(contentHash, owner())).toEqual(before);
+  });
+
+  test("a chunkless manifest cannot be replaced by a chunked one", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("grow");
+    expect(await postManifest("//Owner", contentHash)).toBe(201);
+    const before = storedState(contentHash, owner());
+
+    expect(await postManifest("//Owner", contentHash, chunks)).toBe(409);
+    expect(storedState(contentHash, owner())).toEqual(before);
+  });
+
+  test.each([
+    ["chunked", chunks],
+    ["chunkless", []],
+  ])("re-posting the same %s manifest answers 200 and changes nothing", async (_label, posted) => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("same");
+    expect(await postManifest("//Owner", contentHash, posted)).toBe(201);
+    await markCertified(contentHash);
+    const before = storedState(contentHash, owner());
+    expect(before.quota?.receipts).toBe(1);
+
+    expect(await postManifest("//Owner", contentHash, posted)).toBe(200);
+    expect(storedState(contentHash, owner())).toEqual(before);
+  });
+
+  test("a re-post without the root hash the gateway filled in counts as the same manifest", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("rootless");
+    const post = () => send(blobsRouter, "POST", `/blobs/${contentHash}/manifest`, sigHeaders("//Owner", contentHash), { chunks });
+    expect((await post()).status).toBe(201);
+    const before = storedState(contentHash, owner());
+    expect(JSON.parse(before.manifest).rootHash).toMatch(/^[0-9a-f]{64}$/);
+
+    expect((await post()).status).toBe(200);
+    expect(storedState(contentHash, owner())).toEqual(before);
+  });
+
+  test("a content hash is accepted in lowercase only, with or without 0x", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("spelling");
+    const smaller = [{ index: 0, size: 1, sha256: "55".repeat(32) }];
+    expect(await postManifest("//Owner", contentHash, chunks)).toBe(201);
+    const before = storedState(contentHash, owner());
+
+    expect(await postManifest("//Owner", contentHash.toUpperCase(), smaller)).toBe(400);
+    expect(await postManifest("//Other", contentHash.toUpperCase(), chunks)).toBe(400);
+    const prefixed = (body: unknown[]) =>
+      send(blobsRouter, "POST", `/blobs/0x${contentHash}/manifest`, sigHeaders("//Owner", `0x${contentHash}`), { rootHash: contentHash, chunks: body });
+    expect((await prefixed(smaller)).status).toBe(409);
+    expect((await prefixed(chunks)).status).toBe(200);
+    expect(storedState(contentHash, owner())).toEqual(before);
+    expect(quotaRow(signer("//Other").address)).toBeUndefined();
+  });
+
+  test("the same manifest from another account is refused", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("copy");
+    expect(await postManifest("//Owner", contentHash, chunks)).toBe(201);
+    const before = storedState(contentHash, owner());
+
+    expect(await postManifest("//Copier", contentHash, chunks)).toBe(409);
+    expect(storedState(contentHash, owner())).toEqual(before);
+    expect(quotaRow(signer("//Copier").address)).toBeUndefined();
+  });
+
+  test("a retry after a partial upload is not charged again and completes", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("retry");
+    expect(await postManifest("//Owner", contentHash, chunks)).toBe(201);
+    expect(await putChunk(contentHash, 0, parts[0])).toBe(200);
+
+    expect(await postManifest("//Owner", contentHash, chunks)).toBe(200);
+    expect(await putChunk(contentHash, 0, parts[0])).toBe(409);
+    expect(await putChunk(contentHash, 1, parts[1])).toBe(200);
+
+    const status = await send(blobsRouter, "GET", `/blobs/${contentHash}/status`);
+    expect(status.json).toMatchObject({ complete: true, chunkCount: 2, chunksUploaded: 2 });
+    expect(quotaRow(owner())).toEqual({ receipts: 1, bytes: admissionBytes(contentHash, 1000) });
+  });
+
+  test("an upload cleaned up after its TTL is admitted and charged as a new one", async () => {
+    useProfile("mainnet");
+    config.sigOnlyMaxReceiptsPerDay = 5;
+    const contentHash = contentHashFor("expired");
+    expect(await postManifest("//Owner", contentHash, chunks)).toBe(201);
+    rmSync(join(tmpStorage, "receipts", contentHash), { recursive: true });
+
+    expect(await postManifest("//Owner", contentHash, chunks)).toBe(201);
+    expect(quotaRow(owner())).toEqual({ receipts: 2, bytes: 2 * admissionBytes(contentHash, 1000) });
+  });
+
+  test("concurrent different manifests for one hash: one is stored, the rest are refused and not charged", async () => {
+    useProfile("mainnet");
+    config.sigOnlyMaxReceiptsPerDay = 50;
+    const contentHash = contentHashFor("race-own");
+    const candidates = Array.from({ length: 6 }, (_, n) => [{ index: 0, size: 100 + n, sha256: "88".repeat(32) }]);
+
+    const statuses = await Promise.all(candidates.map((c) => postManifest("//Owner", contentHash, c)));
+
+    expect(statuses.filter((s) => s === 201)).toHaveLength(1);
+    expect(statuses.filter((s) => s === 409)).toHaveLength(candidates.length - 1);
+    const winner = candidates[statuses.indexOf(201)];
+    expect(storedManifest(contentHash).chunks).toEqual(winner);
+    expect(quotaRow(owner())).toEqual({ receipts: 1, bytes: admissionBytes(contentHash, winner[0].size) });
+  });
+
+  test("concurrent posts of the same manifest are charged once", async () => {
+    useProfile("mainnet");
+    config.sigOnlyMaxReceiptsPerDay = 50;
+    const contentHash = contentHashFor("race-same");
+
+    const statuses = await Promise.all(Array.from({ length: 6 }, () => postManifest("//Owner", contentHash, chunks)));
+
+    expect(statuses.filter((s) => s === 201)).toHaveLength(1);
+    expect(statuses.filter((s) => s === 200)).toHaveLength(5);
+    expect(quotaRow(owner())).toEqual({ receipts: 1, bytes: admissionBytes(contentHash, 1000) });
+  });
+
+  test("concurrent posts of one hash by different accounts: one uploader is recorded and only it is charged", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("race-accounts");
+    const uris = Array.from({ length: 6 }, (_, n) => `//Racer${n}`);
+
+    const statuses = await Promise.all(uris.map((uri) => postManifest(uri, contentHash, chunks)));
+
+    expect(statuses.filter((s) => s === 201)).toHaveLength(1);
+    expect(statuses.filter((s) => s === 409)).toHaveLength(uris.length - 1);
+    const winner = signer(uris[statuses.indexOf(201)]).address;
+    expect(JSON.parse(storedState(contentHash, winner).meta).uploaderAddress).toBe(winner);
+    const charged = quotaDb.prepare("SELECT address, receipts, bytes FROM account_quotas_daily").all();
+    expect(charged).toEqual([{ address: winner, receipts: 1, bytes: admissionBytes(contentHash, 1000) }]);
+  });
+});
+
+describe("mainnet quota under concurrent posts", () => {
+  test("posts racing for the last uploads of the day never pass the upload cap", async () => {
+    useProfile("mainnet");
+
+    const hashes = Array.from({ length: 8 }, (_, n) => contentHashFor(`cap${n}`));
+
+    const statuses = await Promise.all(hashes.map((h) => postManifest("//CapRacer", h, [{ index: 0, size: 1 }])));
+
+    expect(statuses.filter((s) => s === 201)).toHaveLength(UPLOAD_CAP);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(hashes.length - UPLOAD_CAP);
+    const each = admissionBytes(hashes[statuses.indexOf(201)], 1);
+    expect(quotaRow(signer("//CapRacer").address)).toEqual({ receipts: UPLOAD_CAP, bytes: UPLOAD_CAP * each });
+  });
+
+  test("posts racing for the last bytes of the day never pass the byte cap", async () => {
+    useProfile("mainnet");
+    config.sigOnlyMaxReceiptsPerDay = 50;
+    config.sigOnlyMaxBytesPerDay = 1200;
+    const hashes = Array.from({ length: 8 }, (_, n) => contentHashFor(`bytes${n}`));
+
+    const statuses = await Promise.all(hashes.map((h) => postManifest("//ByteRacer", h, [{ index: 0, size: 400 }])));
+
+    expect(statuses.filter((s) => s === 201)).toHaveLength(2);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(6);
+    const each = admissionBytes(hashes[statuses.indexOf(201)], 400);
+    expect(3 * each).toBeGreaterThan(config.sigOnlyMaxBytesPerDay);
+    expect(quotaRow(signer("//ByteRacer").address)).toEqual({ receipts: 2, bytes: 2 * each });
+  });
+});
+
+describe("preprod stored manifest", () => {
+  test("a re-post by the uploader is stored again, with no charge at admission", async () => {
+    vi.mocked(checkFunded).mockResolvedValue(true);
+    useProfile("preprod");
+    const contentHash = contentHashFor("preprod-repost");
+    const first = [{ index: 0, size: 4, sha256: "11".repeat(32) }];
+    const second = [{ index: 0, size: 4, sha256: "33".repeat(32) }];
+
+    expect(await postManifest("//PreprodOwner", contentHash, first)).toBe(201);
+    expect(await postManifest("//PreprodOwner", contentHash, second)).toBe(201);
+    expect(storedManifest(contentHash).chunks).toEqual(second);
+    expect(await postManifest("//PreprodOwner", contentHash, second)).toBe(201);
+    expect(quotaRow(signer("//PreprodOwner").address)).toBeUndefined();
   });
 });

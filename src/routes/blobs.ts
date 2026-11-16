@@ -82,6 +82,28 @@ function isSponsoredReceiptSubmitterToken(req: Request): boolean {
   return timingSafeEqual(suppliedBuf, expectedBuf);
 }
 
+/**
+ * Under the quota gate, manifest posts for one content hash run one at a time:
+ * the stored-manifest check, the quota charge and the write of one post never
+ * interleave with another's. Resolves to the function that ends the caller's
+ * turn. In-process, as the quota database is: the gateway runs one replica.
+ */
+const manifestPostQueues = new Map<string, Promise<void>>();
+
+async function queueManifestPost(contentHash: string): Promise<() => void> {
+  const key = stripHexPrefixUtil(contentHash).toLowerCase();
+  const ahead = manifestPostQueues.get(key) ?? Promise.resolve();
+  let end!: () => void;
+  const turn = new Promise<void>((resolve) => { end = resolve; });
+  const tail = ahead.then(() => turn);
+  manifestPostQueues.set(key, tail);
+  await ahead;
+  return () => {
+    if (manifestPostQueues.get(key) === tail) manifestPostQueues.delete(key);
+    end();
+  };
+}
+
 interface ManifestChunk {
   index: number;
   sha256: string;
@@ -105,10 +127,14 @@ interface Manifest {
  * the account quota alone under the quota gate.
  *
  * Under the quota gate a signature costs nothing, so each chunk must declare
- * its size (charged at admission) and a stored manifest can be replaced only
- * by the account recorded as its uploader: anyone else gets 409.
+ * its size (charged at admission with the manifest's own bytes) and a stored
+ * manifest is never replaced. The account recorded as its uploader may post
+ * the same manifest again: that answers 200, writes nothing and charges
+ * nothing. Any other post for the hash gets 409. The hash must be lowercase
+ * hex, so it has one spelling on disk.
  */
 blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Response) => {
+  let endManifestPost: (() => void) | undefined;
   try {
     const { contentHash } = req.params;
     const manifest = req.body;
@@ -143,6 +169,10 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
     // Content limits are checked before a quota slot is taken, so a rejected
     // manifest never holds one.
     const quotaGate = config.uploadGate === "quota";
+    if (quotaGate && /[A-F]/.test(contentHash)) {
+      res.status(400).json({ error: "contentHash must be lowercase hex" });
+      return;
+    }
     const manifestBody = req.body as { chunks?: Array<{ size?: number; sha256?: string; index?: number }>; rootHash?: unknown };
     const declaredChunkBytes = manifestBody.chunks?.reduce((sum, c) => sum + (c.size || 0), 0) ?? 0;
     if (manifestBody.chunks) {
@@ -163,70 +193,6 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
           res.status(400).json({ error: `Chunk size ${chunk.size} exceeds limit ${config.maxChunkBytes}` });
           return;
         }
-      }
-    }
-
-    if (quotaGate) {
-      const uploader = await getManifestUploader(contentHash);
-      if (uploader !== null && uploader !== auth.identity) {
-        res.status(409).json({ status: "already_exists", error: "A manifest for this content hash is already stored by another uploader" });
-        return;
-      }
-    }
-
-    // Dispatch quota tracking by tier. Bearer/api-key tiers use per-operator
-    // keyed quotas if the account is a registered operator; otherwise (bearer
-    // tied to an unregistered account) we fall back to per-account quotas.
-    // Sig-only + registered-validator always use per-account quotas.
-    let uploaderAddress: string | undefined;
-    const useKeyedQuotas =
-      (auth.tier === "bearer" || auth.tier === "api-key") &&
-      auth.keyInfo !== undefined;
-
-    // A chunkless (self-rooted) manifest is complete on arrival: it takes no
-    // concurrency slot, and its stored bytes count against the daily byte quota.
-    const chunkless = !manifestBody.chunks?.length;
-    const manifestBytes = chunkless ? Buffer.byteLength(JSON.stringify(manifest)) : 0;
-
-    if (useKeyedQuotas && auth.keyInfo) {
-      const quotaCheck = chunkless
-        ? chargeManifestBytes(auth.keyInfo, manifestBytes)
-        : startUpload(auth.keyInfo, contentHash);
-      if (!quotaCheck.allowed) {
-        res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
-        return;
-      }
-      // Phase 1 billing: count one receipt per admitted manifest POST. Chunk
-      // bytes are metered in the chunk leg; a chunkless manifest's own bytes
-      // here. Not gated on saveManifest success: a failure there is a disk
-      // error the handler turns into a 500, and the drift is accepted.
-      try {
-        recordUsage(auth.keyInfo.keyHash, manifestBytes, 1);
-      } catch (err) {
-        console.warn(
-          `[blob-gateway] recordUsage(manifest) failed for ${auth.keyInfo.name}:`,
-          err,
-        );
-      }
-    } else {
-      // Account-based quota — covers sig-only, registered-validator, and
-      // Bearer tokens for operators not yet present in quota.db api_keys.
-      const accountId = auth.identity;
-      if (!accountId) {
-        res.status(401).json({ error: "resolved auth has no identity" });
-        return;
-      }
-      const quotaCheck = chunkless
-        ? chargeAccountManifestBytes(accountId, manifestBytes)
-        : startAccountUpload(accountId, contentHash, declaredChunkBytes);
-      if (!quotaCheck.allowed) {
-        res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
-        return;
-      }
-      // Record uploader address only for actual sig-based uploads, mirroring
-      // previous behaviour (Bearer/api-key don't set uploaderAddress in meta).
-      if (auth.tier === "sig-only" || auth.tier === "registered-validator") {
-        uploaderAddress = accountId;
       }
     }
 
@@ -292,6 +258,79 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
       }
     }
 
+    if (quotaGate) {
+      endManifestPost = await queueManifestPost(contentHash);
+      const uploader = await getManifestUploader(contentHash);
+      if (uploader !== null && uploader !== auth.identity) {
+        res.status(409).json({ status: "already_exists", error: "A manifest for this content hash is already stored by another uploader" });
+        return;
+      }
+      if (uploader !== null) {
+        if (JSON.stringify(await getManifest(contentHash)) === JSON.stringify(manifest)) {
+          res.status(200).json({ status: "ok", contentHash });
+          return;
+        }
+        res.status(409).json({ status: "already_exists", error: "A different manifest for this content hash is already stored, and a stored manifest cannot be replaced" });
+        return;
+      }
+    }
+
+    // Dispatch quota tracking by tier. Bearer/api-key tiers use per-operator
+    // keyed quotas if the account is a registered operator; otherwise (bearer
+    // tied to an unregistered account) we fall back to per-account quotas.
+    // Sig-only + registered-validator always use per-account quotas.
+    let uploaderAddress: string | undefined;
+    const useKeyedQuotas =
+      (auth.tier === "bearer" || auth.tier === "api-key") &&
+      auth.keyInfo !== undefined;
+
+    // A chunkless (self-rooted) manifest is complete on arrival: it takes no
+    // concurrency slot, and its stored bytes count against the daily byte quota.
+    const chunkless = !manifestBody.chunks?.length;
+    const manifestBytes = chunkless ? Buffer.byteLength(JSON.stringify(manifest)) : 0;
+
+    if (useKeyedQuotas && auth.keyInfo) {
+      const quotaCheck = chunkless
+        ? chargeManifestBytes(auth.keyInfo, manifestBytes)
+        : startUpload(auth.keyInfo, contentHash);
+      if (!quotaCheck.allowed) {
+        res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
+        return;
+      }
+      // Phase 1 billing: count one receipt per admitted manifest POST. Chunk
+      // bytes are metered in the chunk leg; a chunkless manifest's own bytes
+      // here. Not gated on saveManifest success: a failure there is a disk
+      // error the handler turns into a 500, and the drift is accepted.
+      try {
+        recordUsage(auth.keyInfo.keyHash, manifestBytes, 1);
+      } catch (err) {
+        console.warn(
+          `[blob-gateway] recordUsage(manifest) failed for ${auth.keyInfo.name}:`,
+          err,
+        );
+      }
+    } else {
+      // Account-based quota — covers sig-only, registered-validator, and
+      // Bearer tokens for operators not yet present in quota.db api_keys.
+      const accountId = auth.identity;
+      if (!accountId) {
+        res.status(401).json({ error: "resolved auth has no identity" });
+        return;
+      }
+      const quotaCheck = chunkless
+        ? chargeAccountManifestBytes(accountId, manifestBytes)
+        : startAccountUpload(accountId, contentHash, declaredChunkBytes + Buffer.byteLength(JSON.stringify(manifest)));
+      if (!quotaCheck.allowed) {
+        res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
+        return;
+      }
+      // Record uploader address only for actual sig-based uploads, mirroring
+      // previous behaviour (Bearer/api-key don't set uploaderAddress in meta).
+      if (auth.tier === "sig-only" || auth.tier === "registered-validator") {
+        uploaderAddress = accountId;
+      }
+    }
+
     await saveManifest(contentHash, manifest);
 
     // Record uploader address for sig-based uploads
@@ -304,6 +343,8 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
     console.error("[blob-gateway] Error saving manifest:", error);
     const message = error instanceof Error ? error.message : "Unknown error";
     res.status(500).json({ error: message });
+  } finally {
+    endManifestPost?.();
   }
 });
 

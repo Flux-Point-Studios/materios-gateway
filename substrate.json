@@ -4,7 +4,7 @@
     {
       "id": "blob-gateway-api",
       "name": "Blob gateway API",
-      "desc": "Content-addressed blob gateway: manifest and chunk upload, receipt locators, Merkle helpers, canonical checkpoint batch validation and atomic JSON metadata merges, bounded lock-safe SQLite initialization across processes, paged multivalue leaf discovery, and separately admitted append-only Cardano claims with bounded indexed pagination.",
+      "desc": "Content-addressed blob gateway: manifest and chunk upload (a stored manifest is write-once under the mainnet network profile), receipt locators, Merkle helpers, canonical checkpoint batch validation and atomic JSON metadata merges, bounded lock-safe SQLite initialization across processes, paged multivalue leaf discovery, and separately admitted append-only Cardano claims with bounded indexed pagination.",
       "kind": "api",
       "paths": [
         "src/routes/blobs.ts",
@@ -23,7 +23,7 @@
     {
       "id": "gateway-api-tokens",
       "name": "Gateway auth and tokens",
-      "desc": "Three-tier upload auth \u2014 tenant-scoped bearer tokens, legacy api-keys, sr25519 upload signatures gated by a MATRA balance on preprod or on mainnet (MATERIOS_NETWORK profile) by a per-account daily upload and byte quota charged at admission, with signature access to manifest reads and certification limited to registered validators \u2014 plus the admin token lifecycle.",
+      "desc": "Three-tier upload auth \u2014 tenant-scoped bearer tokens, legacy api-keys, sr25519 upload signatures gated by a MATRA balance on preprod or on mainnet (MATERIOS_NETWORK profile) by a per-account daily upload and byte quota charged once per stored manifest at admission, with signature access to manifest reads and certification limited to registered validators \u2014 plus the admin token lifecycle.",
       "kind": "api",
       "paths": [
         "src/api-tokens.ts",

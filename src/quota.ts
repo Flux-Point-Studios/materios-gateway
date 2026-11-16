@@ -761,8 +761,9 @@ function cleanStaleAccountInflight(address: string): void {
 
 /**
  * Check and record upload start for sig-only uploader. Under the quota gate the
- * upload and its declared chunk bytes are charged here, so a chunk leg needs no
- * signature to stay inside the account's daily byte quota.
+ * upload and its declared bytes (the manifest and every chunk) are charged
+ * here, so a chunk leg needs no signature to stay inside the account's daily
+ * byte quota.
  */
 export function startAccountUpload(address: string, contentHash: string, declaredBytes: number): QuotaCheckResult {
   const txn = db.transaction(() => {
