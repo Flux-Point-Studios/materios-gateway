@@ -5,8 +5,8 @@
  * - bearer: `Authorization: Bearer matra_<token>` — opaque random token (preferred)
  * - api-key: Backwards-compatible API key auth (highest quotas)
  * - registered-validator: sr25519 sig from registered committee member (API-key-level quotas)
- * - sig-only: sr25519 sig from a funded account, or from any account under the
- *   quota upload gate (default quotas)
+ * - sig-only: sr25519 sig from a funded account, or under the quota upload gate
+ *   from any account on a route that bounds the signer itself (default quotas)
  */
 
 import type { Request } from "express";
@@ -44,8 +44,16 @@ const ADDRESS_AS_KEY_ERROR =
 /**
  * Resolve auth for any request.
  * @param contentHash — required for upload sig verification (manifest/chunk/batch routes)
+ * @param options.callerBoundsSigner — the route bounds a sig-only signer itself
+ *   (an upload quota charged at admission, a writer allowlist). Under the quota
+ *   upload gate there is no balance to check, so only such routes admit an
+ *   unregistered signer; every other route admits registered validators alone.
  */
-export async function resolveAuth(req: Request, contentHash?: string): Promise<AuthResult> {
+export async function resolveAuth(
+  req: Request,
+  contentHash?: string,
+  options: { callerBoundsSigner?: boolean } = {},
+): Promise<AuthResult> {
   // Priority 0: Bearer token (preferred, opaque, revocable, hashed-at-rest)
   const authHeader = (req.headers.authorization || (req.headers as Record<string, unknown>)[
     "Authorization"
@@ -101,12 +109,20 @@ export async function resolveAuth(req: Request, contentHash?: string): Promise<A
   if (contentHash) {
     const sig = verifyUploadSig(req, contentHash);
     if (!sig.valid) return { authenticated: false, error: sig.error };
+    const quotaGate = config.uploadGate === "quota";
     const tier: AuthTier | undefined = lookupUploadEligibleValidator(sig.address)
       ? "registered-validator"
-      : config.uploadGate === "quota" || (await checkFunded(sig.address))
+      : (quotaGate ? options.callerBoundsSigner === true : await checkFunded(sig.address))
         ? "sig-only"
         : undefined;
-    if (!tier) return { authenticated: false, error: "Account below minimum balance" };
+    if (!tier) {
+      return {
+        authenticated: false,
+        error: quotaGate
+          ? "Only a registered validator or an API credential may use this route"
+          : "Account below minimum balance",
+      };
+    }
     if (!spendUploadSig(req, sig)) {
       return { authenticated: false, error: "Upload signature already used; sign each request afresh" };
     }

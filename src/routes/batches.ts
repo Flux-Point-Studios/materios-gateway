@@ -28,7 +28,7 @@ batchesRouter.param("anchorId", requireHexId("anchorId"));
 batchesRouter.param("leaf", requireHexId("leaf"));
 
 async function authorizeBatchWrite(req: Request, res: Response): Promise<boolean> {
-  const auth = await resolveAuth(req, req.params.anchorId);
+  const auth = await resolveAuth(req, req.params.anchorId, { callerBoundsSigner: true });
   if (!auth.authenticated) {
     res.status(401).json({ error: auth.error });
     return false;

@@ -760,9 +760,11 @@ function cleanStaleAccountInflight(address: string): void {
 }
 
 /**
- * Check and record upload start for sig-only uploader.
+ * Check and record upload start for sig-only uploader. Under the quota gate the
+ * upload and its declared chunk bytes are charged here, so a chunk leg needs no
+ * signature to stay inside the account's daily byte quota.
  */
-export function startAccountUpload(address: string, contentHash: string): QuotaCheckResult {
+export function startAccountUpload(address: string, contentHash: string, declaredBytes: number): QuotaCheckResult {
   const txn = db.transaction(() => {
     cleanStaleAccountInflight(address);
 
@@ -780,7 +782,7 @@ export function startAccountUpload(address: string, contentHash: string): QuotaC
     }
 
     if (config.uploadGate === "quota") {
-      const admitted = chargeAccountDaily(address, 0, 1);
+      const admitted = chargeAccountDaily(address, declaredBytes, 1);
       if (!admitted.allowed) return admitted;
     }
 
@@ -832,11 +834,12 @@ function chargeAccountDaily(address: string, bytes: number, receipts: 0 | 1): Qu
 }
 
 /**
- * Record chunk bytes for sig-only uploader.
+ * Record chunk bytes for sig-only uploader. Under the quota gate they were
+ * charged when the upload was admitted.
  */
 export function recordAccountChunkBytes(address: string, contentHash: string, chunkBytes: number): QuotaCheckResult {
   const txn = db.transaction(() => {
-    const charged = chargeAccountDaily(address, chunkBytes, 0);
+    const charged = chargeAccountDaily(address, config.uploadGate === "quota" ? 0 : chunkBytes, 0);
     if (!charged.allowed) return charged;
 
     db.prepare(

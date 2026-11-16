@@ -4,7 +4,9 @@
 
 import { Router, type Request, type Response } from "express";
 import { createHash, timingSafeEqual } from "crypto";
-import { saveManifest, getManifest, saveChunk, getChunk, getStatus, markCertified, updateReceiptMeta } from "../storage.js";
+import {
+  saveManifest, getManifest, getManifestUploader, saveChunk, getChunk, getStatus, markCertified, updateReceiptMeta,
+} from "../storage.js";
 import { config } from "../config.js";
 import {
   startUpload, recordChunkBytes, finalizeUpload, chargeManifestBytes,
@@ -101,6 +103,10 @@ interface Manifest {
  * (operators authorised by admin); sig-only tier is balance-gated inside
  * resolveAuth() via checkFunded() under the balance upload gate, and bounded by
  * the account quota alone under the quota gate.
+ *
+ * Under the quota gate a signature costs nothing, so each chunk must declare
+ * its size (charged at admission) and a stored manifest can be replaced only
+ * by the account recorded as its uploader: anyone else gets 409.
  */
 blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Response) => {
   try {
@@ -112,7 +118,7 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
       return;
     }
 
-    const auth = await resolveAuth(req, contentHash);
+    const auth = await resolveAuth(req, contentHash, { callerBoundsSigner: true });
     if (!auth.authenticated) {
       // Preserve existing 403 for the specific "below min balance" case so
       // Penny's client can keep distinguishing 401 (no/invalid creds) from
@@ -136,15 +142,20 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
 
     // Content limits are checked before a quota slot is taken, so a rejected
     // manifest never holds one.
+    const quotaGate = config.uploadGate === "quota";
     const manifestBody = req.body as { chunks?: Array<{ size?: number; sha256?: string; index?: number }>; rootHash?: unknown };
+    const declaredChunkBytes = manifestBody.chunks?.reduce((sum, c) => sum + (c.size || 0), 0) ?? 0;
     if (manifestBody.chunks) {
       if (manifestBody.chunks.length > config.maxChunksPerManifest) {
         res.status(400).json({ error: `Too many chunks: ${manifestBody.chunks.length} > ${config.maxChunksPerManifest}` });
         return;
       }
-      const totalBytes = manifestBody.chunks.reduce((sum, c) => sum + (c.size || 0), 0);
-      if (totalBytes > config.maxBlobBytesPerManifest) {
-        res.status(400).json({ error: `Total blob size ${totalBytes} exceeds limit ${config.maxBlobBytesPerManifest}` });
+      if (quotaGate && !manifestBody.chunks.every((c) => Number.isSafeInteger(c.size) && c.size! > 0)) {
+        res.status(400).json({ error: "Invalid manifest: every chunk must declare its size in bytes as a positive integer" });
+        return;
+      }
+      if (declaredChunkBytes > config.maxBlobBytesPerManifest) {
+        res.status(400).json({ error: `Total blob size ${declaredChunkBytes} exceeds limit ${config.maxBlobBytesPerManifest}` });
         return;
       }
       for (const chunk of manifestBody.chunks) {
@@ -152,6 +163,14 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
           res.status(400).json({ error: `Chunk size ${chunk.size} exceeds limit ${config.maxChunkBytes}` });
           return;
         }
+      }
+    }
+
+    if (quotaGate) {
+      const uploader = await getManifestUploader(contentHash);
+      if (uploader !== null && uploader !== auth.identity) {
+        res.status(409).json({ status: "already_exists", error: "A manifest for this content hash is already stored by another uploader" });
+        return;
       }
     }
 
@@ -199,7 +218,7 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
       }
       const quotaCheck = chunkless
         ? chargeAccountManifestBytes(accountId, manifestBytes)
-        : startAccountUpload(accountId, contentHash);
+        : startAccountUpload(accountId, contentHash, declaredChunkBytes);
       if (!quotaCheck.allowed) {
         res.status(429).json({ error: quotaCheck.error, limit: quotaCheck.limit, current: quotaCheck.current });
         return;
@@ -301,7 +320,8 @@ blobsRouter.post("/blobs/:contentHash/manifest", async (req: Request, res: Respo
  *   2. unified resolveAuth — mirrors POST /blobs/:contentHash/manifest:
  *      Bearer → x-api-key → sr25519 upload signature.
  *      Sig-only requests are balance-gated inside resolveAuth() under the
- *      balance upload gate.
+ *      balance upload gate; under the quota gate only a registered
+ *      validator's signature is accepted here.
  *
  * Returns:
  *   200 + JSON manifest body if found
@@ -359,7 +379,8 @@ blobsRouter.get("/blobs/:contentHash/manifest", async (req: Request, res: Respon
  * Auth (unified via resolveAuth): Bearer → x-api-key → sr25519 upload
  * signature. Same dispatch as POST manifest; no header is
  * strictly required on the chunk leg if the manifest was authed, but if any
- * auth is present we validate + record quotas.
+ * auth is present we validate + record quotas. Under the quota gate a chunk
+ * larger than the size its manifest declared, and was charged for, is refused.
  */
 blobsRouter.put("/blobs/:contentHash/chunks/:i", async (req: Request, res: Response) => {
   try {
@@ -402,6 +423,12 @@ blobsRouter.put("/blobs/:contentHash/chunks/:i", async (req: Request, res: Respo
       return;
     }
 
+    const declaredSize = manifest.chunks[chunkIndex].size;
+    if (config.uploadGate === "quota" && !(typeof declaredSize === "number" && data.length <= declaredSize)) {
+      res.status(400).json({ error: `Chunk is ${data.length} bytes, its manifest declares ${String(declaredSize)}` });
+      return;
+    }
+
     // Resolve auth once for quota routing.
     //
     // Historical behaviour: if no auth header was present the chunk leg
@@ -414,7 +441,7 @@ blobsRouter.put("/blobs/:contentHash/chunks/:i", async (req: Request, res: Respo
       typeof req.headers.authorization === "string" ||
       typeof req.headers["x-api-key"] === "string" ||
       hasUploadSignature(req);
-    const auth = hasAuthHeader ? await resolveAuth(req, contentHash) : null;
+    const auth = hasAuthHeader ? await resolveAuth(req, contentHash, { callerBoundsSigner: true }) : null;
 
     if (auth && !auth.authenticated) {
       if (auth.error && auth.error.toLowerCase().includes("below minimum balance")) {
@@ -546,8 +573,10 @@ blobsRouter.get("/blobs/:contentHash/status", async (req: Request, res: Response
 
 /**
  * PATCH /blobs/:contentHash/certified
- * Marks a receipt as certified — sets certifiedAt in receipt.meta.json.
- * Requires auth: API key or sr25519 signature (Phase 4).
+ * Marks a receipt as certified — sets certifiedAt in receipt.meta.json, which
+ * keeps the blob past the orphan check until the post-certification TTL.
+ * Requires auth: API key or sr25519 signature (Phase 4); under the quota gate
+ * the signature must be a registered validator's.
  */
 blobsRouter.patch("/blobs/:contentHash/certified", async (req: Request, res: Response) => {
   try {

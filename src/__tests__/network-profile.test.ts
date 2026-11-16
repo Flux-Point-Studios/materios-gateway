@@ -27,7 +27,7 @@ vi.mock("@polkadot/api", async (importOriginal) => {
 import express from "express";
 import Database from "better-sqlite3";
 import { createHash, randomBytes } from "crypto";
-import { mkdtempSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
@@ -36,8 +36,12 @@ import { u8aToHex, stringToU8a } from "@polkadot/util";
 
 import { config } from "../config.js";
 import { checkFunded } from "../rpc-client.js";
+import { captureRawBody } from "../raw-body.js";
+import { uploadSigV2Message } from "../upload-auth.js";
+import { batchesRouter } from "../routes/batches.js";
 import { blobsRouter } from "../routes/blobs.js";
 import { faucetRouter } from "../routes/faucet.js";
+import { checkpointBatch } from "./fixtures/checkpoint-batch.js";
 import {
   setQuotaDbForTests,
   migrateUsageColumns,
@@ -88,6 +92,7 @@ const saved = {
   sigOnlyMaxReceiptsPerDay: config.sigOnlyMaxReceiptsPerDay,
   sigOnlyMaxBytesPerDay: config.sigOnlyMaxBytesPerDay,
 };
+const savedBatchWriters = [...config.batchWriterAddresses];
 
 beforeAll(async () => {
   await cryptoWaitReady();
@@ -109,6 +114,7 @@ beforeEach(() => {
 
 afterEach(() => {
   Object.assign(config, saved);
+  config.batchWriterAddresses.splice(0, config.batchWriterAddresses.length, ...savedBatchWriters);
   rmSync(tmpStorage, { recursive: true, force: true });
 });
 
@@ -125,16 +131,18 @@ async function send(
   body?: unknown,
 ): Promise<{ status: number; json: Record<string, unknown> }> {
   const app = express();
-  app.use(express.json({ limit: "2mb" }));
+  app.put("/blobs/:contentHash/chunks/:i", express.raw({ type: "*/*", limit: "2mb", verify: captureRawBody }));
+  app.use(express.json({ limit: "2mb", verify: captureRawBody }));
   app.use(router);
   const server = app.listen(0);
   try {
     const addr = server.address();
     if (typeof addr === "string" || addr === null) throw new Error("no address");
+    const binary = Buffer.isBuffer(body);
     const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
       method,
-      headers: { ...headers, "content-type": "application/json" },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      headers: { "content-type": binary ? "application/octet-stream" : "application/json", ...headers },
+      ...(body === undefined ? {} : { body: binary ? body : JSON.stringify(body) }),
     });
     const text = await res.text();
     return { status: res.status, json: text ? JSON.parse(text) : {} };
@@ -167,6 +175,20 @@ async function postManifest(uri: string, contentHash: string, chunks: unknown[] 
     { rootHash: contentHash, chunks },
   );
   return res.status;
+}
+
+function storedFile(contentHash: string, name: string): string {
+  return join(tmpStorage, "receipts", contentHash, name);
+}
+
+function storedManifest(contentHash: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(storedFile(contentHash, "manifest.json"), "utf-8"));
+}
+
+function registerValidator(address: string): void {
+  quotaDb
+    .prepare("INSERT INTO api_keys (key_hash, name, enabled, validator_id) VALUES (?, 'cert-daemon', 1, ?)")
+    .run(createHash("sha256").update(`registered-${address}`).digest("hex"), address);
 }
 
 function quotaRow(address: string): { receipts: number; bytes: number } | undefined {
@@ -281,7 +303,7 @@ describe("signed upload gate", () => {
       .prepare("INSERT INTO account_quotas_daily (address, day, receipts, bytes) VALUES (?, ?, ?, 0)")
       .run(address, day, UPLOAD_CAP);
 
-    expect(startAccountUpload(address, contentHashFor("s")).allowed).toBe(false);
+    expect(startAccountUpload(address, contentHashFor("s"), 0).allowed).toBe(false);
     const slots = quotaDb.prepare("SELECT COUNT(*) AS n FROM account_uploads_inflight").get() as { n: number };
     expect(slots.n).toBe(0);
   });
@@ -293,9 +315,150 @@ describe("signed upload gate", () => {
     const chunked = contentHashFor("p0");
 
     expect(await postManifest("//PreprodCount", contentHashFor("p1"))).toBe(201);
-    expect(startAccountUpload(address, chunked).allowed).toBe(true);
+    expect(startAccountUpload(address, chunked, 0).allowed).toBe(true);
     expect(quotaRow(address)?.receipts).toBe(0);
     expect(finalizeAccountUpload(address, chunked).allowed).toBe(true);
     expect(quotaRow(address)?.receipts).toBe(1);
+  });
+});
+
+describe("mainnet signature reach", () => {
+  test("an unfunded key cannot read another account's manifest", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("read");
+    expect(await postManifest("//Owner", contentHash)).toBe(201);
+
+    const res = await send(blobsRouter, "GET", `/blobs/${contentHash}/manifest`, sigHeaders("//Stranger", contentHash));
+
+    expect(res.status).toBe(401);
+    expect(res.json).not.toHaveProperty("rootHash");
+    expect(checkFunded).not.toHaveBeenCalled();
+  });
+
+  test("an unfunded key cannot mark a blob certified", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("certify");
+    expect(await postManifest("//Owner", contentHash)).toBe(201);
+
+    const res = await send(blobsRouter, "PATCH", `/blobs/${contentHash}/certified`, sigHeaders("//Owner", contentHash));
+
+    expect(res.status).toBe(401);
+    const meta = JSON.parse(readFileSync(storedFile(contentHash, "receipt.meta.json"), "utf-8"));
+    expect(meta.certifiedAt).toBeNull();
+  });
+
+  test("a registered validator still reads manifests and marks blobs certified", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("daemon");
+    expect(await postManifest("//Owner", contentHash)).toBe(201);
+    registerValidator(signer("//CertDaemon").address);
+
+    const read = await send(blobsRouter, "GET", `/blobs/${contentHash}/manifest`, sigHeaders("//CertDaemon", contentHash));
+    const marked = await send(blobsRouter, "PATCH", `/blobs/${contentHash}/certified`, sigHeaders("//CertDaemon", contentHash));
+
+    expect(read.status).toBe(200);
+    expect(marked.status).toBe(200);
+  });
+
+  test("an allowlisted writer with no MATRA still writes batch records", async () => {
+    useProfile("mainnet");
+    const writer = signer("//MainnetBatchWriter");
+    config.batchWriterAddresses.splice(0, config.batchWriterAddresses.length, writer.address);
+    const batch = checkpointBatch(["ab".repeat(32)]);
+    const id = batch.anchorId.slice(2);
+    const body = Buffer.from(JSON.stringify(batch));
+    const ts = Math.floor(Date.now() / 1000);
+    const message = uploadSigV2Message({
+      method: "PUT",
+      path: `/batches/${id}`,
+      bodySha256: createHash("sha256").update(body).digest("hex"),
+      id,
+      address: writer.address,
+      ts,
+    });
+
+    const res = await send(batchesRouter, "PUT", `/batches/${id}`, {
+      "content-type": "application/json",
+      "x-upload-sig-v2": u8aToHex(writer.sign(stringToU8a(message))),
+      "x-uploader-address": writer.address,
+      "x-upload-ts": String(ts),
+    }, body);
+
+    expect(res.status).toBe(200);
+    expect(checkFunded).not.toHaveBeenCalled();
+  });
+
+  test("another account cannot replace a stored manifest, and is not charged", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("replace");
+    const chunks = [{ index: 0, size: 4, sha256: "11".repeat(32) }];
+    expect(await postManifest("//Owner", contentHash, chunks)).toBe(201);
+    const before = storedManifest(contentHash);
+
+    const res = await send(blobsRouter, "POST", `/blobs/${contentHash}/manifest`, sigHeaders("//Griefer", contentHash), {
+      rootHash: contentHash,
+      chunks: [{ index: 0, size: 4, sha256: "22".repeat(32) }],
+    });
+
+    expect(res.status).toBe(409);
+    expect(storedManifest(contentHash)).toEqual(before);
+    expect(quotaRow(signer("//Griefer").address)?.receipts ?? 0).toBe(0);
+  });
+
+  test("the uploader may replace its own manifest", async () => {
+    useProfile("mainnet");
+    const contentHash = contentHashFor("own");
+    expect(await postManifest("//Owner", contentHash, [{ index: 0, size: 4, sha256: "11".repeat(32) }])).toBe(201);
+
+    expect(await postManifest("//Owner", contentHash, [{ index: 0, size: 4, sha256: "33".repeat(32) }])).toBe(201);
+    expect(storedManifest(contentHash).chunks).toEqual([{ index: 0, size: 4, sha256: "33".repeat(32) }]);
+  });
+});
+
+describe("mainnet byte quota", () => {
+  test("a chunked manifest is charged its declared bytes at admission", async () => {
+    useProfile("mainnet");
+    config.sigOnlyMaxBytesPerDay = 1000;
+    const address = signer("//BigDeclared").address;
+
+    expect(await postManifest("//BigDeclared", contentHashFor("big"), [{ index: 0, size: 5000 }])).toBe(429);
+    expect(quotaRow(address)).toEqual({ receipts: 0, bytes: 0 });
+
+    expect(await postManifest("//BigDeclared", contentHashFor("fits"), [{ index: 0, size: 600 }])).toBe(201);
+    expect(quotaRow(address)).toEqual({ receipts: 1, bytes: 600 });
+  });
+
+  test("a chunk without a positive integer size is refused at admission", async () => {
+    useProfile("mainnet");
+    const address = signer("//NoSize").address;
+
+    expect(await postManifest("//NoSize", contentHashFor("nosize"), [{ index: 0, sha256: "44".repeat(32) }])).toBe(400);
+    expect(await postManifest("//NoSize", contentHashFor("strsize"), [{ index: 0, size: "5000" }])).toBe(400);
+    expect(quotaRow(address)?.receipts ?? 0).toBe(0);
+  });
+
+  test("an unsigned chunk larger than its declared size is not stored", async () => {
+    useProfile("mainnet");
+    config.sigOnlyMaxBytesPerDay = 1000;
+    const contentHash = contentHashFor("oversize");
+    expect(await postManifest("//Declares10", contentHash, [{ index: 0, size: 10 }])).toBe(201);
+
+    const res = await send(blobsRouter, "PUT", `/blobs/${contentHash}/chunks/0`, {}, randomBytes(5000));
+
+    expect(res.status).toBe(400);
+    expect(existsSync(join(tmpStorage, "receipts", contentHash, "chunks", "0.bin"))).toBe(false);
+  });
+
+  test("a signed chunk leg is not charged again", async () => {
+    useProfile("mainnet");
+    const data = randomBytes(4);
+    const contentHash = contentHashFor("signedchunk");
+    const sha256 = createHash("sha256").update(data).digest("hex");
+    expect(await postManifest("//ChunkSigner", contentHash, [{ index: 0, size: 4, sha256 }])).toBe(201);
+
+    const res = await send(blobsRouter, "PUT", `/blobs/${contentHash}/chunks/0`, sigHeaders("//ChunkSigner", contentHash), data);
+
+    expect(res.status).toBe(200);
+    expect(quotaRow(signer("//ChunkSigner").address)).toEqual({ receipts: 1, bytes: 4 });
   });
 });

@@ -137,6 +137,24 @@ export async function getManifest(contentHash: string): Promise<object | null> {
 }
 
 /**
+ * The account recorded as a stored manifest's uploader: null when no manifest
+ * is stored, "" when it was not stored under an account signature.
+ */
+export async function getManifestUploader(contentHash: string): Promise<string | null> {
+  const dir = receiptsDir(contentHash);
+  if (!existsSync(join(dir, "manifest.json"))) return null;
+  let raw: string;
+  try {
+    raw = await readFile(join(dir, "receipt.meta.json"), "utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
+    throw err;
+  }
+  const uploader = (JSON.parse(raw) as { uploaderAddress?: unknown }).uploaderAddress;
+  return typeof uploader === "string" ? uploader : "";
+}
+
+/**
  * Persist the canonical pre-image bytes (the exact bytes whose SHA-256 is the
  * content_hash) at `receipts/{contentHash}/raw.bin`. Used by self-rooted
  * single-blob schemas (e.g. ai_capability_observation_v1) so the daemon-side

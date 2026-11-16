@@ -23,7 +23,7 @@
     {
       "id": "gateway-api-tokens",
       "name": "Gateway auth and tokens",
-      "desc": "Three-tier upload auth \u2014 tenant-scoped bearer tokens, legacy api-keys, sr25519 upload signatures gated by a MATRA balance on preprod or by a per-account daily upload and byte quota on mainnet (MATERIOS_NETWORK profile) \u2014 plus the admin token lifecycle.",
+      "desc": "Three-tier upload auth \u2014 tenant-scoped bearer tokens, legacy api-keys, sr25519 upload signatures gated by a MATRA balance on preprod or on mainnet (MATERIOS_NETWORK profile) by a per-account daily upload and byte quota charged at admission, with signature access to manifest reads and certification limited to registered validators \u2014 plus the admin token lifecycle.",
       "kind": "api",
       "paths": [
         "src/api-tokens.ts",
